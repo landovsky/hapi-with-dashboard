@@ -7,6 +7,8 @@ const harness = vi.hoisted(() => ({
     registerRequestCalls: [] as string[],
     requestHandlers: new Map<string, (params: unknown) => Promise<unknown> | unknown>(),
     initializeCalls: [] as unknown[],
+    setFeatureEnablementCalls: [] as unknown[],
+    failSetFeatureEnablement: false,
     listCollaborationModeCalls: 0,
     collaborationModeResponse: { data: [{ mode: 'default' }, { mode: 'plan' }] } as unknown,
     failListCollaborationModes: false,
@@ -17,6 +19,10 @@ const harness = vi.hoisted(() => ({
     startTurnErrors: [] as Error[],
     interruptedTurns: [] as Array<{ threadId: string; turnId: string }>,
     compactThreadIds: [] as string[],
+    goalSetCalls: [] as unknown[],
+    goalGetCalls: [] as unknown[],
+    goalClearCalls: [] as unknown[],
+    goal: null as Record<string, unknown> | null,
     suppressTurnCompletion: false,
     remainingThreadSystemErrors: 0,
     startTurnMessages: [] as string[],
@@ -26,6 +32,7 @@ const harness = vi.hoisted(() => ({
     deferThreadStatusNotifications: false,
     emitChildThreadEvents: false,
     emitChildUsageEvents: false,
+    emitChildGoalEvent: false,
     emitChildReasoningBurst: false,
     emitChildDoneStatusWithoutMessage: false,
     emitChildWaitStructuredOutput: false,
@@ -69,6 +76,14 @@ vi.mock('./codexAppServerClient', () => {
             return harness.collaborationModeResponse;
         }
 
+        async setExperimentalFeatureEnablement(params: unknown): Promise<unknown> {
+            harness.setFeatureEnablementCalls.push(params);
+            if (harness.failSetFeatureEnablement) {
+                throw new Error('unsupported feature enablement');
+            }
+            return params;
+        }
+
         registerRequestHandler(method: string, handler: (params: unknown) => Promise<unknown> | unknown): void {
             harness.registerRequestCalls.push(method);
             harness.requestHandlers.set(method, handler);
@@ -100,6 +115,42 @@ vi.mock('./codexAppServerClient', () => {
             harness.notifications.push({ method: 'thread/compacted', params: compacted });
             this.notificationHandler?.('thread/compacted', compacted);
             return {};
+        }
+
+        async setThreadGoal(params?: { threadId?: string; objective?: string; status?: string }): Promise<{ goal: Record<string, unknown> }> {
+            harness.goalSetCalls.push(params ?? {});
+            const threadId = params?.threadId ?? 'thread-unknown';
+            harness.goal = {
+                threadId,
+                objective: params?.objective ?? harness.goal?.objective ?? 'existing goal',
+                status: params?.status ?? 'active',
+                tokenBudget: null,
+                tokensUsed: 0,
+                timeUsedSeconds: 0,
+                createdAt: 1,
+                updatedAt: 2
+            };
+            const notification = { threadId, goal: harness.goal };
+            harness.notifications.push({ method: 'thread/goal/updated', params: notification });
+            this.notificationHandler?.('thread/goal/updated', notification);
+            return { goal: harness.goal };
+        }
+
+        async getThreadGoal(params?: { threadId?: string }): Promise<{ goal: Record<string, unknown> | null }> {
+            harness.goalGetCalls.push(params ?? {});
+            return { goal: harness.goal };
+        }
+
+        async clearThreadGoal(params?: { threadId?: string }): Promise<{ cleared: boolean }> {
+            harness.goalClearCalls.push(params ?? {});
+            const cleared = harness.goal !== null;
+            harness.goal = null;
+            if (cleared) {
+                const notification = { threadId: params?.threadId ?? 'thread-unknown' };
+                harness.notifications.push({ method: 'thread/goal/cleared', params: notification });
+                this.notificationHandler?.('thread/goal/cleared', notification);
+            }
+            return { cleared };
         }
 
         async startTurn(params?: { threadId?: string; input?: Array<{ text?: string }>; message?: string; userMessage?: string }): Promise<{ turn: { id?: string } }> {
@@ -387,6 +438,24 @@ vi.mock('./codexAppServerClient', () => {
                     };
                     harness.notifications.push({ method: 'thread/tokenUsage/updated', params: ambiguousUsage });
                     this.notificationHandler?.('thread/tokenUsage/updated', ambiguousUsage);
+                }
+
+                if (harness.emitChildGoalEvent) {
+                    const childGoal = {
+                        threadId: childThreadId,
+                        goal: {
+                            threadId: childThreadId,
+                            objective: 'child-only goal',
+                            status: 'active',
+                            tokenBudget: null,
+                            tokensUsed: 0,
+                            timeUsedSeconds: 0,
+                            createdAt: 1,
+                            updatedAt: 2
+                        }
+                    };
+                    harness.notifications.push({ method: 'thread/goal/updated', params: childGoal });
+                    this.notificationHandler?.('thread/goal/updated', childGoal);
                 }
 
                 const childCommandStart = {
@@ -781,6 +850,8 @@ describe('codexRemoteLauncher', () => {
         harness.registerRequestCalls = [];
         harness.requestHandlers = new Map();
         harness.initializeCalls = [];
+        harness.setFeatureEnablementCalls = [];
+        harness.failSetFeatureEnablement = false;
         harness.listCollaborationModeCalls = 0;
         harness.collaborationModeResponse = { data: [{ mode: 'default' }, { mode: 'plan' }] };
         harness.failListCollaborationModes = false;
@@ -791,6 +862,10 @@ describe('codexRemoteLauncher', () => {
         harness.startTurnErrors = [];
         harness.interruptedTurns = [];
         harness.compactThreadIds = [];
+        harness.goalSetCalls = [];
+        harness.goalGetCalls = [];
+        harness.goalClearCalls = [];
+        harness.goal = null;
         harness.suppressTurnCompletion = false;
         harness.startTurnMessages = [];
         harness.failResumeThreadIds = [];
@@ -800,6 +875,7 @@ describe('codexRemoteLauncher', () => {
         harness.deferThreadStatusNotifications = false;
         harness.emitChildThreadEvents = false;
         harness.emitChildUsageEvents = false;
+        harness.emitChildGoalEvent = false;
         harness.emitChildReasoningBurst = false;
         harness.emitChildDoneStatusWithoutMessage = false;
         harness.emitChildWaitStructuredOutput = false;
@@ -843,6 +919,7 @@ describe('codexRemoteLauncher', () => {
                 experimentalApi: true
             }
         }]);
+        expect(harness.setFeatureEnablementCalls).toEqual([{ enablement: { goals: true } }]);
         expect(harness.notifications.map((entry) => entry.method)).toEqual([
             'turn/started',
             'item/started',
@@ -976,6 +1053,50 @@ describe('codexRemoteLauncher', () => {
         expect(sessionEvents).toContainEqual({
             type: 'message',
             message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+        });
+    });
+
+    it('sets a Codex goal without starting a normal turn', async () => {
+        const { session, sessionEvents, codexMessages, foundSessionIds } = createSessionStub(['/goal improve benchmark coverage']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(foundSessionIds).toEqual(['thread-1']);
+        expect(harness.startTurnParams).toHaveLength(0);
+        expect(harness.goalSetCalls).toEqual([{
+            threadId: 'thread-1',
+            objective: 'improve benchmark coverage',
+            status: 'active'
+        }]);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Goal active'
+        });
+        expect(codexMessages).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                type: 'thread_goal_updated',
+                thread_id: 'thread-1',
+                goal: expect.objectContaining({
+                    objective: 'improve benchmark coverage',
+                    status: 'active'
+                })
+            })
+        ]));
+    });
+
+    it('shows unsupported message when goals feature cannot be enabled', async () => {
+        harness.failSetFeatureEnablement = true;
+        const { session, sessionEvents } = createSessionStub(['/goal improve benchmark coverage']);
+
+        const exitReason = await codexRemoteLauncher(session as never);
+
+        expect(exitReason).toBe('exit');
+        expect(harness.goalSetCalls).toHaveLength(0);
+        expect(harness.startTurnParams).toHaveLength(0);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Codex goals are not supported by this Codex runtime. Upgrade Codex or enable features.goals.'
         });
     });
 
@@ -1493,6 +1614,19 @@ describe('codexRemoteLauncher', () => {
         }));
         expect(codexMessages).not.toContainEqual(expect.objectContaining({
             type: 'context_compacted',
+            thread_id: 'child-thread'
+        }));
+    });
+
+    it('keeps child goal events out of the parent goal stream', async () => {
+        harness.emitChildThreadEvents = true;
+        harness.emitChildGoalEvent = true;
+        const { session, codexMessages } = createSessionStub();
+
+        await codexRemoteLauncher(session as never);
+
+        expect(codexMessages).not.toContainEqual(expect.objectContaining({
+            type: 'thread_goal_updated',
             thread_id: 'child-thread'
         }));
     });

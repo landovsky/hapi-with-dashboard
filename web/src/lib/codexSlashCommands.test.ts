@@ -11,6 +11,7 @@ describe('getBuiltinSlashCommands', () => {
         expect(getBuiltinSlashCommands('codex').map((command) => command.name)).toEqual(expect.arrayContaining([
             'clear',
             'compact',
+            'goal',
             'plan',
             'status',
             'execute',

@@ -12,7 +12,7 @@ import {
     useRef,
     useState
 } from 'react'
-import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
+import type { AgentState, CodexCollaborationMode, PermissionMode, ThreadGoal } from '@/types/api'
 import type { Suggestion } from '@/hooks/useActiveSuggestions'
 import type { ConversationStatus } from '@/realtime/types'
 import { useActiveWord } from '@/hooks/useActiveWord'
@@ -46,6 +46,7 @@ export function HappyComposer(props: {
     disabled?: boolean
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
+    threadGoal?: ThreadGoal | null
     model?: string | null
     modelReasoningEffort?: string | null
     effort?: string | null
@@ -82,6 +83,7 @@ export function HappyComposer(props: {
         disabled = false,
         permissionMode: rawPermissionMode,
         collaborationMode: rawCollaborationMode,
+        threadGoal,
         model: rawModel,
         modelReasoningEffort: rawModelReasoningEffort,
         effort: rawEffort,
@@ -775,6 +777,7 @@ export function HappyComposer(props: {
                         modelReasoningEffort={modelReasoningEffort}
                         permissionMode={permissionMode}
                         collaborationMode={collaborationMode}
+                        threadGoal={threadGoal}
                         agentFlavor={agentFlavor}
                         voiceStatus={voiceStatus}
                     />

@@ -32,6 +32,25 @@ function normalizeAgentEvent(value: unknown): AgentEvent | null {
     return value as AgentEvent
 }
 
+function normalizeThreadGoal(value: unknown) {
+    if (!isObject(value)) return null
+    const threadId = asString(value.threadId ?? value.thread_id)
+    const objective = asString(value.objective)
+    const status = asString(value.status)
+    if (!threadId || !objective || !status) return null
+    if (status !== 'active' && status !== 'paused' && status !== 'budgetLimited' && status !== 'complete') return null
+    return {
+        threadId,
+        objective,
+        status,
+        tokenBudget: asNumber(value.tokenBudget ?? value.token_budget),
+        tokensUsed: asNumber(value.tokensUsed ?? value.tokens_used) ?? 0,
+        timeUsedSeconds: asNumber(value.timeUsedSeconds ?? value.time_used_seconds) ?? 0,
+        createdAt: asNumber(value.createdAt ?? value.created_at) ?? 0,
+        updatedAt: asNumber(value.updatedAt ?? value.updated_at) ?? 0
+    }
+}
+
 function normalizeCodexTokenUsage(value: unknown, data?: Record<string, unknown>) {
     const info = isObject(value) ? value : null
     if (!info) return null
@@ -516,6 +535,40 @@ export function normalizeAgentRecord(
                 meta,
                 usage
             } : null
+        }
+
+        if (data.type === 'thread_goal_updated') {
+            const goal = normalizeThreadGoal(data.goal)
+            if (!goal) return null
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-updated',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? goal.threadId,
+                    turnId: asString(data.turnId ?? data.turn_id) ?? undefined,
+                    goal
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
+        if (data.type === 'thread_goal_cleared') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'thread-goal-cleared',
+                    threadId: asString(data.threadId ?? data.thread_id) ?? undefined
+                },
+                isSidechain: false,
+                meta
+            }
         }
 
         if (data.type === 'tool-call' && typeof data.callId === 'string') {

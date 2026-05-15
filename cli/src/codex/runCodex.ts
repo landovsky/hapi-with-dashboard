@@ -149,6 +149,27 @@ export async function runCodex(opts: {
                     model: currentModel,
                     modelReasoningEffort: currentModelReasoningEffort
                 });
+                if (slash.kind === 'goal') {
+                    if (slash.message) {
+                        session.sendAgentMessage({
+                            type: 'message',
+                            message: slash.message,
+                            id: randomUUID()
+                        });
+                    }
+                    const goalCommand = slash.action === 'set'
+                        ? `/goal ${slash.objective ?? ''}`
+                        : slash.action === 'show'
+                            ? '/goal'
+                            : `/goal ${slash.action}`;
+                    messageQueue.pushIsolateAndClear(goalCommand, {
+                        permissionMode: currentPermissionMode ?? 'default',
+                        model: currentModel,
+                        modelReasoningEffort: currentModelReasoningEffort,
+                        collaborationMode: currentCollaborationMode
+                    }, localId);
+                    return;
+                }
                 if (slash.kind !== 'passthrough') {
                     applySlashUpdates(slash.updates);
                     if (slash.message) {

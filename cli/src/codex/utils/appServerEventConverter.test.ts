@@ -16,6 +16,33 @@ describe('AppServerEventConverter', () => {
         expect(events).toEqual([{ type: 'thread_started', thread_id: 'thread-2' }]);
     });
 
+    it('maps thread goal updates and clears', () => {
+        const converter = new AppServerEventConverter();
+        const goal = {
+            threadId: 'thread-1',
+            objective: 'ship goal support',
+            status: 'active'
+        };
+
+        expect(converter.handleNotification('thread/goal/updated', {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            goal
+        })).toEqual([{
+            type: 'thread_goal_updated',
+            thread_id: 'thread-1',
+            turn_id: 'turn-1',
+            goal
+        }]);
+
+        expect(converter.handleNotification('thread/goal/cleared', {
+            threadId: 'thread-1'
+        })).toEqual([{
+            type: 'thread_goal_cleared',
+            thread_id: 'thread-1'
+        }]);
+    });
+
     it('maps thread systemError to a task failure', () => {
         const converter = new AppServerEventConverter();
         const events = converter.handleNotification('thread/status/changed', {

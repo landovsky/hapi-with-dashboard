@@ -116,6 +116,7 @@ describe('listSlashCommands', () => {
         expect(commands.map((command) => command.name)).toEqual(expect.arrayContaining([
             'clear',
             'compact',
+            'goal',
             'plan',
             'status',
             'model',

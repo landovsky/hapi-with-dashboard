@@ -96,6 +96,32 @@ describe('getEventPresentation — token-count', () => {
     })
 })
 
+describe('getEventPresentation — thread goals', () => {
+    it('formats goal status updates', () => {
+        const result = getEventPresentation({
+            type: 'thread-goal-updated',
+            goal: {
+                threadId: 'thread-1',
+                objective: 'ship goal support',
+                status: 'budgetLimited',
+                tokenBudget: 5000,
+                tokensUsed: 4100,
+                timeUsedSeconds: 0,
+                createdAt: 1,
+                updatedAt: 2
+            }
+        })
+
+        expect(result.text).toBe('Goal limited by budget · 4k / 5k')
+    })
+
+    it('formats goal clear events', () => {
+        const result = getEventPresentation({ type: 'thread-goal-cleared', threadId: 'thread-1' })
+
+        expect(result.text).toBe('Goal cleared')
+    })
+})
+
 describe('formatResetTime', () => {
     it('formats a unix timestamp to a non-empty string', () => {
         const result = formatResetTime(1774278000)

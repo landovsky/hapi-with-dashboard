@@ -15,6 +15,7 @@ import { hasCodexCliOverrides } from './utils/codexCliOverrides';
 import { AppServerEventConverter } from './utils/appServerEventConverter';
 import { registerAppServerPermissionHandlers } from './utils/appServerPermissionAdapter';
 import { buildThreadStartParams, buildTurnStartParams } from './utils/appServerConfig';
+import type { ThreadGoal, ThreadGoalStatus } from './appServerTypes';
 import { shouldIgnoreTerminalEvent } from './utils/terminalEventGuard';
 import { parseCodexSpecialCommand } from './codexSpecialCommands';
 import {
@@ -57,6 +58,8 @@ const CONTEXT_COMPACT_RETRYABLE_ERROR_PATTERNS = [
 const SAME_THREAD_MAX_RETRIES = 3;
 const SAME_THREAD_MAX_COMPACT_RETRIES = 1;
 const SAME_THREAD_COMPACT_TIMEOUT_MS = 10 * 60 * 1000;
+const CODEX_GOALS_UNSUPPORTED_MESSAGE = 'Codex goals are not supported by this Codex runtime. Upgrade Codex or enable features.goals.';
+const MAX_CODEX_GOAL_OBJECTIVE_CHARS = 4_000;
 
 function isSameThreadRetryableCodexError(error: string | null): boolean {
     if (!error) {
@@ -72,6 +75,31 @@ function isContextCompactRetryableCodexError(error: string | null): boolean {
     }
     const normalized = error.toLowerCase();
     return CONTEXT_COMPACT_RETRYABLE_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+function formatGoalStatus(status: unknown): string {
+    switch (status) {
+        case 'active':
+            return 'active';
+        case 'paused':
+            return 'paused';
+        case 'budgetLimited':
+            return 'limited by budget';
+        case 'complete':
+            return 'complete';
+        default:
+            return typeof status === 'string' ? status : 'updated';
+    }
+}
+
+function formatGoalUsage(goal: ThreadGoal): string {
+    const parts: string[] = [`Goal ${formatGoalStatus(goal.status)}`];
+    if (goal.tokenBudget !== null && goal.tokenBudget !== undefined) {
+        parts.push(`${goal.tokensUsed}/${goal.tokenBudget} tokens`);
+    } else if (goal.tokensUsed > 0) {
+        parts.push(`${goal.tokensUsed} tokens`);
+    }
+    return parts.join(' · ');
 }
 
 class CodexRemoteLauncher extends RemoteLauncherBase {
@@ -547,7 +575,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         };
 
         const isScopeSensitiveCodexEvent = (type: string): boolean => {
-            return type === 'token_count' || type === 'context_compacted';
+            return type === 'token_count'
+                || type === 'context_compacted'
+                || type === 'thread_goal_updated'
+                || type === 'thread_goal_cleared';
         };
 
         const hasKnownChildAgents = (): boolean => {
@@ -1741,6 +1772,22 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 return;
             }
 
+            if (msgType === 'thread_goal_updated') {
+                session.sendAgentMessage({
+                    ...addCodexEventScope(msg, 'parent', eventThreadId ?? this.currentThreadId),
+                    id: randomUUID()
+                });
+                return;
+            }
+
+            if (msgType === 'thread_goal_cleared') {
+                session.sendAgentMessage({
+                    ...addCodexEventScope(msg, 'parent', eventThreadId ?? this.currentThreadId),
+                    id: randomUUID()
+                });
+                return;
+            }
+
             if (msgType === 'task_started') {
                 const turnId = eventTurnId;
                 if (turnId) {
@@ -2229,6 +2276,14 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         });
         let supportsTurnCollaborationMode = true;
         let supportsPlanCollaborationMode = true;
+        let supportsGoals = true;
+        try {
+            await appServerClient.setExperimentalFeatureEnablement({ enablement: { goals: true } });
+            logger.debug('[Codex] goals feature enabled');
+        } catch (error) {
+            supportsGoals = false;
+            logger.debug(`[Codex] failed to enable goals feature: ${errorMessage(error)}`);
+        }
         try {
             const response = await appServerClient.listCollaborationModes();
             const hasPlanMode = responseContainsPlanCollaborationMode(response);
@@ -2268,6 +2323,13 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         const sendVisibleStatus = (message: string) => {
             messageBuffer.addMessage(message, 'status');
             session.sendSessionEvent({ type: 'message', message });
+        };
+
+        const sendGoalEvent = (event: Record<string, unknown>) => {
+            session.sendAgentMessage({
+                ...addCodexEventScope(event, 'parent', this.currentThreadId),
+                id: randomUUID()
+            });
         };
 
         const resetCurrentTurnState = () => {
@@ -2325,6 +2387,188 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
                 logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate} for /compact`, error);
                 return null;
             }
+        };
+
+        const parseGoalCommand = (text: string): {
+            action: 'show' | 'set' | 'pause' | 'resume' | 'clear';
+            objective?: string;
+            error?: string;
+        } | null => {
+            const match = /^\s*\/goal(?:\s+([\s\S]*))?$/i.exec(text);
+            if (!match) return null;
+            const rest = match[1]?.trim() ?? '';
+            if (!rest) return { action: 'show' };
+            switch (rest.toLowerCase()) {
+                case 'clear':
+                    return { action: 'clear' };
+                case 'pause':
+                    return { action: 'pause' };
+                case 'resume':
+                    return { action: 'resume' };
+                default:
+                    if ([...rest].length > MAX_CODEX_GOAL_OBJECTIVE_CHARS) {
+                        return { action: 'set', error: `Goal objective must be at most ${MAX_CODEX_GOAL_OBJECTIVE_CHARS} characters.` };
+                    }
+                    return { action: 'set', objective: rest };
+            }
+        };
+
+        const ensureThreadForGoal = async (mode: EnhancedMode): Promise<string | null> => {
+            if (this.currentThreadId && this.currentThreadId !== invalidThreadId) {
+                hasThread = true;
+                return this.currentThreadId;
+            }
+
+            const resumeCandidate = session.sessionId && session.sessionId !== invalidThreadId
+                ? session.sessionId
+                : null;
+            if (resumeCandidate) {
+                const threadParams = buildThreadStartParams({
+                    cwd: session.path,
+                    mode,
+                    mcpServers,
+                    cliOverrides: session.codexCliOverrides
+                });
+                try {
+                    const resumeResponse = await appServerClient.resumeThread({
+                        threadId: resumeCandidate,
+                        ...threadParams
+                    }, {
+                        signal: this.abortController.signal
+                    });
+                    const resumeRecord = asRecord(resumeResponse);
+                    const resumeThread = resumeRecord ? asRecord(resumeRecord.thread) : null;
+                    const threadId = asString(resumeThread?.id) ?? resumeCandidate;
+                    applyResolvedModel(resumeRecord?.model);
+                    this.currentThreadId = threadId;
+                    session.onSessionFound(threadId);
+                    hasThread = true;
+                    return threadId;
+                } catch (error) {
+                    logger.warn(`[Codex] Failed to resume app-server thread ${resumeCandidate} for /goal`, error);
+                    sendVisibleStatus(`Goal failed: Codex conversation ${resumeCandidate} could not be resumed`);
+                    return null;
+                }
+            }
+
+            if (!hasThread) {
+                const threadParams = buildThreadStartParams({
+                    cwd: session.path,
+                    mode,
+                    mcpServers,
+                    cliOverrides: session.codexCliOverrides
+                });
+                const threadResponse = await appServerClient.startThread(threadParams, {
+                    signal: this.abortController.signal
+                });
+                const threadRecord = asRecord(threadResponse);
+                const thread = threadRecord ? asRecord(threadRecord.thread) : null;
+                const threadId = asString(thread?.id);
+                applyResolvedModel(threadRecord?.model);
+                if (!threadId) {
+                    throw new Error('app-server thread/start did not return thread.id');
+                }
+                this.currentThreadId = threadId;
+                session.onSessionFound(threadId);
+                hasThread = true;
+                return threadId;
+            }
+
+            return null;
+        };
+
+        const normalizeGoal = (goal: ThreadGoal): ThreadGoal => ({
+            ...goal,
+            threadId: asString((goal as unknown as Record<string, unknown>).threadId ?? (goal as unknown as Record<string, unknown>).thread_id) ?? goal.threadId,
+            tokenBudget: (goal as unknown as Record<string, unknown>).tokenBudget as number | null | undefined
+                ?? (goal as unknown as Record<string, unknown>).token_budget as number | null | undefined
+                ?? null,
+            tokensUsed: (goal as unknown as Record<string, unknown>).tokensUsed as number | undefined
+                ?? (goal as unknown as Record<string, unknown>).tokens_used as number | undefined
+                ?? 0,
+            timeUsedSeconds: (goal as unknown as Record<string, unknown>).timeUsedSeconds as number | undefined
+                ?? (goal as unknown as Record<string, unknown>).time_used_seconds as number | undefined
+                ?? 0,
+            createdAt: (goal as unknown as Record<string, unknown>).createdAt as number | undefined
+                ?? (goal as unknown as Record<string, unknown>).created_at as number | undefined
+                ?? 0,
+            updatedAt: (goal as unknown as Record<string, unknown>).updatedAt as number | undefined
+                ?? (goal as unknown as Record<string, unknown>).updated_at as number | undefined
+                ?? 0
+        });
+
+        const handleGoalCommand = async (message: QueuedMessage): Promise<boolean> => {
+            const command = parseGoalCommand(message.message);
+            if (!command) {
+                return false;
+            }
+
+            await interruptActiveTurn();
+            resetCurrentTurnState();
+
+            if (command.error) {
+                sendVisibleStatus(command.error);
+                return true;
+            }
+
+            if (!supportsGoals) {
+                sendVisibleStatus(CODEX_GOALS_UNSUPPORTED_MESSAGE);
+                return true;
+            }
+
+            const threadId = await ensureThreadForGoal(message.mode);
+            if (!threadId) {
+                return true;
+            }
+
+            try {
+                if (command.action === 'show') {
+                    const response = await appServerClient.getThreadGoal({ threadId }, {
+                        signal: this.abortController.signal
+                    });
+                    const goal = response.goal ? normalizeGoal(response.goal) : null;
+                    if (!goal) {
+                        sendVisibleStatus('Usage: /goal <objective>');
+                        sendGoalEvent({ type: 'thread_goal_cleared', thread_id: threadId });
+                        return true;
+                    }
+                    sendVisibleStatus(formatGoalUsage(goal));
+                    sendGoalEvent({ type: 'thread_goal_updated', thread_id: threadId, goal });
+                    return true;
+                }
+
+                if (command.action === 'clear') {
+                    const response = await appServerClient.clearThreadGoal({ threadId }, {
+                        signal: this.abortController.signal
+                    });
+                    if (response.cleared) {
+                        sendVisibleStatus('Goal cleared');
+                    } else {
+                        sendVisibleStatus('No goal to clear');
+                    }
+                    return true;
+                }
+
+                const status: ThreadGoalStatus = command.action === 'pause' ? 'paused' : 'active';
+                const response = await appServerClient.setThreadGoal({
+                    threadId,
+                    ...(command.action === 'set' ? { objective: command.objective } : {}),
+                    status
+                }, {
+                    signal: this.abortController.signal
+                });
+                const goal = normalizeGoal(response.goal);
+                sendVisibleStatus(formatGoalUsage(goal));
+            } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                if (/goals feature is disabled|unsupported remote app-server request|method not found/i.test(detail)) {
+                    supportsGoals = false;
+                    sendVisibleStatus(CODEX_GOALS_UNSUPPORTED_MESSAGE);
+                } else {
+                    sendVisibleStatus(`Goal failed: ${detail}`);
+                }
+            }
+            return true;
         };
 
         const handleSpecialCommand = async (message: QueuedMessage): Promise<boolean> => {
@@ -2413,6 +2657,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             activeMessage = message;
 
             try {
+                if (await handleGoalCommand(message)) {
+                    continue;
+                }
+
                 if (await handleSpecialCommand(message)) {
                     continue;
                 }

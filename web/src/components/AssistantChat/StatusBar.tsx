@@ -8,6 +8,7 @@ import type { PermissionModeTone } from '@hapi/protocol'
 import { useMemo } from 'react'
 import type { AgentState, CodexCollaborationMode, PermissionMode } from '@/types/api'
 import type { ConversationStatus } from '@/realtime/types'
+import type { ThreadGoal } from '@/types/api'
 import { getContextBudgetTokens } from '@/chat/modelConfig'
 import { useTranslation } from '@/lib/use-translation'
 
@@ -150,6 +151,7 @@ export function StatusBar(props: {
     modelReasoningEffort?: string | null
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
+    threadGoal?: ThreadGoal | null
     agentFlavor?: string | null
     voiceStatus?: ConversationStatus
 }) {
@@ -202,6 +204,11 @@ export function StatusBar(props: {
     const codexFastMode = props.agentFlavor === 'codex'
         ? isCodexFastMode(props.model, props.modelReasoningEffort)
         : false
+    const goalLabel = props.agentFlavor === 'codex' && props.threadGoal
+        ? props.threadGoal.status === 'active'
+            ? 'goal'
+            : `goal ${props.threadGoal.status === 'budgetLimited' ? 'limited' : props.threadGoal.status}`
+        : null
 
     return (
         <div className="flex items-center justify-between px-2 pb-1">
@@ -235,6 +242,11 @@ export function StatusBar(props: {
                 {codexFastMode ? (
                     <span className="text-xs text-[#34C759]">
                         fast
+                    </span>
+                ) : null}
+                {goalLabel ? (
+                    <span className="text-xs text-[var(--app-link)]">
+                        {goalLabel}
                     </span>
                 ) : null}
                 {collaborationModeLabel ? (

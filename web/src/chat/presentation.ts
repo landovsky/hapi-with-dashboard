@@ -58,6 +58,27 @@ function formatTokenCount(value: number): string {
     return String(value)
 }
 
+function formatGoalStatus(status: string): string {
+    if (status === 'active') return 'active'
+    if (status === 'paused') return 'paused'
+    if (status === 'budgetLimited') return 'limited by budget'
+    if (status === 'complete') return 'complete'
+    return status
+}
+
+function formatThreadGoalEvent(event: AgentEvent): EventPresentation {
+    const goal = asRecord((event as Record<string, unknown>).goal)
+    if (!goal) return { icon: null, text: 'Goal updated' }
+    const status = typeof goal.status === 'string' ? goal.status : 'updated'
+    const tokensUsed = asNumber(goal.tokensUsed ?? goal.tokens_used)
+    const tokenBudget = asNumber(goal.tokenBudget ?? goal.token_budget)
+    const parts = [`Goal ${formatGoalStatus(status)}`]
+    if (tokensUsed !== null && tokenBudget !== null) {
+        parts.push(`${formatTokenCount(tokensUsed)} / ${formatTokenCount(tokenBudget)}`)
+    }
+    return { icon: null, text: parts.join(' · ') }
+}
+
 function formatTokenCountEvent(event: AgentEvent): EventPresentation {
     const info = asRecord((event as Record<string, unknown>).info)
     const total = asRecord(info?.total) ?? info
@@ -147,6 +168,12 @@ export function getEventPresentation(event: AgentEvent): EventPresentation {
     }
     if (event.type === 'compact') {
         return { icon: '📦', text: 'Conversation compacted' }
+    }
+    if (event.type === 'thread-goal-updated') {
+        return formatThreadGoalEvent(event)
+    }
+    if (event.type === 'thread-goal-cleared') {
+        return { icon: null, text: 'Goal cleared' }
     }
     if (event.type === 'token-count') {
         return formatTokenCountEvent(event)

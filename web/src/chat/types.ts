@@ -1,4 +1,5 @@
 import type { AttachmentMetadata, MessageStatus } from '@/types/api'
+import type { ThreadGoal } from '@/types/api'
 
 export type UsageData = {
     input_tokens: number
@@ -23,6 +24,8 @@ export type AgentEvent =
     | { type: 'turn-duration'; durationMs: number; targetMessageId?: string }
     | { type: 'microcompact'; trigger: string; preTokens: number; tokensSaved: number }
     | { type: 'compact'; trigger: string; preTokens: number }
+    | { type: 'thread-goal-updated'; goal: ThreadGoal; threadId?: string; turnId?: string }
+    | { type: 'thread-goal-cleared'; threadId?: string }
     | ({ type: string } & Record<string, unknown>)
 
 export type ToolResultPermission = {
