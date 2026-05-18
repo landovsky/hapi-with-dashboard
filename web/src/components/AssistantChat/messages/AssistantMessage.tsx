@@ -59,6 +59,7 @@ export function HappyAssistantMessage() {
     const durationMs = useAssistantState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.durationMs)
     const usage = useAssistantState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.usage)
     const messageModel = useAssistantState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.model)
+    const turnCount = useAssistantState(({ message }) => (message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined)?.turnCount)
 
     const hasMetadata = invokedAt != null
         || (typeof durationMs === 'number' && durationMs >= 0)
@@ -100,6 +101,7 @@ export function HappyAssistantMessage() {
                         durationMs={durationMs}
                         usage={usage}
                         model={messageModel ?? null}
+                        turnCount={turnCount}
                         className="mt-1"
                     />
                 )}
@@ -158,16 +160,26 @@ export function HappyAssistantMessage() {
                 id={getConversationMessageAnchorId(messageId)}
                 className={`${rootClass} ${copyText ? 'group/msg' : ''} scroll-mt-4`}
             >
-                <MessagePrimitive.Content components={MESSAGE_PART_COMPONENTS} />
-                {showMetadata && (
-                    <MessageMetadata
-                        invokedAt={invokedAt}
-                        durationMs={durationMs}
-                        usage={usage}
-                        model={messageModel ?? null}
-                        className="mt-1"
-                    />
-                )}
+                <div
+                    className={hasMetadata ? 'min-w-0 cursor-pointer' : 'min-w-0'}
+                    onClick={hasMetadata ? toggleMetadata : undefined}
+                    onKeyDown={hasMetadata ? onMetadataKeyDown : undefined}
+                    role={hasMetadata ? 'button' : undefined}
+                    tabIndex={hasMetadata ? 0 : undefined}
+                    aria-expanded={hasMetadata ? showMetadata : undefined}
+                >
+                    <MessagePrimitive.Content components={MESSAGE_PART_COMPONENTS} />
+                    {showMetadata && (
+                        <MessageMetadata
+                            invokedAt={invokedAt}
+                            durationMs={durationMs}
+                            usage={usage}
+                            model={messageModel ?? null}
+                            turnCount={turnCount}
+                            className="mt-1"
+                        />
+                    )}
+                </div>
             </MessagePrimitive.Root>
         )
     }
@@ -193,6 +205,7 @@ export function HappyAssistantMessage() {
                             durationMs={durationMs}
                             usage={usage}
                             model={messageModel ?? null}
+                            turnCount={turnCount}
                             className="mt-1"
                         />
                     )}
