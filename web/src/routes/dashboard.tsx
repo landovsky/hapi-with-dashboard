@@ -175,6 +175,14 @@ function DashboardTile({
             className={`vd-tile${expanded ? ' vd-exp' : ''}${row.status === 'dead' ? ' vd-dead' : ''}`}
             style={{ borderLeftColor: meta.accent }}
             onClick={onToggle}
+            onKeyDown={(e) => {
+                // Toggle on Enter/Space only when the tile itself holds focus —
+                // never when the key bubbled up from an inner action button.
+                if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+                    e.preventDefault()
+                    onToggle()
+                }
+            }}
             role="button"
             tabIndex={0}
             aria-expanded={expanded}

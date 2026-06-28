@@ -278,3 +278,14 @@
 @keyframes vv-spin {
     to { transform: rotate(360deg); }
 }
+
+/* Reduced-motion: still the equaliser bars, rings and spinner, but keep static
+   stand-ins so "speaking", "listening" and "sending" remain legible without
+   leaning on movement. */
+@media (prefers-reduced-motion: reduce) {
+    .vv-wave span,
+    .vv-mic-live-wave span { animation: none; }
+    .vv-mic-btn.vv-listening::before,
+    .vv-mic-btn.vv-listening::after { animation: none; opacity: 0.4; }
+    .vv-spinner { animation: none; border-top-color: rgba(255, 255, 255, 0.6); }
+}
