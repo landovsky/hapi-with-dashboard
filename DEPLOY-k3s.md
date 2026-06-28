@@ -33,56 +33,53 @@ k3s deployment (https://hapi.kopernici.cz). Written 2026-06-28.
   **SSE response buffering disabled** (good — the dashboard/voice use SSE).
 - `pvc.yaml` — 1Gi RWO at `/root/.hapi` (sessions + now also `hapi-ext.db`).
 
-## What must change
+## Build & release (reproducible — tagged deploys)
 
-- [ ] **Ship the fork as an image** (not npm-global) and point the deployment at it.
-- [ ] **Rebuild + embed the web PWA** so the hub serves the *new* dashboard —
-      `bun run build` runs `web` build → `generate:embedded-web-assets` → hub build.
-      (Skipping the embed step ships the new server with the *old* UI.)
-- [ ] **Add `GEMINI_API_KEY`** to `hapi-hub-secrets` — `/summarize` + `/suggest-replies`
-      fail soft with HTTP 400 until it's present (rest of the board works without it).
-- [ ] Confirm the **hub entrypoint** for the fork (see "Open decisions").
+The image build now lives in the repo, mirroring the other k3s apps
+(`landovsky/pharmacy`): **push a semver tag and CI builds + pushes to GHCR.**
 
-## Recommended path — local image, import into k3s (single-node, no registry)
+- **`Dockerfile`** — two-stage Bun build: installs, runs `bun run build` (web →
+  `generate:embedded-web-assets` → hub), then a slim runtime that runs the hub
+  **from source**: `bun run hub/src/index.ts` (entry → `startHub()`, listens on
+  3006). `bun:sqlite` means no native modules. Data dir pinned to
+  `HAPI_HOME=/root/.hapi` to match the PVC mount. *Validated locally: builds,
+  boots, `/health` → 200.*
+- **`.github/workflows/k3s-deploy.yml`** — on `push: tags: ['v*.*.*']` (+
+  manual `workflow_dispatch`), builds and pushes `ghcr.io/landovsky/hapi-hub`
+  tagged `{{version}}`, `{{major}}.{{minor}}`, `{{major}}`, and `sha-…`.
 
-Leanest for this homelab; avoids standing up/authing a registry.
+### Cut a release
 
-- [ ] Add a `Dockerfile` to the fork: `FROM oven/bun:1`; copy repo; `bun install`;
-      `bun run build`; entrypoint that boots the hub on :3006 (see Open decisions).
-- [ ] Build + import into k3s's containerd:
+```bash
+git tag v0.1.0 && git push origin v0.1.0      # → CI builds ghcr.io/landovsky/hapi-hub:0.1.0
+```
+
+Then point the cluster at that tag (k3s repo, Flux applies within 5 min):
+
+- [ ] In `~/git/k3s/apps/hapi-hub/deployment.yaml`, set
+      `image: ghcr.io/landovsky/hapi-hub:0.1.0` (currently pinned to the mutable
+      `:voice-dashboard` tag). Keep `imagePullPolicy`, `env`, `envFrom`, `ports`,
+      `volumeMounts`, probes as-is — the image provides its own `CMD`, so there
+      must be **no `command:` override**.
+- [ ] Commit + push the k3s repo → Flux rolls it out. (Force now with
+      `kubectl rollout restart deploy/hapi-hub -n default` — `imagePullPolicy` is
+      already `Always`.)
+- [ ] **`GEMINI_API_KEY`** in `hapi-hub-secrets` (for `/summarize` +
+      `/suggest-replies`; the rest works without it):
   ```bash
-  docker build -t hapi-hub-fork:voice-dashboard .
-  docker save hapi-hub-fork:voice-dashboard | sudo k3s ctr images import -
+  kubectl -n default patch secret hapi-hub-secrets --type=merge \
+    -p '{"stringData":{"GEMINI_API_KEY":"…","ELEVENLABS_API_KEY":"…"}}'
   ```
-- [ ] Edit `~/git/k3s/apps/hapi-hub/deployment.yaml`:
-  - `image: docker.io/library/hapi-hub-fork:voice-dashboard`
-  - `imagePullPolicy: Never` (image lives only in local containerd)
-  - **remove** the `npm install … && exec hapi hub` command block — let the image's
-    entrypoint run; keep `env`, `envFrom`, `ports`, `volumeMounts`, probes as-is.
-- [ ] Add the Gemini key to the secret (envFrom picks it up automatically):
-  ```bash
-  kubectl -n default create secret generic hapi-hub-secrets \
-    --from-literal=CLI_API_TOKEN="…" \
-    --from-literal=ELEVENLABS_API_KEY="…" \
-    --from-literal=GEMINI_API_KEY="…" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  ```
-- [ ] Commit the deployment.yaml change to the **k3s repo** → Flux applies within 5 min
-      (or `kubectl rollout restart deploy/hapi-hub -n default` to force now).
 
-### Alternative — GHCR image (if multi-node or you want pure GitOps)
-- [ ] Build + push `ghcr.io/<user>/hapi-hub:voice-dashboard`; add an `imagePullSecret`
-      if the package is private; set `imagePullPolicy: IfNotPresent`.
-- [ ] Same deployment.yaml + secret edits. Cleaner for reproducible GitOps, but
-      needs registry auth on the cluster.
+### Local build (no CI / no registry)
 
-## Open decisions / things to verify
+```bash
+docker build -t ghcr.io/landovsky/hapi-hub:dev .
+docker save ghcr.io/landovsky/hapi-hub:dev | sudo k3s ctr images import -   # single-node
+```
 
-- **Hub entrypoint in the image.** Upstream runs the CLI subcommand `hapi hub`.
-  For the fork, confirm which boots the hub server on :3006 with a working `/health`:
-  (a) `bun run build:single-exe` → run the produced `hapi` binary `hapi hub`
-  (mirrors upstream exactly), or (b) run the built hub bundle directly via `bun`.
-  Recommend (a) — least surprise, same command the manifest already used.
+## Things to verify
+
 - **STT body size.** `/stt` reads the raw audio body (~30–60s clips). Verify Traefik
   doesn't cap request body for that route; raise the limit if uploads 413.
 - **PVC carries `hapi-ext.db`.** It's created next to `hapi.db` on first run on the
