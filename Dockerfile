@@ -45,6 +45,10 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/shared ./shared
 COPY --from=build /app/hub ./hub
+# The hub runs from source (isBunCompiled() is false), so it serves the built
+# PWA from web/dist — findWebappDistDir() resolves /app/web/dist. Must be copied
+# or the UI 503s with "Mini App is not built" while /api still works.
+COPY --from=build /app/web/dist ./web/dist
 
 EXPOSE 3006
 CMD ["bun", "run", "hub/src/index.ts"]
