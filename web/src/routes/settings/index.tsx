@@ -38,6 +38,7 @@ import {
 import { useAppearance, getAppearanceOptions, type AppearancePreference } from '@/hooks/useTheme'
 import { useThemeColors, type ThemeColorKeyId } from '@/hooks/useThemeColors'
 import { PROTOCOL_VERSION } from '@hapi/protocol'
+import { CheckForUpdatesRow } from '@/components/CheckForUpdatesRow'
 import { VoiceRespondsControls, VoiceSoundsControls, VoicePersonaControls, VoiceDiagnosticsControls } from '@/components/settings/VoiceAdvancedControls'
 
 const locales: { value: Locale; nativeLabel: string }[] = [
@@ -1281,6 +1282,7 @@ export default function SettingsPage() {
                             <span className="text-[var(--app-fg)]">{t('settings.about.protocolVersion')}</span>
                             <span className="text-[var(--app-hint)]">{PROTOCOL_VERSION}</span>
                         </div>
+                        <CheckForUpdatesRow />
                     </div>
                 </div>
             </div>

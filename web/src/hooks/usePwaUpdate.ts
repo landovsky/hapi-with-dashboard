@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { registerSW } from 'virtual:pwa-register'
 
-export const PWA_UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000
+// Check for a new deploy every 15 min (was 60). Combined with the on-focus
+// check below, this surfaces the update banner soon after a rollout instead of
+// the operator having to reinstall the PWA to get the fresh version.
+export const PWA_UPDATE_CHECK_INTERVAL_MS = 15 * 60 * 1000
 export const PWA_UPDATE_RELOAD_FALLBACK_MS = 2000
 
 export async function requestPwaUpdateReload(
@@ -81,6 +84,7 @@ export function setupRegistrationUpdateChecks(
 export function usePwaUpdate() {
     const [needRefresh, setNeedRefresh] = useState(false)
     const updateSWRef = useRef<((reloadPage?: boolean) => Promise<void>) | null>(null)
+    const registrationRef = useRef<ServiceWorkerRegistration | null>(null)
     const cleanupRef = useRef<(() => void) | null>(null)
 
     useEffect(() => {
@@ -94,6 +98,7 @@ export function usePwaUpdate() {
             onRegistered(registration) {
                 cleanupRef.current?.()
                 cleanupRef.current = null
+                registrationRef.current = registration ?? null
 
                 if (!registration) {
                     return
@@ -112,6 +117,7 @@ export function usePwaUpdate() {
             cleanupRef.current?.()
             cleanupRef.current = null
             updateSWRef.current = null
+            registrationRef.current = null
         }
     }, [])
 
@@ -119,5 +125,21 @@ export function usePwaUpdate() {
         void requestPwaUpdateReload(updateSWRef.current)
     }, [])
 
-    return { needRefresh, reload }
+    // Force an immediate check against the server. Resolves true when a newer
+    // service worker is now downloading/waiting (the update banner will follow
+    // via onNeedRefresh); false when already current or SW unavailable.
+    const checkForUpdate = useCallback(async (): Promise<boolean> => {
+        const registration = registrationRef.current
+        if (!registration) {
+            return false
+        }
+        try {
+            await registration.update()
+        } catch {
+            return false
+        }
+        return Boolean(registration.installing || registration.waiting)
+    }, [])
+
+    return { needRefresh, reload, checkForUpdate }
 }
