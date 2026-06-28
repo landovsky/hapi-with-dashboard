@@ -30,6 +30,7 @@ import { createTtsRoutes } from './routes/tts'
 import { createSttRoutes } from './routes/stt'
 import { createSummarizeRoutes } from './routes/summarize'
 import { createSuggestRepliesRoutes } from './routes/suggestReplies'
+import { createDashboardSessionsRoutes } from './routes/dashboardSessions'
 import type { ExtStore } from '../ext/extStore'
 import type { SSEManager } from '../sse/sseManager'
 import type { VisibilityTracker } from '../visibility/visibilityTracker'
@@ -263,6 +264,7 @@ function createWebApp(options: {
     app.route('/api', createSttRoutes())
     app.route('/api', createSummarizeRoutes())
     app.route('/api', createSuggestRepliesRoutes())
+    app.route('/api', createDashboardSessionsRoutes(options.getSyncEngine))
 
     // Skip static serving in relay mode, show helpful message on root
     if (options.relayMode) {

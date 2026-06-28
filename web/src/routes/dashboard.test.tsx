@@ -8,8 +8,16 @@ const context = describe
 // The board pulls sessions from this hook — feed it fixtures so the render
 // exercises the real status derivation + grouping, not a stub.
 const sessions: SessionSummary[] = []
-vi.mock('@/hooks/queries/useSessions', () => ({
-    useSessions: () => ({ sessions, isLoading: false, error: null, refetch: vi.fn() })
+vi.mock('@/hooks/queries/useDashboardSessions', () => ({
+    useDashboardSessions: () => ({
+        sessions,
+        total: sessions.length,
+        shown: sessions.length,
+        days: 5,
+        isLoading: false,
+        error: null,
+        refetch: vi.fn()
+    })
 }))
 // Pins / read-state ride on react-query inside the component; stub the query
 // layer so no network is attempted and nothing is pinned by default.
@@ -95,10 +103,10 @@ describe('DashboardPage', () => {
     })
 
     context('an empty fleet should say so plainly, not render a broken shell', () => {
-        it('shows the no-sessions message when there is nothing live', () => {
+        it('shows the empty-window message (and nudges Show all) when nothing is recent', () => {
             setSessions([])
             render(<DashboardPage />)
-            expect(screen.getByText('No live sessions.')).toBeInTheDocument()
+            expect(screen.getByText(/Nothing in the last 5 days/)).toBeInTheDocument()
         })
     })
 })
