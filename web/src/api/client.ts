@@ -24,6 +24,7 @@ import type {
     SessionsResponse
 } from '@/types/api'
 import type {
+    DashboardSessionsResponse,
     PinsResponse,
     ReadStateResponse,
     SttResponse,
@@ -200,6 +201,21 @@ export class ApiClient {
     // These hit the additive `/api/pins` and `/api/read-state` routes backed by
     // the separate hapi-ext.db. All sit behind the same JWT middleware, so they
     // inherit auth + namespace for free.
+
+    /** Dashboard session list, filtered to the last `days` (default 5) on the
+     *  backend so a 900-session store doesn't ship in full. `all` returns
+     *  everything; `total` in the response is the unfiltered count. */
+    async getDashboardSessions(opts?: { all?: boolean; days?: number }): Promise<DashboardSessionsResponse> {
+        const params = new URLSearchParams()
+        if (opts?.all) {
+            params.set('all', 'true')
+        }
+        if (opts?.days !== undefined) {
+            params.set('days', String(opts.days))
+        }
+        const qs = params.toString()
+        return await this.request<DashboardSessionsResponse>(`/api/dashboard/sessions${qs ? `?${qs}` : ''}`)
+    }
 
     /** Pinned sessions in the operator's manual order (never auto-sorted). */
     async listPins(): Promise<PinsResponse> {

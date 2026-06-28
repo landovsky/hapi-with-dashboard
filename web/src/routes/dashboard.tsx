@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAppContext } from '@/lib/app-context'
-import { useSessions } from '@/hooks/queries/useSessions'
+import { useDashboardSessions } from '@/hooks/queries/useDashboardSessions'
 import { useGitStatusFiles } from '@/hooks/queries/useGitStatusFiles'
 import {
     DASHBOARD_STATUS_META,
@@ -12,6 +12,7 @@ import {
     deriveDashboardStatus,
     formatElapsed
 } from '@/lib/dashboardStatus'
+import { groupRowsByProject, matchesQuery, projectKey } from '@/lib/dashboardView'
 import type { ApiClient } from '@/api/client'
 import type { GitStatusFiles, SessionSummary } from '@/types/api'
 import { LoadingState } from '@/components/LoadingState'
@@ -24,6 +25,8 @@ interface DashboardRow {
     status: DashboardStatus
     title: string
     snippet: string
+    /** Project key (worktree root / cwd / 'Other') — for grouping + search. */
+    project: string
     elapsed: { text: string; warnLong: boolean }
     unread: boolean
     pinned: boolean
@@ -252,17 +255,17 @@ export default function DashboardPage() {
     const navigate = useNavigate()
     const queryClient = useQueryClient()
     const now = useNow()
-    const { sessions, isLoading, error, refetch: refetchSessions } = useSessions(api)
     const [expandedId, setExpandedId] = useState<string | null>(null)
     const [sentNotes, setSentNotes] = useState<Record<string, { text: string; failed: boolean }>>({})
+    // Toolbar state: show-all overrides the backend 5-day window; search filters
+    // locally; group toggles the project layout.
+    const [showAll, setShowAll] = useState(false)
+    const [search, setSearch] = useState('')
+    const [grouped, setGrouped] = useState(false)
 
-    // A glanceable board has to be a LIVE board — poll the session list so
-    // statuses, snippets and the waiting pill stay current without a manual
-    // refresh ("in 5 seconds see what needs me"). Elapsed clocks tick via useNow.
-    useEffect(() => {
-        const id = setInterval(() => { void refetchSessions() }, 10_000)
-        return () => clearInterval(id)
-    }, [refetchSessions])
+    // Sessions come pre-filtered to the last few days from the backend (or all,
+    // when the checkbox is on). The hook polls so the board stays live.
+    const { sessions, total, days, isLoading, error } = useDashboardSessions(api, showAll)
 
     const pinsQuery = useQuery({
         queryKey: ['dashboard', 'pins'],
@@ -283,35 +286,59 @@ export default function DashboardPage() {
     }, [pinsQuery.data])
     const readState = readStateQuery.data?.readState ?? {}
 
-    const { pinnedRows, otherRows, waitingRow } = useMemo(() => {
-        const rows: DashboardRow[] = sessions.map((summary) => {
-            const lastSeenAt = readState[summary.id] ?? 0
-            const status = deriveDashboardStatus(summary, { lastSeenAt, now })
-            return {
-                summary,
-                status,
-                title: dashboardSessionTitle(summary),
-                snippet: dashboardSessionSnippet(summary),
-                elapsed: formatElapsed(summary, status, now),
-                unread: summary.updatedAt > lastSeenAt && lastSeenAt > 0,
-                pinned: pinOrder.has(summary.id)
-            }
-        })
+    const allRows = useMemo<DashboardRow[]>(() => sessions.map((summary) => {
+        const lastSeenAt = readState[summary.id] ?? 0
+        const status = deriveDashboardStatus(summary, { lastSeenAt, now })
+        return {
+            summary,
+            status,
+            title: dashboardSessionTitle(summary),
+            snippet: dashboardSessionSnippet(summary),
+            project: projectKey(summary),
+            elapsed: formatElapsed(summary, status, now),
+            unread: summary.updatedAt > lastSeenAt && lastSeenAt > 0,
+            pinned: pinOrder.has(summary.id)
+        }
+    }), [sessions, readState, pinOrder, now])
 
-        const pinned = rows
+    // Local fulltext over what the row already shows — no server round-trip.
+    const filteredRows = useMemo(() => {
+        if (!search.trim()) {
+            return allRows
+        }
+        return allRows.filter((r) => matchesQuery(
+            [r.title, r.snippet, r.project, DASHBOARD_STATUS_META[r.status].short, r.summary.metadata?.path, r.summary.model],
+            search
+        ))
+    }, [allRows, search])
+
+    const pinnedRows = useMemo(
+        () => filteredRows
             .filter((r) => r.pinned)
-            .sort((a, b) => (pinOrder.get(a.summary.id) ?? 0) - (pinOrder.get(b.summary.id) ?? 0))
-        // "Everything else" most-recent-first; pinned rows are the manually
-        // ordered set, the rest follows recency so fresh activity floats up.
-        const others = rows
+            .sort((a, b) => (pinOrder.get(a.summary.id) ?? 0) - (pinOrder.get(b.summary.id) ?? 0)),
+        [filteredRows, pinOrder]
+    )
+    // "Everything else" most-recent-first; pinned rows are the manually ordered
+    // set, the rest follows recency so fresh activity floats up.
+    const otherRows = useMemo(
+        () => filteredRows
             .filter((r) => !r.pinned)
-            .sort((a, b) => b.summary.updatedAt - a.summary.updatedAt)
-
-        const waiting = others.find((r) => r.status === 'waiting') ?? pinned.find((r) => r.status === 'waiting') ?? null
-        return { pinnedRows: pinned, otherRows: others, waitingRow: waiting }
-    }, [sessions, readState, pinOrder, now])
+            .sort((a, b) => b.summary.updatedAt - a.summary.updatedAt),
+        [filteredRows]
+    )
+    const waitingRow = useMemo(
+        () => otherRows.find((r) => r.status === 'waiting') ?? pinnedRows.find((r) => r.status === 'waiting') ?? null,
+        [otherRows, pinnedRows]
+    )
+    // When grouping is on, the non-pinned rows are bucketed by project; pinned
+    // stays its own manual section on top.
+    const projectGroups = useMemo(
+        () => grouped ? groupRowsByProject(otherRows, (r) => r.project) : [],
+        [grouped, otherRows]
+    )
 
     const activeCount = useMemo(() => sessions.filter((s) => s.active).length, [sessions])
+    const visibleCount = filteredRows.length
 
     const openSession = useCallback((sessionId: string) => {
         navigate({ to: '/sessions/$sessionId', params: { sessionId } })
@@ -412,12 +439,37 @@ export default function DashboardPage() {
             <div className="vd-scroll">
                 <div className="vd-topbar">
                     <h2>
-                        sessions<span className="vd-dim">/{sessions.length}</span>
+                        sessions<span className="vd-dim">/{total}</span>
                     </h2>
                     <span className="vd-live">
                         <span className="vd-d" />
                         {activeCount} active
                     </span>
+                </div>
+
+                <div className="vd-toolbar">
+                    <input
+                        className="vd-search"
+                        type="search"
+                        inputMode="search"
+                        placeholder="Search sessions…"
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                        aria-label="Search sessions"
+                    />
+                    <div className="vd-toolbar-row">
+                        <label className="vd-check">
+                            <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+                            Show all
+                        </label>
+                        <label className="vd-check">
+                            <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+                            Group by project
+                        </label>
+                        <span className="vd-count">
+                            {visibleCount} of {total}{showAll ? '' : ` · last ${days}d`}
+                        </span>
+                    </div>
                 </div>
 
                 {error ? <div className="vd-empty">{error}</div> : null}
@@ -445,15 +497,30 @@ export default function DashboardPage() {
                     </>
                 ) : null}
 
-                {otherRows.length > 0 ? (
+                {grouped ? (
+                    projectGroups.map((group) => (
+                        <div key={group.key}>
+                            <div className="vd-sec">
+                                {group.label}<span className="vd-sec-n">·{group.rows.length}</span>
+                            </div>
+                            {group.rows.map(renderRow)}
+                        </div>
+                    ))
+                ) : otherRows.length > 0 ? (
                     <>
                         {pinnedRows.length > 0 ? <div className="vd-sec">Everything else</div> : null}
                         {otherRows.map(renderRow)}
                     </>
                 ) : null}
 
-                {!isLoading && sessions.length === 0 && !error ? (
-                    <div className="vd-empty">No live sessions.</div>
+                {!isLoading && visibleCount === 0 && !error ? (
+                    <div className="vd-empty">
+                        {search.trim()
+                            ? `No sessions match “${search.trim()}”.`
+                            : showAll
+                                ? 'No sessions.'
+                                : `Nothing in the last ${days} days — tick “Show all”.`}
+                    </div>
                 ) : null}
             </div>
         </div>
