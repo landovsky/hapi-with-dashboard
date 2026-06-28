@@ -1,0 +1,280 @@
+/*
+ * Voice view — Direction B dark voice surface. Ported from the .voice block of
+ * tmp/voice-dashboard-mockup.html (B variant). Scoped under .vv so it is a
+ * self-contained dark surface regardless of app theme.
+ */
+
+.vv {
+    position: relative;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: calc(22px + env(safe-area-inset-top)) 22px calc(26px + env(safe-area-inset-bottom));
+    color: #dfe1e6;
+    background: radial-gradient(120% 60% at 50% 6%, #161b22 0%, #0b0c10 60%);
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.vv-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+.vv-back {
+    font-size: 22px;
+    font-weight: 700;
+    color: #aeb4be;
+    background: none;
+    border: none;
+    cursor: pointer;
+    line-height: 1;
+    padding: 4px 8px 4px 0;
+}
+.vv-name {
+    font-weight: 700;
+    font-size: 15px;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.vv-stat {
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 9px;
+    border-radius: 8px;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex: none;
+}
+
+/* conversation */
+.vv-convo {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 22px 0;
+    overflow-y: auto;
+}
+.vv-bubble {
+    max-width: 84%;
+    padding: 13px 15px;
+    border-radius: 18px;
+    font-size: 15px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.vv-you {
+    align-self: flex-end;
+    border-bottom-right-radius: 5px;
+    background: #1f2a3d;
+    color: #dbe6f7;
+    font-size: 13.5px;
+}
+.vv-claude {
+    align-self: flex-start;
+    border-bottom-left-radius: 5px;
+    background: #15171d;
+    border: 1px solid #242a34;
+    color: #cfd4dc;
+}
+.vv-label {
+    font-size: 9.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    opacity: 0.5;
+    margin-bottom: 5px;
+}
+
+.vv-speakbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 11px;
+    padding-top: 11px;
+    border-top: 1px solid #262c36;
+}
+.vv-wave {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    height: 20px;
+    color: #3fd99a;
+}
+.vv-wave span {
+    width: 3px;
+    border-radius: 3px;
+    background: currentColor;
+    animation: vv-eq 1s infinite ease-in-out;
+    transform-origin: center;
+}
+.vv-wave span:nth-child(1) { animation-delay: 0s; height: 8px; }
+.vv-wave span:nth-child(2) { animation-delay: 0.15s; height: 16px; }
+.vv-wave span:nth-child(3) { animation-delay: 0.3s; height: 11px; }
+.vv-wave span:nth-child(4) { animation-delay: 0.1s; height: 19px; }
+.vv-wave span:nth-child(5) { animation-delay: 0.25s; height: 7px; }
+.vv-wave span:nth-child(6) { animation-delay: 0.4s; height: 14px; }
+.vv-spk-txt {
+    color: #3fd99a;
+    font-size: 11px;
+}
+.vv-replay {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 6px 11px;
+    border-radius: 9px;
+    background: #1b1e25;
+    color: #aeb4be;
+    border: 1px solid #262a33;
+    cursor: pointer;
+}
+
+/* suggested chips */
+.vv-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-bottom: 14px;
+}
+.vv-sg {
+    font-weight: 600;
+    font-size: 12.5px;
+    padding: 10px 14px;
+    border-radius: 20px;
+    background: #14171d;
+    border: 1px solid #28303c;
+    color: #aab3c0;
+    cursor: pointer;
+}
+.vv-sg:hover { border-color: #3a4658; color: #dfe6f0; }
+
+.vv-summarize {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    width: 100%;
+    padding: 13px;
+    border-radius: 14px;
+    font-weight: 700;
+    font-size: 13px;
+    margin-bottom: 16px;
+    background: #11151c;
+    border: 1px solid #243042;
+    color: #7fa9e8;
+    cursor: pointer;
+}
+.vv-summarize:disabled { opacity: 0.5; cursor: default; }
+
+/* mic dock */
+.vv-mic-dock {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+}
+.vv-mic-hint {
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    color: #6b727d;
+    text-align: center;
+}
+.vv-mic-btn {
+    width: 84px;
+    height: 84px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 34px;
+    position: relative;
+    flex: none;
+    border: none;
+    cursor: pointer;
+    background: #1b1e25;
+    color: #aeb4be;
+    transition: background 0.12s;
+}
+.vv-mic-btn:disabled { opacity: 0.5; cursor: default; }
+
+.vv-mic-btn.vv-listening {
+    background: #e5483b;
+    color: #fff;
+    box-shadow: 0 12px 30px -6px rgba(229, 72, 59, 0.6);
+}
+.vv-mic-btn.vv-listening::before,
+.vv-mic-btn.vv-listening::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 2px solid #e5483b;
+    animation: vv-ring 1.8s infinite ease-out;
+}
+.vv-mic-btn.vv-listening::after { animation-delay: 0.9s; }
+
+.vv-mic-live-wave {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 28px;
+    color: #e5483b;
+}
+.vv-mic-live-wave span {
+    width: 4px;
+    border-radius: 4px;
+    background: currentColor;
+    animation: vv-eq 0.8s infinite ease-in-out;
+    transform-origin: center;
+}
+.vv-mic-live-wave span:nth-child(1) { height: 10px; animation-delay: 0s; }
+.vv-mic-live-wave span:nth-child(2) { height: 24px; animation-delay: 0.1s; }
+.vv-mic-live-wave span:nth-child(3) { height: 16px; animation-delay: 0.2s; }
+.vv-mic-live-wave span:nth-child(4) { height: 26px; animation-delay: 0.05s; }
+.vv-mic-live-wave span:nth-child(5) { height: 13px; animation-delay: 0.25s; }
+.vv-mic-live-wave span:nth-child(6) { height: 22px; animation-delay: 0.15s; }
+.vv-mic-live-wave span:nth-child(7) { height: 9px; animation-delay: 0.3s; }
+
+.vv-mic-btn.vv-sending { background: #1f2a3d; color: #fff; }
+.vv-spinner {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 255, 255, 0.25);
+    border-top-color: #fff;
+    animation: vv-spin 0.8s linear infinite;
+}
+.vv-sending-txt {
+    font-size: 12px;
+    font-weight: 600;
+    color: #7fa9e8;
+}
+
+.vv-error {
+    text-align: center;
+    font-size: 12px;
+    color: #e0796f;
+    margin-bottom: 10px;
+}
+
+@keyframes vv-ring {
+    0% { transform: scale(0.7); opacity: 0.8; }
+    100% { transform: scale(2.1); opacity: 0; }
+}
+@keyframes vv-eq {
+    0%, 100% { transform: scaleY(0.4); }
+    50% { transform: scaleY(1); }
+}
+@keyframes vv-spin {
+    to { transform: rotate(360deg); }
+}

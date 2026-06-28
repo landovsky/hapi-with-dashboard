@@ -24,6 +24,14 @@ import type {
     SessionsResponse
 } from '@/types/api'
 import type {
+    PinsResponse,
+    ReadStateResponse,
+    SttResponse,
+    SuggestRepliesResponse,
+    SummarizeResponse,
+    VoiceTranscriptMessage
+} from '@/types/dashboard'
+import type {
     CodexModelsResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
@@ -186,6 +194,115 @@ export class ApiClient {
 
     async getSessions(): Promise<SessionsResponse> {
         return await this.request<SessionsResponse>('/api/sessions')
+    }
+
+    // --- Voice dashboard (ext store: pins + read-state) ---------------------
+    // These hit the additive `/api/pins` and `/api/read-state` routes backed by
+    // the separate hapi-ext.db. All sit behind the same JWT middleware, so they
+    // inherit auth + namespace for free.
+
+    /** Pinned sessions in the operator's manual order (never auto-sorted). */
+    async listPins(): Promise<PinsResponse> {
+        return await this.request<PinsResponse>('/api/pins')
+    }
+
+    /** Pin a session (idempotent). Lands at the end unless a position is given. */
+    async addPin(sessionId: string, position?: number): Promise<void> {
+        await this.request(`/api/pins/${encodeURIComponent(sessionId)}`, {
+            method: 'PUT',
+            body: JSON.stringify(position === undefined ? {} : { position })
+        })
+    }
+
+    async removePin(sessionId: string): Promise<void> {
+        await this.request(`/api/pins/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+    }
+
+    /** Persist a manual reorder — the client sends the desired top-to-bottom order. */
+    async reorderPins(sessionIds: string[]): Promise<void> {
+        await this.request('/api/pins/reorder', {
+            method: 'POST',
+            body: JSON.stringify({ sessionIds })
+        })
+    }
+
+    /** Map of sessionId → last-seen `updatedAt`. A row is unread when its live
+     *  `updatedAt` exceeds the stored marker. */
+    async getReadState(): Promise<ReadStateResponse> {
+        return await this.request<ReadStateResponse>('/api/read-state')
+    }
+
+    /** Mark a session seen up to `seq` (monotonic — we pass its `updatedAt`). */
+    async markSeen(sessionId: string, seq: number): Promise<void> {
+        await this.request(`/api/read-state/${encodeURIComponent(sessionId)}`, {
+            method: 'PUT',
+            body: JSON.stringify({ seq })
+        })
+    }
+
+    // --- Voice view (plain TTS/STT + fast-model summarize/suggest) ----------
+    // These back the dark voice surface. Distinct from upstream /api/voice/*
+    // (ElevenLabs ConvAI); these are provider-abstracted plain TTS/STT.
+
+    /** Speech-to-text: post the recorded clip as the raw body, get a transcript
+     *  back. `lang` (e.g. "cs") hints the recognizer. */
+    async transcribeSpeech(audio: Blob, lang?: string): Promise<SttResponse> {
+        const qs = lang ? `?lang=${encodeURIComponent(lang)}` : ''
+        return await this.request<SttResponse>(`/api/stt${qs}`, {
+            method: 'POST',
+            body: audio,
+            headers: { 'content-type': audio.type || 'audio/webm' }
+        })
+    }
+
+    /** Text-to-speech: get raw audio for a reply/summary to play aloud. Mirrors
+     *  the blob-fetch auth path used by generated images so a 401 still refreshes. */
+    async synthesizeSpeech(
+        text: string,
+        voiceId?: string,
+        attempt: number = 0,
+        overrideToken?: string | null
+    ): Promise<Blob> {
+        const headers = new Headers({ 'content-type': 'application/json' })
+        const liveToken = this.getToken ? this.getToken() : null
+        const authToken = overrideToken !== undefined
+            ? (overrideToken ?? (liveToken ?? this.token))
+            : (liveToken ?? this.token)
+        if (authToken) {
+            headers.set('authorization', `Bearer ${authToken}`)
+        }
+        const res = await fetch(this.buildUrl('/api/tts'), {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(voiceId ? { text, voiceId } : { text })
+        })
+        if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
+            const refreshed = await this.onUnauthorized()
+            if (refreshed) {
+                this.token = refreshed
+                return await this.synthesizeSpeech(text, voiceId, attempt + 1, refreshed)
+            }
+        }
+        if (!res.ok) {
+            throw new ApiError(`HTTP ${res.status}`, res.status, undefined, await res.text().catch(() => undefined))
+        }
+        return await res.blob()
+    }
+
+    /** Spoken "catch me up" recap of the visible exchange (fast model → text). */
+    async summarizeSession(messages: VoiceTranscriptMessage[], sessionName?: string): Promise<SummarizeResponse> {
+        return await this.request<SummarizeResponse>('/api/summarize', {
+            method: 'POST',
+            body: JSON.stringify(sessionName ? { messages, sessionName } : { messages })
+        })
+    }
+
+    /** A few tappable canned replies for the latest assistant turn. */
+    async suggestReplies(messages: VoiceTranscriptMessage[]): Promise<SuggestRepliesResponse> {
+        return await this.request<SuggestRepliesResponse>('/api/suggest-replies', {
+            method: 'POST',
+            body: JSON.stringify({ messages })
+        })
     }
 
     async getPushVapidPublicKey(): Promise<PushVapidPublicKeyResponse> {

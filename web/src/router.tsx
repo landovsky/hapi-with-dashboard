@@ -48,6 +48,8 @@ import FilePage from '@/routes/sessions/file'
 import TerminalPage from '@/routes/sessions/terminal'
 import SettingsPage from '@/routes/settings'
 import SharePage from '@/routes/share'
+import DashboardPage from '@/routes/dashboard'
+import VoicePage from '@/routes/voice'
 import { setSharePendingTransfer } from '@/lib/sharePendingState'
 import { deleteShareTransfer } from '@/lib/shareTransfer'
 
@@ -126,6 +128,27 @@ function FolderOpenIcon(props: { className?: string }) {
             className={props.className}
         >
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
+    )
+}
+
+function DashboardIcon(props: { className?: string }) {
+    return (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            className={props.className}
+        >
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
         </svg>
     )
 }
@@ -481,6 +504,14 @@ function SessionsPage() {
                                 title={t('codexSync.tooltip')}
                             >
                                 <CodexImportIcon className={`h-5 w-5 ${isLoadingCodexSessions ? 'animate-spin' : ''}`} />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => navigate({ to: '/dashboard' })}
+                                className="p-1.5 rounded-full text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-subtle-bg)] transition-colors"
+                                title="Voice dashboard"
+                            >
+                                <DashboardIcon className="h-5 w-5" />
                             </button>
                             <button
                                 type="button"
@@ -1221,6 +1252,23 @@ const settingsRoute = createRoute({
     component: SettingsPage,
 })
 
+// Voice dashboard — the dense triage board (Direction B). A glanceable,
+// mobile-first overview of every live session that the SessionList tree can't
+// give at a glance.
+const dashboardRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/dashboard',
+    component: DashboardPage,
+})
+
+// Voice view — the dark tap-to-talk surface for one session (Direction B):
+// read the last reply aloud, talk back, tap canned replies, summarize.
+const voiceRoute = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/voice/$sessionId',
+    component: VoicePage,
+})
+
 // Web Share Target landing route. Service worker (`web/src/sw.ts`)
 // intercepts the manifest's `POST /share` and 303-redirects here with an
 // IDB transfer id. `error=ingest` is set when the SW failed to write IDB.
@@ -1253,6 +1301,8 @@ export const routeTree = rootRoute.addChildren([
     ]),
     browseRoute,
     settingsRoute,
+    dashboardRoute,
+    voiceRoute,
     shareRoute,
 ])
 
