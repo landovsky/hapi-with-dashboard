@@ -1,5 +1,6 @@
 import { createConfiguration, type ConfigSource } from './configuration'
 import { Store } from './store'
+import { ExtStore } from './ext/extStore'
 import { SyncEngine, type SyncEvent } from './sync/syncEngine'
 import { NotificationHub } from './notifications/notificationHub'
 import type { NotificationChannel } from './notifications/notificationTypes'
@@ -165,6 +166,8 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     }
 
     const store = new Store(config.dbPath)
+    // hapi-happy: separate ext DB (pins + read-state), decoupled from upstream schema
+    const ext = new ExtStore(ExtStore.defaultPathFor(config.dbPath))
     const jwtSecret = await getOrCreateJwtSecret()
     const vapidKeys = await getOrCreateVapidKeys(config.dataDir)
     const vapidSubject = process.env.VAPID_SUBJECT ?? 'mailto:admin@hapi.run'
@@ -227,6 +230,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         getVisibilityTracker: () => visibilityTracker,
         jwtSecret,
         store,
+        ext,
         vapidPublicKey: vapidKeys.publicKey,
         socketEngine: socketServer.engine,
         corsOrigins,

@@ -23,6 +23,14 @@ import { createCliRoutes } from './routes/cli'
 import { createCodexDesktopRoutes } from './routes/codexDesktop'
 import { createPushRoutes } from './routes/push'
 import { createVoiceRoutes } from './routes/voice'
+// hapi-happy additions (merge-clean: new files only)
+import { createPinsRoutes } from './routes/pins'
+import { createReadStateRoutes } from './routes/readState'
+import { createTtsRoutes } from './routes/tts'
+import { createSttRoutes } from './routes/stt'
+import { createSummarizeRoutes } from './routes/summarize'
+import { createSuggestRepliesRoutes } from './routes/suggestReplies'
+import type { ExtStore } from '../ext/extStore'
 import type { SSEManager } from '../sse/sseManager'
 import type { VisibilityTracker } from '../visibility/visibilityTracker'
 import type { Server as BunServer, ServerWebSocket } from 'bun'
@@ -204,6 +212,7 @@ function createWebApp(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
+    ext: ExtStore
     vapidPublicKey: string
     corsOrigins?: string[]
     embeddedAssetMap: Map<string, EmbeddedWebAsset> | null
@@ -247,6 +256,13 @@ function createWebApp(options: {
     }))
     app.route('/api', createPushRoutes(options.store, options.vapidPublicKey))
     app.route('/api', createVoiceRoutes())
+    // hapi-happy additions — additive routes behind the same JWT middleware
+    app.route('/api', createPinsRoutes(options.ext))
+    app.route('/api', createReadStateRoutes(options.ext))
+    app.route('/api', createTtsRoutes())
+    app.route('/api', createSttRoutes())
+    app.route('/api', createSummarizeRoutes())
+    app.route('/api', createSuggestRepliesRoutes())
 
     // Skip static serving in relay mode, show helpful message on root
     if (options.relayMode) {
@@ -357,6 +373,7 @@ export async function startWebServer(options: {
     getVisibilityTracker: () => VisibilityTracker | null
     jwtSecret: Uint8Array
     store: Store
+    ext: ExtStore
     vapidPublicKey: string
     socketEngine: SocketEngine
     corsOrigins?: string[]
@@ -371,6 +388,7 @@ export async function startWebServer(options: {
         getVisibilityTracker: options.getVisibilityTracker,
         jwtSecret: options.jwtSecret,
         store: options.store,
+        ext: options.ext,
         vapidPublicKey: options.vapidPublicKey,
         corsOrigins: options.corsOrigins,
         embeddedAssetMap,
