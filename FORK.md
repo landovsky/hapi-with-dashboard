@@ -63,10 +63,13 @@ bun run build           # full prod build (also re-embeds the web PWA into the h
 
 ## Releasing a deploy
 
-Tag the commit you ship so you can roll back to it:
+Deploys are **tagged** (like the other k3s apps). Push a **semver** tag and CI
+(`.github/workflows/k3s-deploy.yml`) builds + pushes the image to
+`ghcr.io/landovsky/hapi-hub`:
 
 ```bash
-git tag -a v0.1.0-dashboard -m "voice dashboard live" && git push origin v0.1.0-dashboard
+git tag v0.1.0 && git push origin v0.1.0     # must match v*.*.* to trigger the build
 ```
 
-Then follow [`DEPLOY-k3s.md`](./DEPLOY-k3s.md).
+Then point `~/git/k3s/apps/hapi-hub/deployment.yaml` at `:0.1.0`. Full steps in
+[`DEPLOY-k3s.md`](./DEPLOY-k3s.md).

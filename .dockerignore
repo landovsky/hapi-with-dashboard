@@ -1,0 +1,20 @@
+# Keep the build context small + force a clean install/build in-image.
+.git
+**/node_modules
+**/dist
+web/dist
+hub/dist
+cli/dist
+website/dist
+docs/.vitepress/dist
+**/*.generated.ts
+.hapi
+**/*.db
+**/*.db-*
+.env
+.env.*
+**/.DS_Store
+e2e
+playwright-report
+test-results
+*.log
