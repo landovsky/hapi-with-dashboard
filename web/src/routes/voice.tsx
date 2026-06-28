@@ -48,29 +48,51 @@ export default function VoicePage() {
 
     const lastAssistant = useMemo(() => extractLastAssistantSpeakable(messages), [messages])
 
-    const playTts = useCallback(async (text: string) => {
+    // Serialize TTS so the voice view never fires concurrent ElevenLabs
+    // requests. Their low-tier concurrency cap is what turned bursts (auto-read
+    // a reply, then tap replay/summarize) into 502s. Each call chains behind the
+    // previous synth+playback; a newer call supersedes any still-pending one
+    // (latest reply wins) and stops whatever is currently playing.
+    const ttsChainRef = useRef<Promise<void>>(Promise.resolve())
+    const ttsTokenRef = useRef(0)
+    const playTts = useCallback((text: string): Promise<void> => {
         if (!api || !text.trim()) {
-            return
+            return Promise.resolve()
         }
-        try {
-            const blob = await api.synthesizeSpeech(text)
-            const url = URL.createObjectURL(blob)
-            if (!audioRef.current) {
-                audioRef.current = new Audio()
+        const token = ++ttsTokenRef.current
+        audioRef.current?.pause()
+        setSpeaking(false)
+        const next = ttsChainRef.current.catch(() => {}).then(async () => {
+            if (token !== ttsTokenRef.current) {
+                return // superseded before our turn — skip the network call entirely
             }
-            const el = audioRef.current
-            el.src = url
-            el.onended = () => {
-                setSpeaking(false)
-                URL.revokeObjectURL(url)
+            try {
+                const blob = await api.synthesizeSpeech(text)
+                if (token !== ttsTokenRef.current) {
+                    return
+                }
+                const url = URL.createObjectURL(blob)
+                if (!audioRef.current) {
+                    audioRef.current = new Audio()
+                }
+                const el = audioRef.current
+                el.src = url
+                setSpeaking(true)
+                await new Promise<void>((resolve) => {
+                    el.onended = () => { URL.revokeObjectURL(url); resolve() }
+                    el.onerror = () => { URL.revokeObjectURL(url); resolve() }
+                    el.play().catch(() => resolve())
+                })
+            } catch {
+                // Autoplay can be blocked until a user gesture; Replay is the fallback.
+            } finally {
+                if (token === ttsTokenRef.current) {
+                    setSpeaking(false)
+                }
             }
-            setSpeaking(true)
-            await el.play()
-        } catch {
-            // Autoplay can be blocked until a user gesture; the Replay button is
-            // always available as the fallback, so fail quietly.
-            setSpeaking(false)
-        }
+        })
+        ttsChainRef.current = next
+        return next
     }, [api])
 
     const loadSuggestions = useCallback(async (assistantText: string) => {
