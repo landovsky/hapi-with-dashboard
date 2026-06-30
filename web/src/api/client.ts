@@ -30,6 +30,7 @@ import type {
     SttResponse,
     SuggestRepliesResponse,
     SummarizeResponse,
+    TtsStateResponse,
     VoiceTranscriptMessage
 } from '@/types/dashboard'
 import type {
@@ -256,6 +257,14 @@ export class ApiClient {
         })
     }
 
+    /** Map of sessionId → last assistant `seq` already read aloud. The voice view
+     *  consults this on entry so it never re-synthesizes an already-spoken reply.
+     *  Marking happens server-side inside `/tts` (synthesis == the played event),
+     *  so there's no separate "mark played" call. */
+    async getTtsState(): Promise<TtsStateResponse> {
+        return await this.request<TtsStateResponse>('/api/tts-state')
+    }
+
     // --- Voice view (plain TTS/STT + fast-model summarize/suggest) ----------
     // These back the dark voice surface. Distinct from upstream /api/voice/*
     // (ElevenLabs ConvAI); these are provider-abstracted plain TTS/STT.
@@ -272,10 +281,16 @@ export class ApiClient {
     }
 
     /** Text-to-speech: get raw audio for a reply/summary to play aloud. Mirrors
-     *  the blob-fetch auth path used by generated images so a 401 still refreshes. */
+     *  the blob-fetch auth path used by generated images so a 401 still refreshes.
+     *
+     *  Pass `mark` ({ sessionId, seq }) only when auto-reading a freshly arrived
+     *  assistant reply: a successful synth then records that reply as "played"
+     *  server-side, so re-entering the voice view won't re-bill ElevenLabs for
+     *  it. Replay/summary synths omit it — they should never advance the mark. */
     async synthesizeSpeech(
         text: string,
         voiceId?: string,
+        mark?: { sessionId: string; seq: number },
         attempt: number = 0,
         overrideToken?: string | null
     ): Promise<Blob> {
@@ -287,16 +302,19 @@ export class ApiClient {
         if (authToken) {
             headers.set('authorization', `Bearer ${authToken}`)
         }
+        const body: { text: string; voiceId?: string; sessionId?: string; seq?: number } = { text }
+        if (voiceId) body.voiceId = voiceId
+        if (mark) { body.sessionId = mark.sessionId; body.seq = mark.seq }
         const res = await fetch(this.buildUrl('/api/tts'), {
             method: 'POST',
             headers,
-            body: JSON.stringify(voiceId ? { text, voiceId } : { text })
+            body: JSON.stringify(body)
         })
         if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
             const refreshed = await this.onUnauthorized()
             if (refreshed) {
                 this.token = refreshed
-                return await this.synthesizeSpeech(text, voiceId, attempt + 1, refreshed)
+                return await this.synthesizeSpeech(text, voiceId, mark, attempt + 1, refreshed)
             }
         }
         if (!res.ok) {

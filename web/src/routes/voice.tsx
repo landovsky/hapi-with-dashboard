@@ -4,7 +4,7 @@ import { useAppContext } from '@/lib/app-context'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { useMessages } from '@/hooks/queries/useMessages'
 import { useAudioRecorder } from '@/hooks/useAudioRecorder'
-import { extractLastAssistantSpeakable } from '@/realtime/hooks/contextFormatters'
+import { extractLastAssistantSpeakableDetailed, VOICE_PREAMBLE } from '@/realtime/hooks/contextFormatters'
 import {
     DASHBOARD_STATUS_META,
     dashboardSessionTitle,
@@ -13,10 +13,6 @@ import {
 import type { VoiceTranscriptMessage } from '@/types/dashboard'
 import { LoadingState } from '@/components/LoadingState'
 import './voice.css'
-
-/** One-line hat on voice-originated messages so replies come back short and
- *  speakable, without a per-session flag or a modified system prompt. */
-const VOICE_PREAMBLE = '[Voice mode — keep your reply short and speakable.]'
 
 /** While the voice view is open we nudge the message query so a reply that
  *  arrives over SSE (or not) still surfaces promptly to be read aloud. */
@@ -39,14 +35,43 @@ export default function VoicePage() {
     const [hint, setHint] = useState<string | null>(null)
 
     const audioRef = useRef<HTMLAudioElement | null>(null)
-    const spokenRef = useRef<string | null>(null)
+    // Highest assistant seq we've auto-spoken this mount. Tracking by seq (not
+    // text) means a reply read once is never re-read, even if the same words
+    // recur. Seeded from the persisted server mark below so re-entry/refresh
+    // doesn't replay (and re-bill) what an earlier visit already spoke.
+    const spokenSeqRef = useRef<number>(-1)
+    // Last assistant seq we fetched tappable replies for. Suggestions hit the
+    // cheap fast model (not ElevenLabs), so they load for any new reply — the
+    // credit-sensitive gating applies only to TTS.
+    const suggestedSeqRef = useRef<number>(-1)
+    // null = server's tts-state not loaded yet; we hold off auto-TTS until then
+    // so the first render after mount can't fire on an already-played reply.
+    const [playedSeq, setPlayedSeq] = useState<number | null>(null)
 
     const summary = useMemo(() => sessions.find((s) => s.id === sessionId) ?? null, [sessions, sessionId])
     const title = summary ? dashboardSessionTitle(summary) : sessionId.slice(0, 8)
     const status = summary ? deriveDashboardStatus(summary, { lastSeenAt: 0, now: Date.now() }) : null
     const statusMeta = status ? DASHBOARD_STATUS_META[status] : null
 
-    const lastAssistant = useMemo(() => extractLastAssistantSpeakable(messages), [messages])
+    const lastReply = useMemo(() => extractLastAssistantSpeakableDetailed(messages), [messages])
+    const lastAssistant = lastReply?.text ?? null
+
+    // Load the durable "already read aloud" mark for this session before any
+    // auto-TTS can run. On failure (older hub without the route) fall back to
+    // -1 so voice replies still get spoken — spokenSeqRef still de-dupes within
+    // the mount; we just lose cross-mount suppression.
+    useEffect(() => {
+        let cancelled = false
+        setPlayedSeq(null)
+        spokenSeqRef.current = -1
+        if (!api) {
+            return
+        }
+        api.getTtsState()
+            .then(({ ttsState }) => { if (!cancelled) setPlayedSeq(ttsState[sessionId] ?? -1) })
+            .catch(() => { if (!cancelled) setPlayedSeq(-1) })
+        return () => { cancelled = true }
+    }, [api, sessionId])
 
     // Serialize TTS so the voice view never fires concurrent ElevenLabs
     // requests. Their low-tier concurrency cap is what turned bursts (auto-read
@@ -55,7 +80,9 @@ export default function VoicePage() {
     // (latest reply wins) and stops whatever is currently playing.
     const ttsChainRef = useRef<Promise<void>>(Promise.resolve())
     const ttsTokenRef = useRef(0)
-    const playTts = useCallback((text: string): Promise<void> => {
+    // `mark` is passed only on the auto-read path so a successful synth records
+    // the reply as played server-side; replay/summarize omit it.
+    const playTts = useCallback((text: string, mark?: { sessionId: string; seq: number }): Promise<void> => {
         if (!api || !text.trim()) {
             return Promise.resolve()
         }
@@ -67,7 +94,7 @@ export default function VoicePage() {
                 return // superseded before our turn — skip the network call entirely
             }
             try {
-                const blob = await api.synthesizeSpeech(text)
+                const blob = await api.synthesizeSpeech(text, undefined, mark)
                 if (token !== ttsTokenRef.current) {
                     return
                 }
@@ -108,23 +135,35 @@ export default function VoicePage() {
     }, [api])
 
     // Reconcile the latest assistant message into the visible exchange, and —
-    // when it's genuinely new — read it aloud and refresh the tappable replies.
-    // Seeding (first load) and later replies go through the same path.
+    // when it's a genuinely new VOICE reply — read it aloud and refresh the
+    // tappable replies. Two guards keep us off the ElevenLabs meter:
+    //  - voiceOriginated: never auto-read an ordinary chat reply (often long and
+    //    never meant to be spoken); those still show as a bubble with manual ↺.
+    //  - seq > played marks: skip anything an earlier visit already spoke. We
+    //    wait for the server mark (playedSeq !== null) before deciding.
     useEffect(() => {
-        if (!lastAssistant) {
+        if (!lastReply) {
             return
         }
+        const { text, seq, voiceOriginated } = lastReply
         setBubbles((prev) =>
-            prev.some((b) => b.role === 'assistant' && b.text === lastAssistant)
+            prev.some((b) => b.role === 'assistant' && b.text === text)
                 ? prev
-                : [...prev, { role: 'assistant', text: lastAssistant }]
+                : [...prev, { role: 'assistant', text }]
         )
-        if (spokenRef.current !== lastAssistant) {
-            spokenRef.current = lastAssistant
-            void playTts(lastAssistant)
-            void loadSuggestions(lastAssistant)
+        if (suggestedSeqRef.current !== seq) {
+            suggestedSeqRef.current = seq
+            void loadSuggestions(text)
         }
-    }, [lastAssistant, playTts, loadSuggestions])
+        if (playedSeq === null || !voiceOriginated) {
+            return
+        }
+        if (seq <= playedSeq || seq <= spokenSeqRef.current) {
+            return
+        }
+        spokenSeqRef.current = seq
+        void playTts(text, { sessionId, seq })
+    }, [lastReply, playedSeq, sessionId, playTts, loadSuggestions])
 
     // Keep messages fresh while the view is open so a reply surfaces to be spoken.
     useEffect(() => {

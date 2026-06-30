@@ -27,6 +27,17 @@ export interface ReadStateResponse {
 }
 
 /**
+ * Map of sessionId → last assistant `seq` already read aloud. The voice view
+ * loads this on entry and only auto-synthesizes a reply whose seq exceeds the
+ * stored mark, so re-mounting or refreshing never re-bills ElevenLabs for a
+ * reply that was already spoken. Server-side so it follows the operator across
+ * devices, same as read-state.
+ */
+export interface TtsStateResponse {
+    ttsState: Record<string, number>
+}
+
+/**
  * Filtered session list for the dashboard. `sessions` are the ones within the
  * window (or all of them when `all` was requested); `total` is the full count
  * regardless of the filter, so the UI can show "showing N of M".

@@ -16,6 +16,10 @@ import { dirname, join } from 'node:path'
  *  - pins        : per-namespace pinned sessions, manually ordered
  *  - read_state  : per-namespace last-seen seq, for the unread marker
  *    (a session is "unread" when its live `seq` exceeds last_seen_seq)
+ *  - tts_state   : per-namespace last-PLAYED assistant seq, so the voice view
+ *    never re-synthesizes (and re-bills ElevenLabs for) a reply it already
+ *    spoke. In-memory client state resets on every mount/refresh; this is the
+ *    durable "was this reply read aloud?" record.
  */
 
 export interface Pin {
@@ -57,6 +61,14 @@ export class ExtStore {
                 session_id    TEXT NOT NULL,
                 last_seen_seq INTEGER NOT NULL,
                 updated_at    INTEGER NOT NULL,
+                PRIMARY KEY (namespace, session_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS tts_state (
+                namespace       TEXT NOT NULL,
+                session_id      TEXT NOT NULL,
+                last_played_seq INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
                 PRIMARY KEY (namespace, session_id)
             );
         `)
@@ -125,6 +137,34 @@ export class ExtStore {
             DO UPDATE SET
                 last_seen_seq = MAX(read_state.last_seen_seq, excluded.last_seen_seq),
                 updated_at    = excluded.updated_at
+        `).run({ namespace, session_id: sessionId, seq, updated_at: now })
+    }
+
+    // ---- tts-state ----------------------------------------------------------
+
+    /** Map of sessionId → last assistant seq we've already read aloud. The voice
+     *  view consults this on entry so re-mounting (or a page refresh) never
+     *  re-synthesizes a reply that was already spoken. */
+    getTtsState(namespace: string): Record<string, number> {
+        const rows = this.db.prepare(
+            'SELECT session_id, last_played_seq FROM tts_state WHERE namespace = ?'
+        ).all(namespace) as Array<{ session_id: string; last_played_seq: number }>
+        const out: Record<string, number> = {}
+        for (const r of rows) out[r.session_id] = r.last_played_seq
+        return out
+    }
+
+    /** Mark a session's reply read aloud up to `seq`. Monotonic: a later replay
+     *  of an older reply never lowers the high-water mark. */
+    markTtsPlayed(namespace: string, sessionId: string, seq: number): void {
+        const now = Date.now()
+        this.db.prepare(`
+            INSERT INTO tts_state (namespace, session_id, last_played_seq, updated_at)
+            VALUES (@namespace, @session_id, @seq, @updated_at)
+            ON CONFLICT(namespace, session_id)
+            DO UPDATE SET
+                last_played_seq = MAX(tts_state.last_played_seq, excluded.last_played_seq),
+                updated_at      = excluded.updated_at
         `).run({ namespace, session_id: sessionId, seq, updated_at: now })
     }
 

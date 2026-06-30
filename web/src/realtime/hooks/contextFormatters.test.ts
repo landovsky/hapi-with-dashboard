@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { DecryptedMessage } from '@/types/api'
-import { extractLastAssistantSpeakable, formatMessage, formatNewMessages, formatReadyEvent } from './contextFormatters'
+import {
+    extractLastAssistantSpeakable,
+    extractLastAssistantSpeakableDetailed,
+    formatMessage,
+    formatNewMessages,
+    formatReadyEvent,
+    VOICE_PREAMBLE
+} from './contextFormatters'
+
+const context = describe
 
 function msg(partial: Pick<DecryptedMessage, 'id' | 'seq' | 'content'>): DecryptedMessage {
     return {
@@ -98,6 +107,55 @@ describe('extractLastAssistantSpeakable', () => {
             })
         ]
         expect(extractLastAssistantSpeakable(messages)).toBe('Codex finished the refactor.')
+    })
+})
+
+describe('extractLastAssistantSpeakableDetailed', () => {
+    context('the voice view must only read aloud replies it was actually asked to speak — auto-reading old chat answers burned ElevenLabs credits on entry', () => {
+        it('flags a reply as voice-originated when the prompting user turn carried the voice preamble', () => {
+            const messages = [
+                msg({ id: '1', seq: 1, content: { role: 'user', content: `${VOICE_PREAMBLE}\n\nwhat's the status?` } }),
+                msg({ id: '2', seq: 2, content: { role: 'assistant', content: 'All green.' } })
+            ]
+            expect(extractLastAssistantSpeakableDetailed(messages)).toEqual({
+                text: 'All green.',
+                seq: 2,
+                voiceOriginated: true
+            })
+        })
+
+        it('leaves an ordinary chat reply un-flagged so it is shown but never auto-spoken', () => {
+            const messages = [
+                msg({ id: '1', seq: 1, content: { role: 'user', content: 'walk me through the whole migration plan' } }),
+                msg({ id: '2', seq: 2, content: { role: 'assistant', content: 'a very long answer…' } })
+            ]
+            expect(extractLastAssistantSpeakableDetailed(messages)).toEqual({
+                text: 'a very long answer…',
+                seq: 2,
+                voiceOriginated: false
+            })
+        })
+
+        it('carries the reply seq so the view can track played-state by identity rather than by fragile text equality', () => {
+            const messages = [
+                msg({ id: '1', seq: 7, content: { role: 'user', content: `${VOICE_PREAMBLE}\n\nhi` } }),
+                msg({ id: '2', seq: 8, content: { role: 'assistant', content: 'Hi back.' } })
+            ]
+            expect(extractLastAssistantSpeakableDetailed(messages)?.seq).toBe(8)
+        })
+
+        it('looks past an intervening tool call to find the prompting voice user turn', () => {
+            const messages = [
+                msg({ id: '1', seq: 1, content: { role: 'user', content: `${VOICE_PREAMBLE}\n\nrun the build` } }),
+                msg({ id: '2', seq: 2, content: { role: 'assistant', content: [{ type: 'tool_use', name: 'bash', input: {} }] } }),
+                msg({ id: '3', seq: 3, content: { role: 'assistant', content: 'Build passed.' } })
+            ]
+            expect(extractLastAssistantSpeakableDetailed(messages)?.voiceOriginated).toBe(true)
+        })
+
+        it('returns null for empty history', () => {
+            expect(extractLastAssistantSpeakableDetailed([])).toBeNull()
+        })
     })
 })
 
