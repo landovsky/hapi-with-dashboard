@@ -260,7 +260,7 @@ function createWebApp(options: {
     // hapi-happy additions — additive routes behind the same JWT middleware
     app.route('/api', createPinsRoutes(options.ext))
     app.route('/api', createReadStateRoutes(options.ext))
-    app.route('/api', createTtsRoutes())
+    app.route('/api', createTtsRoutes(options.ext))
     app.route('/api', createSttRoutes())
     app.route('/api', createSummarizeRoutes())
     app.route('/api', createSuggestRepliesRoutes())

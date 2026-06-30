@@ -195,27 +195,76 @@ function isNonSpeakableAgentPayload(content: unknown): boolean {
     return false
 }
 
+/** One-line hat the voice view prepends to voice-originated USER messages so
+ *  replies come back short and speakable. It's also the only durable signal of
+ *  "this assistant reply was generated for voice" — the reply itself carries no
+ *  flag, so we detect voice origin by the marker on the user turn that prompted
+ *  it. Kept here (not in the route component) so detection and tagging share one
+ *  source of truth. */
+export const VOICE_PREAMBLE = '[Voice mode — keep your reply short and speakable.]'
+
+/** Normalized role + speakable text for a single message, or null when the
+ *  message has nothing readable (tool calls, agent control payloads, etc.). */
+function speakableOf(message: DecryptedMessage): { role: NormalizedRole | null; text: string } | null {
+    const { role, content: wrappedContent } = unwrapRoleWrappedContent(message)
+    const { roleOverride, content } = unwrapOutputContent(wrappedContent)
+    if (isNonSpeakableAgentPayload(wrappedContent) || isNonSpeakableAgentPayload(content)) {
+        return null
+    }
+    const text = extractSpeakableFromContent(content)
+    if (!text) {
+        return null
+    }
+    return { role: roleOverride ?? role, text }
+}
+
+export interface LastAssistantSpeakable {
+    text: string
+    /** The assistant message's sequence number — the stable identity the voice
+     *  view tracks "played" against (text alone is ambiguous and resets on
+     *  re-mount). */
+    seq: number
+    /** True when the user turn that prompted this reply carried VOICE_PREAMBLE,
+     *  i.e. the reply was generated for voice and is safe/short to read aloud.
+     *  Older chat replies (long, never meant to be spoken) come back false. */
+    voiceOriginated: boolean
+}
+
 export function extractLastAssistantSpeakable(messages: DecryptedMessage[]): string | null {
+    return extractLastAssistantSpeakableDetailed(messages)?.text ?? null
+}
+
+/**
+ * Like {@link extractLastAssistantSpeakable} but also reports the reply's `seq`
+ * and whether it was voice-originated. The voice view uses both to decide
+ * whether to auto-read a reply: only voice-originated replies it hasn't already
+ * spoken (by seq) should be synthesized, so entering the screen on an old chat
+ * session never burns ElevenLabs credits on a long, stale answer.
+ */
+export function extractLastAssistantSpeakableDetailed(
+    messages: DecryptedMessage[]
+): LastAssistantSpeakable | null {
     const sorted = [...messages].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
 
     for (let i = sorted.length - 1; i >= 0; i -= 1) {
-        const message = sorted[i]
-        const { role, content: wrappedContent } = unwrapRoleWrappedContent(message)
-        const { roleOverride, content } = unwrapOutputContent(wrappedContent)
-        const normalizedRole = roleOverride ?? role
-
-        if (normalizedRole === 'user') {
+        const speakable = speakableOf(sorted[i])
+        if (!speakable || speakable.role === 'user') {
             continue
         }
 
-        if (isNonSpeakableAgentPayload(wrappedContent) || isNonSpeakableAgentPayload(content)) {
-            continue
+        // Walk back to the nearest user turn that prompted this reply and check
+        // for the voice marker. A non-user, non-speakable message in between
+        // (tool call) doesn't break the link, so we keep scanning past nulls.
+        let voiceOriginated = false
+        for (let j = i - 1; j >= 0; j -= 1) {
+            const prior = speakableOf(sorted[j])
+            if (prior?.role === 'user') {
+                voiceOriginated = prior.text.includes(VOICE_PREAMBLE)
+                break
+            }
         }
 
-        const speakable = extractSpeakableFromContent(content)
-        if (speakable) {
-            return speakable
-        }
+        return { text: speakable.text, seq: sorted[i].seq ?? 0, voiceOriginated }
     }
 
     return null

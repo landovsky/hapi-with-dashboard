@@ -10,6 +10,8 @@ const api = {
     // rejects so playTts bails before touching Audio/createObjectURL (absent in jsdom)
     synthesizeSpeech: vi.fn().mockRejectedValue(new Error('no audio in test')),
     suggestReplies: vi.fn().mockResolvedValue({ replies: ['Wire them in', 'Hold for review'] }),
+    // nothing spoken yet for this session — exercises the auto-read decision path
+    getTtsState: vi.fn().mockResolvedValue({ ttsState: {} }),
     summarizeSession: vi.fn(),
     transcribeSpeech: vi.fn(),
     sendMessage: vi.fn()
@@ -46,7 +48,14 @@ vi.mock('@/hooks/queries/useMessages', () => ({
 }))
 vi.mock('@/hooks/useAudioRecorder', () => ({ useAudioRecorder: () => recorder }))
 vi.mock('@/realtime/hooks/contextFormatters', () => ({
-    extractLastAssistantSpeakable: () => 'Want me to wire the tokens in, or hold for review?'
+    VOICE_PREAMBLE: '[Voice mode — keep your reply short and speakable.]',
+    // voiceOriginated reply so the surface seeds it, loads suggestions, and
+    // exercises the auto-read path (synthesizeSpeech rejects, so no real audio)
+    extractLastAssistantSpeakableDetailed: () => ({
+        text: 'Want me to wire the tokens in, or hold for review?',
+        seq: 1,
+        voiceOriginated: true
+    })
 }))
 
 import VoicePage from './voice'
