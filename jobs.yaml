@@ -1,0 +1,13 @@
+version: 1
+project: hapi-with-dashboard
+
+jobs:
+  weekly-upstream-deploy:
+    description: Sync upstream/main, gate (typecheck+build+tests), build image, deploy via ttl.sh+Flux, ping DevOps Telegram
+    schedule: "0 7 * * 1"
+    command: bash /home/tomas/git/hapi-with-dashboard/scripts/weekly-upstream-deploy.sh
+    working_dir: /home/tomas/git/hapi-with-dashboard
+    timeout: 1800
+    on_failure: notify
+    retries: 0
+    tags: [deploy, upstream, weekly]
