@@ -94,12 +94,16 @@ function ExpandedTileBody({
     api,
     row,
     onOpen,
-    onReplyVoice
+    onReplyVoice,
+    onArchive,
+    archiveArmed
 }: {
     api: ApiClient | null
     row: DashboardRow
     onOpen: () => void
     onReplyVoice: () => void
+    onArchive: () => void
+    archiveArmed: boolean
 }) {
     const { status, isLoading } = useGitStatusFiles(api, row.summary.id)
     const { messages, refetch } = useMessages(api, row.summary.id)
@@ -139,6 +143,11 @@ function ExpandedTileBody({
             <div className="vd-qa">
                 <button type="button" className="vd-qbtn vd-alt" onClick={(e) => stop(e, onOpen)}>▤ Read full</button>
                 <button type="button" className="vd-qbtn" onClick={(e) => stop(e, onReplyVoice)}>🎙 Reply by voice</button>
+                <button
+                    type="button"
+                    className={`vd-qbtn vd-arch${archiveArmed ? ' vd-arch-armed' : ''}`}
+                    onClick={(e) => stop(e, onArchive)}
+                >{archiveArmed ? '⚠ Confirm archive' : '🗄 Archive'}</button>
             </div>
         </div>
     )
@@ -165,6 +174,8 @@ interface DashboardTileProps {
     onOpen: () => void
     onVoice: () => void
     onReplyVoice: () => void
+    onArchive: () => void
+    archiveArmed: boolean
     onTogglePin: () => void
     onMoveToTop: () => void
     onQuickAction: (action: QuickAction) => void
@@ -181,6 +192,8 @@ function DashboardTile({
     onOpen,
     onVoice,
     onReplyVoice,
+    onArchive,
+    archiveArmed,
     onTogglePin,
     onMoveToTop,
     onQuickAction
@@ -256,19 +269,33 @@ function DashboardTile({
                 </div>
             ) : null}
             {expanded ? (
-                <ExpandedTileBody api={api} row={row} onOpen={onOpen} onReplyVoice={onReplyVoice} />
+                <ExpandedTileBody api={api} row={row} onOpen={onOpen} onReplyVoice={onReplyVoice} onArchive={onArchive} archiveArmed={archiveArmed} />
             ) : null}
         </div>
     )
 }
+
+/** Board view state that should survive leaving the dashboard and coming back
+ *  (to voice / session detail and back) — #2. Module-level so it persists across
+ *  the route unmount within the SPA (not across a full page reload). Exported so
+ *  tests can reset it between renders. */
+export const boardMemory: {
+    view: 'projects' | 'sessions'
+    sortBy: 'recent' | 'oldest' | 'name'
+    expandedId: string | null
+    expandedProjects: string[]
+} = { view: 'projects', sortBy: 'recent', expandedId: null, expandedProjects: [] }
 
 export default function DashboardPage() {
     const { api } = useAppContext()
     const navigate = useNavigate()
     const queryClient = useQueryClient()
     const now = useNow()
-    const [expandedId, setExpandedId] = useState<string | null>(null)
+    const [expandedId, setExpandedId] = useState<string | null>(() => boardMemory.expandedId)
     const [sentNotes, setSentNotes] = useState<Record<string, { text: string; failed: boolean }>>({})
+    // Two-tap archive guard: first tap arms (button asks to confirm), second tap
+    // within a few seconds actually archives — no accidental one-tap archives.
+    const [armedArchive, setArmedArchive] = useState<string | null>(null)
     // The waiting session the operator already jumped to — hides the pill until a
     // *different* session needs attention (or the current one stops waiting), so
     // "Jump" actually dismisses the pill instead of leaving it stuck on screen.
@@ -279,16 +306,23 @@ export default function DashboardPage() {
     const [search, setSearch] = useState('')
     // Two tabs instead of a grouping checkbox: Projects (grouped board) and
     // Sessions (flat list). Default to Projects — that's where the operator lives.
-    const [view, setView] = useState<'projects' | 'sessions'>('projects')
+    const [view, setView] = useState<'projects' | 'sessions'>(() => boardMemory.view)
     const grouped = view === 'projects'
     // Sort applied to sessions (both tabs) and to the project groups. Recency by
     // default — freshest first.
-    const [sortBy, setSortBy] = useState<'recent' | 'oldest' | 'name'>('recent')
+    const [sortBy, setSortBy] = useState<'recent' | 'oldest' | 'name'>(() => boardMemory.sortBy)
     // Which project groups are EXPANDED (by project key). Tracking expansion (not
     // collapse) means the empty default = every group collapsed, which is what we
     // want on load. Display-only; grouping/ordering/status are untouched.
-    const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set())
+    const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set(boardMemory.expandedProjects))
     const searchRef = useRef<HTMLInputElement | null>(null)
+
+    // Mirror the persistent view state into module memory so a return trip from
+    // voice/detail restores exactly what was open (#2).
+    useEffect(() => { boardMemory.view = view }, [view])
+    useEffect(() => { boardMemory.sortBy = sortBy }, [sortBy])
+    useEffect(() => { boardMemory.expandedId = expandedId }, [expandedId])
+    useEffect(() => { boardMemory.expandedProjects = Array.from(expandedProjects) }, [expandedProjects])
 
     // Desktop power-move: ⌘F / Ctrl+F jumps into the board's own search instead
     // of the browser's find-on-page (which searches the DOM, not our sessions).
@@ -431,6 +465,19 @@ export default function DashboardPage() {
         () => projectGroups.map((g) => ({ key: g.key, label: g.label, count: g.rows.length })),
         [projectGroups]
     )
+
+    // On return to the board (#2), once sessions have loaded, bring the tile that
+    // was left expanded back into view — once, not on every later toggle.
+    const scrollRestoredRef = useRef(false)
+    useEffect(() => {
+        if (scrollRestoredRef.current || !expandedId || sessions.length === 0) {
+            return
+        }
+        scrollRestoredRef.current = true
+        requestAnimationFrame(() => {
+            document.getElementById(`vd-tile-${expandedId}`)?.scrollIntoView({ block: 'center' })
+        })
+    }, [expandedId, sessions.length])
     const allExpanded = projectGroups.length > 0 && projectGroups.every((g) => expandedProjects.has(g.key))
 
     const toggleGroupExpanded = useCallback((key: string) => {
@@ -486,6 +533,25 @@ export default function DashboardPage() {
             }).catch(() => { /* read-state is best-effort */ })
         }
     }, [api, queryClient])
+
+    // Archive from the expanded tile (#1). First tap arms; the second (within 3s)
+    // archives and drops the row from the board. Recoverable via the main app's
+    // archived filter, so no modal — just the arm step to prevent fat-fingers.
+    const archiveSession = useCallback((sessionId: string) => {
+        if (!api) {
+            return
+        }
+        if (armedArchive !== sessionId) {
+            setArmedArchive(sessionId)
+            setTimeout(() => setArmedArchive((cur) => (cur === sessionId ? null : cur)), 3000)
+            return
+        }
+        setArmedArchive(null)
+        setExpandedId((cur) => (cur === sessionId ? null : cur))
+        void api.archiveSession(sessionId)
+            .then(() => queryClient.invalidateQueries({ queryKey: ['dashboard', 'sessions'] }))
+            .catch(() => { /* best-effort — the poll will re-sync if it failed */ })
+    }, [api, armedArchive, queryClient])
 
     const toggleExpand = useCallback((row: DashboardRow) => {
         setExpandedId((prev) => (prev === row.summary.id ? null : row.summary.id))
@@ -583,6 +649,8 @@ export default function DashboardPage() {
             onOpen={() => openSession(row.summary.id)}
             onVoice={() => talkToSession(row.summary.id)}
             onReplyVoice={() => talkToSessionWithMic(row.summary.id)}
+            onArchive={() => archiveSession(row.summary.id)}
+            archiveArmed={armedArchive === row.summary.id}
             onTogglePin={() => togglePin(row)}
             onMoveToTop={() => moveToTop(row.summary.id)}
             onQuickAction={(a) => runQuickAction(row.summary.id, a)}
