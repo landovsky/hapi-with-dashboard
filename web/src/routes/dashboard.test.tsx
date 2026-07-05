@@ -76,13 +76,28 @@ describe('DashboardPage', () => {
                 // dead = inactive with an abnormal-exit lifecycle
                 makeSummary({ id: 'b', active: false, metadata: { path: '/x/old-spike', lifecycleState: 'exited:error' } })
             ])
-            render(<DashboardPage />)
-            // titles come from the working-directory basename
-            expect(screen.getByText('blog-redesign')).toBeInTheDocument()
-            expect(screen.getByText('old-spike')).toBeInTheDocument()
+            const { container } = render(<DashboardPage />)
+            // Tile titles come from the working-directory basename. Scope to the
+            // title span so we don't collide with the (identically-named) project
+            // group header now that the board groups by project by default.
+            const titles = Array.from(container.querySelectorAll('.vd-ttl')).map((el) => el.textContent)
+            expect(titles).toContain('blog-redesign')
+            expect(titles).toContain('old-spike')
             // a thinking session reads as WORK, a crashed one as DEAD
             expect(screen.getByText('WORK')).toBeInTheDocument()
             expect(screen.getByText('DEAD')).toBeInTheDocument()
+        })
+    })
+
+    context('operators think in projects, so the board should open already ordered by project, not one flat recency stream', () => {
+        it('groups sessions under a distinct project header by default (#11, #12)', () => {
+            setSessions([
+                makeSummary({ id: 'a', metadata: { path: '/x/blog-redesign' } }),
+                makeSummary({ id: 'b', metadata: { path: '/x/api-svc' } })
+            ])
+            const { container } = render(<DashboardPage />)
+            const projNames = Array.from(container.querySelectorAll('.vd-projname')).map((el) => el.textContent)
+            expect(projNames).toEqual(expect.arrayContaining(['blog-redesign', 'api-svc']))
         })
     })
 
