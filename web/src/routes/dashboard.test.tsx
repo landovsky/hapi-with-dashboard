@@ -1,6 +1,12 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import type { SessionSummary } from '@/types/api'
+
+// jsdom has no layout engine, so scrollIntoView is undefined — the Jump handler
+// calls it inside rAF. Stub it so revealing a tile doesn't throw under test.
+beforeAll(() => {
+    Element.prototype.scrollIntoView = vi.fn()
+})
 
 // vitest has no `context`; alias it to name the scenario, not the method.
 const context = describe
@@ -87,6 +93,27 @@ describe('DashboardPage', () => {
             ])
             render(<DashboardPage />)
             expect(screen.getByText(/WAITING · scrape-carvago/)).toBeInTheDocument()
+        })
+
+        it('dismisses the pill once you jump — it should not stay stuck pulsing after you act on it', () => {
+            setSessions([
+                makeSummary({ id: 'c', metadata: { path: '/x/scrape-carvago' }, pendingRequestsCount: 1, pendingRequestKinds: ['input'] })
+            ])
+            render(<DashboardPage />)
+            const pill = screen.getByText(/WAITING · scrape-carvago/)
+            fireEvent.click(pill)
+            expect(screen.queryByText(/WAITING · scrape-carvago/)).not.toBeInTheDocument()
+        })
+    })
+
+    context('on desktop the operator reaches for ⌘F expecting to search sessions, not the browser find-on-page', () => {
+        it('routes ⌘F / Ctrl+F focus into the board search input', () => {
+            setSessions([makeSummary({ id: 'e', metadata: { path: '/x/blog' } })])
+            render(<DashboardPage />)
+            const input = screen.getByLabelText('Search sessions')
+            expect(input).not.toHaveFocus()
+            fireEvent.keyDown(window, { key: 'f', metaKey: true })
+            expect(input).toHaveFocus()
         })
     })
 

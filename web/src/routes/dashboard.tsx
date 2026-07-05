@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAppContext } from '@/lib/app-context'
@@ -175,6 +175,7 @@ function DashboardTile({
     }
     return (
         <div
+            id={`vd-tile-${row.summary.id}`}
             className={`vd-tile${expanded ? ' vd-exp' : ''}${row.status === 'dead' ? ' vd-dead' : ''}`}
             style={{ borderLeftColor: meta.accent }}
             onClick={onToggle}
@@ -257,11 +258,30 @@ export default function DashboardPage() {
     const now = useNow()
     const [expandedId, setExpandedId] = useState<string | null>(null)
     const [sentNotes, setSentNotes] = useState<Record<string, { text: string; failed: boolean }>>({})
+    // The waiting session the operator already jumped to — hides the pill until a
+    // *different* session needs attention (or the current one stops waiting), so
+    // "Jump" actually dismisses the pill instead of leaving it stuck on screen.
+    const [dismissedWaitingId, setDismissedWaitingId] = useState<string | null>(null)
     // Toolbar state: show-all overrides the backend 5-day window; search filters
     // locally; group toggles the project layout.
     const [showAll, setShowAll] = useState(false)
     const [search, setSearch] = useState('')
     const [grouped, setGrouped] = useState(false)
+    const searchRef = useRef<HTMLInputElement | null>(null)
+
+    // Desktop power-move: ⌘F / Ctrl+F jumps into the board's own search instead
+    // of the browser's find-on-page (which searches the DOM, not our sessions).
+    useEffect(() => {
+        const onKeyDown = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'f' || e.key === 'F')) {
+                e.preventDefault()
+                searchRef.current?.focus()
+                searchRef.current?.select()
+            }
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+    }, [])
 
     // Sessions come pre-filtered to the last few days from the backend (or all,
     // when the checkbox is on). The hook polls so the board stays live.
@@ -330,6 +350,14 @@ export default function DashboardPage() {
         () => otherRows.find((r) => r.status === 'waiting') ?? pinnedRows.find((r) => r.status === 'waiting') ?? null,
         [otherRows, pinnedRows]
     )
+    // Once nothing is waiting, forget the dismissal so the pill returns the next
+    // time a session (even the same one) blocks again.
+    useEffect(() => {
+        if (!waitingRow) {
+            setDismissedWaitingId(null)
+        }
+    }, [waitingRow])
+    const showWaitingPill = waitingRow && waitingRow.summary.id !== dismissedWaitingId
     // When grouping is on, the non-pinned rows are bucketed by project; pinned
     // stays its own manual section on top.
     const projectGroups = useMemo(
@@ -348,15 +376,33 @@ export default function DashboardPage() {
         navigate({ to: '/voice/$sessionId', params: { sessionId } })
     }, [navigate])
 
-    const toggleExpand = useCallback((row: DashboardRow) => {
-        setExpandedId((prev) => (prev === row.summary.id ? null : row.summary.id))
-        // Opening a row counts as seeing it — clear the unread marker server-side.
+    const markRowSeen = useCallback((row: DashboardRow) => {
+        // Opening/revealing a row counts as seeing it — clear unread server-side.
         if (row.unread && api) {
             void api.markSeen(row.summary.id, row.summary.updatedAt).then(() => {
                 void queryClient.invalidateQueries({ queryKey: ['dashboard', 'read-state'] })
             }).catch(() => { /* read-state is best-effort */ })
         }
     }, [api, queryClient])
+
+    const toggleExpand = useCallback((row: DashboardRow) => {
+        setExpandedId((prev) => (prev === row.summary.id ? null : row.summary.id))
+        markRowSeen(row)
+    }, [markRowSeen])
+
+    // "Jump" on the waiting pill: reveal the blocked session in place — expand it
+    // and scroll it into view — rather than diverting to the voice detail page,
+    // then dismiss the pill so it stops pulsing (#1).
+    const jumpToWaiting = useCallback((row: DashboardRow) => {
+        setExpandedId(row.summary.id)
+        setDismissedWaitingId(row.summary.id)
+        markRowSeen(row)
+        requestAnimationFrame(() => {
+            const el = document.getElementById(`vd-tile-${row.summary.id}`)
+            el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            el?.focus?.()
+        })
+    }, [markRowSeen])
 
     const invalidatePins = useCallback(
         () => queryClient.invalidateQueries({ queryKey: ['dashboard', 'pins'] }),
@@ -449,10 +495,11 @@ export default function DashboardPage() {
 
                 <div className="vd-toolbar">
                     <input
+                        ref={searchRef}
                         className="vd-search"
                         type="search"
                         inputMode="search"
-                        placeholder="Search sessions…"
+                        placeholder="Search sessions… (⌘F)"
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
                         aria-label="Search sessions"
@@ -474,15 +521,15 @@ export default function DashboardPage() {
 
                 {error ? <div className="vd-empty">{error}</div> : null}
 
-                {waitingRow ? (
+                {showWaitingPill ? (
                     <button
                         type="button"
                         className="vd-pill"
-                        onClick={() => talkToSession(waitingRow.summary.id)}
+                        onClick={() => jumpToWaiting(waitingRow)}
                     >
                         <span className="vd-pulse" />
                         WAITING · {waitingRow.title}
-                        <span className="vd-arrow">jump ↑</span>
+                        <span className="vd-arrow">jump ↓</span>
                     </button>
                 ) : null}
 
