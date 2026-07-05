@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { render, screen, waitFor, cleanup } from '@testing-library/react'
 import type { SessionSummary } from '@/types/api'
 
@@ -6,6 +6,9 @@ const context = describe
 
 const navigate = vi.fn()
 const recorder = { state: 'idle' as const, start: vi.fn(), stop: vi.fn(), error: null }
+// Mutable so a test can simulate arriving with ?mic=true (the "Reply by voice"
+// intent) while every other test sees the default no-mic search.
+let searchParams: { mic?: true } = {}
 const api = {
     // rejects so playTts bails before touching Audio/createObjectURL (absent in jsdom)
     synthesizeSpeech: vi.fn().mockRejectedValue(new Error('no audio in test')),
@@ -37,7 +40,8 @@ const sessions: SessionSummary[] = [{
 
 vi.mock('@tanstack/react-router', () => ({
     useNavigate: () => navigate,
-    useParams: () => ({ sessionId: 's1' })
+    useParams: () => ({ sessionId: 's1' }),
+    useSearch: () => searchParams
 }))
 vi.mock('@/lib/app-context', () => ({ useAppContext: () => ({ api }) }))
 vi.mock('@/hooks/queries/useSessions', () => ({
@@ -60,6 +64,10 @@ vi.mock('@/realtime/hooks/contextFormatters', () => ({
 
 import VoicePage from './voice'
 
+beforeEach(() => {
+    searchParams = {}
+    recorder.start.mockClear()
+})
 afterEach(cleanup)
 
 describe('VoicePage', () => {
@@ -81,6 +89,20 @@ describe('VoicePage', () => {
             render(<VoicePage />)
             await waitFor(() => expect(screen.getByText('Wire them in')).toBeInTheDocument())
             expect(screen.getByText('Hold for review')).toBeInTheDocument()
+        })
+    })
+
+    context('"Reply by voice" is an explicit intent to speak — arriving with the mic already live spares a second tap (#23)', () => {
+        it('arms the recorder on mount when navigated with mic=true', () => {
+            searchParams = { mic: true }
+            render(<VoicePage />)
+            expect(recorder.start).toHaveBeenCalledTimes(1)
+        })
+
+        it('does not touch the mic on an ordinary voice-view open', () => {
+            searchParams = {}
+            render(<VoicePage />)
+            expect(recorder.start).not.toHaveBeenCalled()
         })
     })
 })

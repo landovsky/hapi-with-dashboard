@@ -264,15 +264,6 @@
     flex: none;
 }
 .vd-el.vd-warnlong { color: #f0a92b; }
-.vd-snip {
-    font-size: 13px;
-    color: #9aa0aa;
-    margin-top: 6px;
-    line-height: 1.4;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
 .vd-rowacts { display: flex; gap: 6px; margin-top: 9px; }
 .vd-ico {
     width: 30px;
@@ -306,8 +297,7 @@
 /* push the open/voice cluster to the right, keep pin + reorder on the left */
 .vd-rowacts .vd-spacer { margin-left: auto; }
 .vd-tile.vd-dead { opacity: 0.62; }
-.vd-tile.vd-dead .vd-ttl,
-.vd-tile.vd-dead .vd-snip { color: #6a6066; }
+.vd-tile.vd-dead .vd-ttl { color: #6a6066; }
 
 /* inline quick-actions on done rows — resolve without opening (mockup B1) */
 .vd-qmini {
@@ -349,7 +339,8 @@
 .vd-expbody { margin-top: 10px; padding-top: 11px; border-top: 1px solid #232934; }
 .vd-fullwrap { position: relative; }
 .vd-full {
-    font-size: 12.5px;
+    /* #22: −30% from 12.5px so far more of the reply fits at a glance. */
+    font-size: 9px;
     line-height: 1.5;
     color: #aab0ba;
     background: #0e1014;
@@ -358,8 +349,14 @@
     padding: 10px;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 132px;
+    /* #21: an expanded tile gives its reply nearly the whole phone viewport
+       (dvh so mobile browser chrome doesn't clip it), half the screen on
+       desktop. The tile header/actions stay just above via the outer scroll. */
+    max-height: 88dvh;
     overflow-y: auto;
+}
+@media (min-width: 768px) {
+    .vd-full { max-height: 50vh; }
 }
 /* faded bottom edge so a long preview reads as "more below" (mockup B2) */
 .vd-fullwrap::after {
