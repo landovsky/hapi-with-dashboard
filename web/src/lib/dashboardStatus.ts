@@ -53,8 +53,12 @@ export function deriveDashboardStatus(
     summary: SessionSummary,
     ctx: DashboardStatusContext
 ): DashboardStatus {
+    // Only an ACTIVE session can actually be waiting on you — the agent has to
+    // be there to act on your answer. An inactive/exited session that still
+    // carries a stale pendingRequests count is a zombie, not a live block, so it
+    // must not read as waiting (and must not pulse in the waiting pill). #2
     const pending = summary.pendingRequestsCount > 0 || summary.pendingRequestKinds.length > 0
-    if (pending) {
+    if (pending && summary.active) {
         return 'waiting'
     }
 
@@ -157,12 +161,19 @@ function humanizeDuration(ms: number): string {
     return hrs ? `${days}d${hrs}h` : `${days}d`
 }
 
-/** Best-effort display title for a session row: explicit name, else the last
- *  path segment of its working directory, else a short id. */
+/** Best-effort display title for a session row: explicit name, else the agent's
+ *  running summary (what the operator actually recognises the session by — and
+ *  what search matches on), else the last path segment of its working directory,
+ *  else a short id. Mirrors the main app's getSessionTitle so an unnamed session
+ *  shows its real title on the board, not the bare repo basename. #1 */
 export function dashboardSessionTitle(summary: SessionSummary): string {
     const name = summary.metadata?.name?.trim()
     if (name) {
         return name
+    }
+    const summaryText = summary.metadata?.summary?.text?.trim()
+    if (summaryText) {
+        return summaryText
     }
     const path = summary.metadata?.path?.replace(/\/+$/, '')
     if (path) {

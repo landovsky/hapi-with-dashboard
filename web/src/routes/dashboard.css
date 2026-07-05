@@ -176,14 +176,24 @@
    the project name is the primary way you scan a grouped board, so it reads
    bright, bold and a size up, sitting over a hairline that separates groups. */
 .vd-projgroup { margin-top: 2px; }
+/* Clickable to collapse/expand its group (#3). Reset the button chrome and keep
+   the loud-header look. */
 .vd-projsec {
     display: flex;
     align-items: center;
     gap: 9px;
-    margin: 18px 2px 10px;
+    width: 100%;
+    margin: 18px 0 10px;
     padding: 0 2px 7px;
+    border: none;
     border-bottom: 1px solid #2a303b;
+    background: none;
+    font-family: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
 }
+.vd-projsec:hover .vd-projname { color: #fff; }
 .vd-projsec::before {
     content: '';
     width: 3px;
@@ -192,6 +202,13 @@
     background: #3d7df2;
     box-shadow: 0 0 8px -1px #3d7df2;
     flex: none;
+}
+.vd-projchev {
+    font-size: 10px;
+    color: #6b7686;
+    width: 10px;
+    flex: none;
+    margin-left: -2px;
 }
 .vd-projname {
     font-size: 15px;
@@ -213,6 +230,59 @@
     padding: 1px 9px;
     flex: none;
 }
+
+/* Project quick-jump pills (#4) — a single sideways-scrolling row (never wraps)
+   so many projects stay reachable in one tap; freshest project first. */
+.vd-pjbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 12px;
+}
+.vd-pjscroll {
+    display: flex;
+    gap: 7px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    padding-bottom: 3px;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+}
+.vd-pjscroll::-webkit-scrollbar { height: 4px; }
+.vd-pjscroll::-webkit-scrollbar-thumb { background: #2a303b; border-radius: 2px; }
+.vd-pjpill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    height: 28px;
+    padding: 0 11px;
+    border-radius: 999px;
+    border: 1px solid #262a33;
+    background: #15171d;
+    color: #cfd4dc;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.vd-pjpill:hover { background: #1b1f27; border-color: #33507f; color: #fff; }
+.vd-pjpill-n { font-size: 10px; font-weight: 700; color: #6b7686; }
+.vd-collapse-all {
+    flex: none;
+    width: 30px;
+    height: 28px;
+    border-radius: 8px;
+    border: 1px solid #262a33;
+    background: #15171d;
+    color: #aeb4be;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+.vd-collapse-all:hover { background: #1b1f27; color: #fff; }
 
 /* dense row */
 .vd-tile {
