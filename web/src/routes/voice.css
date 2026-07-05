@@ -39,8 +39,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
 }
-.vv-stat {
+.vv-open {
     margin-left: auto;
+    flex: none;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    border: 1px solid #262a33;
+    background: #1b1e25;
+    color: #aeb4be;
+    font-size: 15px;
+    cursor: pointer;
+}
+.vv-open:hover { background: #232733; color: #fff; }
+.vv-stat {
     font-size: 12px;
     font-weight: 700;
     padding: 4px 9px;
@@ -87,12 +102,36 @@
     color: #cfd4dc;
 }
 .vv-label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 5px;
     font-size: 9.5px;
     letter-spacing: 0.16em;
     text-transform: uppercase;
-    opacity: 0.5;
-    margin-bottom: 5px;
+    /* muted via colour, not opacity, so the copy button below can stay legible */
+    color: #7b828d;
 }
+.vv-time {
+    text-transform: none;
+    letter-spacing: 0.02em;
+    color: #6b727d;
+}
+.vv-copy {
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: 0.02em;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid #2a303b;
+    background: transparent;
+    color: #9098a4;
+    cursor: pointer;
+}
+.vv-copy:hover { background: #1b1e25; color: #dfe6f0; }
 
 .vv-speakbar {
     display: flex;

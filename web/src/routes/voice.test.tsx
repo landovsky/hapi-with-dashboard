@@ -16,6 +16,11 @@ beforeAll(() => {
     globalThis.Audio = FakeAudio as unknown as typeof Audio
     globalThis.URL.createObjectURL = () => 'blob:voice-test'
     globalThis.URL.revokeObjectURL = () => {}
+    // jsdom has no clipboard — stub writeText so the copy button is testable.
+    Object.defineProperty(globalThis.navigator, 'clipboard', {
+        value: { writeText: vi.fn().mockResolvedValue(undefined) },
+        configurable: true
+    })
 })
 
 const context = describe
@@ -74,6 +79,7 @@ vi.mock('@/realtime/hooks/contextFormatters', () => ({
     extractLastAssistantSpeakableDetailed: () => ({
         text: 'Want me to wire the tokens in, or hold for review?',
         seq: 1,
+        createdAt: Date.now() - 5 * 60_000,
         voiceOriginated: true
     })
 }))
@@ -107,6 +113,23 @@ describe('VoicePage', () => {
             render(<VoicePage />)
             await waitFor(() => expect(screen.getByText('Wire them in')).toBeInTheDocument())
             expect(screen.getByText('Hold for review')).toBeInTheDocument()
+        })
+
+        it('shows how old a message is so you can tell stale replies at a glance', () => {
+            render(<VoicePage />)
+            expect(screen.getByText(/5m ago/)).toBeInTheDocument()
+        })
+
+        it('lets you open the full session detail — the voice view is a lens, not a dead end', () => {
+            render(<VoicePage />)
+            fireEvent.click(screen.getByLabelText('Open session detail'))
+            expect(navigate).toHaveBeenCalledWith({ to: '/sessions/$sessionId', params: { sessionId: 's1' } })
+        })
+
+        it('copies a message to the clipboard when its copy button is tapped', () => {
+            render(<VoicePage />)
+            fireEvent.click(screen.getByLabelText('Copy message'))
+            expect(navigator.clipboard.writeText).toHaveBeenCalledWith('Want me to wire the tokens in, or hold for review?')
         })
     })
 

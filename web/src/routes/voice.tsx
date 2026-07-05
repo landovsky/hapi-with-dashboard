@@ -20,6 +20,24 @@ const REPLY_POLL_MS = 5_000
 
 type MicPhase = 'idle' | 'listening' | 'sending'
 
+/** A visible bubble — the transcript shape plus when it happened, so the view
+ *  can show how old each message is (the API-facing shape stays role+text). */
+type Bubble = VoiceTranscriptMessage & { at?: number }
+
+/** Compact "how long ago" for a message, self-contained so the voice surface
+ *  needs no i18n provider. Falls back to a date once it's older than a week. */
+function relativeAge(at: number): string {
+    const delta = Date.now() - at
+    if (delta < 60_000) return 'just now'
+    const minutes = Math.floor(delta / 60_000)
+    if (minutes < 60) return `${minutes}m ago`
+    const hours = Math.floor(minutes / 60)
+    if (hours < 24) return `${hours}h ago`
+    const days = Math.floor(hours / 24)
+    if (days < 7) return `${days}d ago`
+    return new Date(at).toLocaleDateString()
+}
+
 export default function VoicePage() {
     const { api } = useAppContext()
     const navigate = useNavigate()
@@ -29,10 +47,11 @@ export default function VoicePage() {
     const { messages, isLoading, refetch } = useMessages(api, sessionId)
     const recorder = useAudioRecorder()
 
-    const [bubbles, setBubbles] = useState<VoiceTranscriptMessage[]>([])
+    const [bubbles, setBubbles] = useState<Bubble[]>([])
     const [suggestions, setSuggestions] = useState<string[]>([])
     const [sending, setSending] = useState(false)
     const [speaking, setSpeaking] = useState(false)
+    const [copiedKey, setCopiedKey] = useState<string | null>(null)
     const [hint, setHint] = useState<string | null>(null)
 
     const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -156,11 +175,11 @@ export default function VoicePage() {
         if (!lastReply) {
             return
         }
-        const { text, seq, voiceOriginated } = lastReply
+        const { text, seq, createdAt, voiceOriginated } = lastReply
         setBubbles((prev) =>
             prev.some((b) => b.role === 'assistant' && b.text === text)
                 ? prev
-                : [...prev, { role: 'assistant', text }]
+                : [...prev, { role: 'assistant', text, at: createdAt || undefined }]
         )
         if (suggestedSeqRef.current !== seq) {
             suggestedSeqRef.current = seq
@@ -204,7 +223,7 @@ export default function VoicePage() {
         }
         setHint(null)
         setSuggestions([])
-        setBubbles((prev) => [...prev, { role: 'user', text: trimmed }])
+        setBubbles((prev) => [...prev, { role: 'user', text: trimmed, at: Date.now() }])
         try {
             await api.sendMessage(sessionId, `${VOICE_PREAMBLE}\n\n${trimmed}`)
         } catch {
@@ -243,8 +262,8 @@ export default function VoicePage() {
         if (!api) {
             return
         }
-        const transcript = bubbles.length
-            ? bubbles
+        const transcript: VoiceTranscriptMessage[] = bubbles.length
+            ? bubbles.map((b) => ({ role: b.role, text: b.text }))
             : lastAssistant
                 ? [{ role: 'assistant' as const, text: lastAssistant }]
                 : []
@@ -269,12 +288,25 @@ export default function VoicePage() {
             : ''
 
     const goBack = useCallback(() => navigate({ to: '/dashboard' }), [navigate])
+    // Jump straight to the full session view — the voice surface is a lens, not a
+    // dead end.
+    const openDetail = useCallback(
+        () => navigate({ to: '/sessions/$sessionId', params: { sessionId } }),
+        [navigate, sessionId]
+    )
+    const copyMessage = useCallback((text: string, key: string) => {
+        void navigator.clipboard?.writeText(text).then(() => {
+            setCopiedKey(key)
+            setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1500)
+        }).catch(() => { /* clipboard blocked — best-effort */ })
+    }, [])
 
     return (
         <div className="vv">
             <div className="vv-top">
                 <button type="button" className="vv-back" onClick={goBack} aria-label="Back to dashboard">‹</button>
                 <span className="vv-name">{title}</span>
+                <button type="button" className="vv-open" onClick={openDetail} aria-label="Open session detail" title="Open session detail">↗</button>
                 {statusMeta ? (
                     <span className="vv-stat" style={{ background: statusMeta.soft, color: statusMeta.chipText }}>
                         <span aria-hidden>{statusMeta.icon}</span>
@@ -287,9 +319,22 @@ export default function VoicePage() {
                 {isLoading && bubbles.length === 0 ? (
                     <LoadingState label="Loading conversation…" className="text-sm" />
                 ) : null}
-                {bubbles.map((b, i) => (
-                    <div key={`${b.role}-${i}`} className={`vv-bubble ${b.role === 'user' ? 'vv-you' : 'vv-claude'}`}>
-                        <div className="vv-label">{b.role === 'user' ? 'You' : 'Zorka · Claude'}</div>
+                {bubbles.map((b, i) => {
+                    const key = `${b.role}-${i}`
+                    const when = b.at ? relativeAge(b.at) : null
+                    return (
+                    <div key={key} className={`vv-bubble ${b.role === 'user' ? 'vv-you' : 'vv-claude'}`}>
+                        <div className="vv-label">
+                            <span>{b.role === 'user' ? 'You' : 'Zorka · Claude'}</span>
+                            {when ? <span className="vv-time">· {when}</span> : null}
+                            <button
+                                type="button"
+                                className="vv-copy"
+                                onClick={() => copyMessage(b.text, key)}
+                                aria-label="Copy message"
+                                title="Copy message"
+                            >{copiedKey === key ? '✓ copied' : '⧉ copy'}</button>
+                        </div>
                         {b.text}
                         {b.role === 'assistant' && i === bubbles.length - 1 ? (
                             <div className="vv-speakbar">
@@ -307,7 +352,8 @@ export default function VoicePage() {
                             </div>
                         ) : null}
                     </div>
-                ))}
+                    )
+                })}
             </div>
 
             {hint ? <div className="vv-error">{hint}</div> : null}
