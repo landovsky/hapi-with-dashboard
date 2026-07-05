@@ -1274,6 +1274,10 @@ const dashboardRoute = createRoute({
 const voiceRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/voice/$sessionId',
+    // `mic=true` (set by the dashboard's "Reply by voice") arms the recorder on
+    // arrival so an explicit voice intent doesn't need a second tap (#23).
+    validateSearch: (search: Record<string, unknown>): { mic?: true } =>
+        (search.mic === true || search.mic === 'true') ? { mic: true } : {},
     component: VoicePage,
 })
 

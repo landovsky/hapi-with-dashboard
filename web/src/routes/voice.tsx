@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams } from '@tanstack/react-router'
+import { useNavigate, useParams, useSearch } from '@tanstack/react-router'
 import { useAppContext } from '@/lib/app-context'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { useMessages } from '@/hooks/queries/useMessages'
@@ -24,6 +24,7 @@ export default function VoicePage() {
     const { api } = useAppContext()
     const navigate = useNavigate()
     const { sessionId } = useParams({ from: '/voice/$sessionId' })
+    const { mic: micRequested } = useSearch({ from: '/voice/$sessionId' })
     const { sessions } = useSessions(api)
     const { messages, isLoading, refetch } = useMessages(api, sessionId)
     const recorder = useAudioRecorder()
@@ -172,6 +173,19 @@ export default function VoicePage() {
     }, [refetch])
 
     useEffect(() => () => { audioRef.current?.pause() }, [])
+
+    // Arrived with mic=true (from "Reply by voice") — arm the recorder once. The
+    // navigating tap is still within the user-activation window, so getUserMedia
+    // is allowed; if it isn't, the mic button stays the fallback. Guarded so it
+    // fires a single time even as recorder state churns.
+    const micArmedRef = useRef(false)
+    useEffect(() => {
+        if (!micRequested || micArmedRef.current || recorder.state !== 'idle') {
+            return
+        }
+        micArmedRef.current = true
+        void recorder.start()
+    }, [micRequested, recorder.state, recorder.start])
 
     const sendUserText = useCallback(async (text: string) => {
         const trimmed = text.trim()

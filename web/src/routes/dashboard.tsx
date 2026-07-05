@@ -4,6 +4,8 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAppContext } from '@/lib/app-context'
 import { useDashboardSessions } from '@/hooks/queries/useDashboardSessions'
 import { useGitStatusFiles } from '@/hooks/queries/useGitStatusFiles'
+import { useMessages } from '@/hooks/queries/useMessages'
+import { extractLastAssistantSpeakable } from '@/realtime/hooks/contextFormatters'
 import {
     DASHBOARD_STATUS_META,
     type DashboardStatus,
@@ -76,24 +78,41 @@ function summarizeDiff(status: GitStatusFiles | null): { added: number; removed:
     return { added, removed, files, branch: status.branch }
 }
 
+/** How often the open tile re-pulls the session's messages so its expanded
+ *  transcript keeps up with a still-running agent (#22 "ensure it's updated").
+ *  Only the one expanded tile mounts this, so it's a single poll, not N. */
+const EXPANDED_POLL_MS = 5_000
+
 /**
- * The expanded body of a tile — only mounted when a row is open, so a git
- * status/numstat is fetched for that one session rather than for the whole
- * board. Shows the full last message, a real diff stat, and the two actions
- * that resolve a finished/review session without leaving the dashboard.
+ * The expanded body of a tile — only mounted when a row is open, so the
+ * messages + git status/numstat are fetched for that one session rather than
+ * the whole board. Shows the tail of the agent's actual last reply (#22), a
+ * real diff stat, and the two actions that resolve a session without leaving
+ * the dashboard.
  */
 function ExpandedTileBody({
     api,
     row,
     onOpen,
-    onVoice
+    onReplyVoice
 }: {
     api: ApiClient | null
     row: DashboardRow
     onOpen: () => void
-    onVoice: () => void
+    onReplyVoice: () => void
 }) {
     const { status, isLoading } = useGitStatusFiles(api, row.summary.id)
+    const { messages, refetch } = useMessages(api, row.summary.id)
+    // Keep the transcript live while the tile is open.
+    useEffect(() => {
+        const id = setInterval(() => { void refetch() }, EXPANDED_POLL_MS)
+        return () => clearInterval(id)
+    }, [refetch])
+    // Prefer the agent's real last reply (many lines) over the one-line running
+    // summary that used to sit here — that's the whole point of #22. Fall back
+    // to the summary when there's no readable assistant message yet.
+    const lastReply = useMemo(() => extractLastAssistantSpeakable(messages)?.trim() || '', [messages])
+    const fullBody = lastReply || row.snippet
     const diff = summarizeDiff(status)
     const stop = (e: React.MouseEvent, fn: () => void) => {
         e.stopPropagation()
@@ -101,9 +120,9 @@ function ExpandedTileBody({
     }
     return (
         <div className="vd-expbody">
-            {row.snippet ? (
+            {fullBody ? (
                 <div className="vd-fullwrap">
-                    <div className="vd-full">{row.snippet}</div>
+                    <div className="vd-full">{fullBody}</div>
                 </div>
             ) : null}
             {diff ? (
@@ -119,7 +138,7 @@ function ExpandedTileBody({
             ) : null}
             <div className="vd-qa">
                 <button type="button" className="vd-qbtn vd-alt" onClick={(e) => stop(e, onOpen)}>▤ Read full</button>
-                <button type="button" className="vd-qbtn" onClick={(e) => stop(e, onVoice)}>🎙 Reply by voice</button>
+                <button type="button" className="vd-qbtn" onClick={(e) => stop(e, onReplyVoice)}>🎙 Reply by voice</button>
             </div>
         </div>
     )
@@ -139,16 +158,15 @@ interface DashboardTileProps {
     api: ApiClient | null
     row: DashboardRow
     expanded: boolean
-    canMoveUp: boolean
-    canMoveDown: boolean
+    canMoveToTop: boolean
     quickActions: QuickAction[]
     sentNote: { text: string; failed: boolean } | null
     onToggle: () => void
     onOpen: () => void
     onVoice: () => void
+    onReplyVoice: () => void
     onTogglePin: () => void
-    onMoveUp: () => void
-    onMoveDown: () => void
+    onMoveToTop: () => void
     onQuickAction: (action: QuickAction) => void
 }
 
@@ -156,16 +174,15 @@ function DashboardTile({
     api,
     row,
     expanded,
-    canMoveUp,
-    canMoveDown,
+    canMoveToTop,
     quickActions,
     sentNote,
     onToggle,
     onOpen,
     onVoice,
+    onReplyVoice,
     onTogglePin,
-    onMoveUp,
-    onMoveDown,
+    onMoveToTop,
     onQuickAction
 }: DashboardTileProps) {
     const meta = DASHBOARD_STATUS_META[row.status]
@@ -198,7 +215,6 @@ function DashboardTile({
                 {row.unread ? <span className="vd-unread" aria-label="unread" /> : null}
                 <span className={`vd-el${row.elapsed.warnLong ? ' vd-warnlong' : ''}`}>⧗{row.elapsed.text}</span>
             </div>
-            {row.snippet ? <div className="vd-snip">{row.snippet}</div> : null}
             <div className="vd-rowacts">
                 <button
                     type="button"
@@ -209,27 +225,22 @@ function DashboardTile({
                 >
                     <span style={{ opacity: row.pinned ? 1 : 0.4 }}>📌</span>
                 </button>
+                {/* One-tap "send this pinned row to the very top" — replaces the
+                    up/down peck-fest for the common case of bumping a fresh
+                    session up (#20). */}
                 {row.pinned ? (
-                    <>
-                        <button
-                            type="button"
-                            className="vd-ico"
-                            title="Move up"
-                            disabled={!canMoveUp}
-                            onClick={(e) => stop(e, onMoveUp)}
-                        >↑</button>
-                        <button
-                            type="button"
-                            className="vd-ico"
-                            title="Move down"
-                            disabled={!canMoveDown}
-                            onClick={(e) => stop(e, onMoveDown)}
-                        >↓</button>
-                    </>
+                    <button
+                        type="button"
+                        className="vd-ico"
+                        title="Move to top"
+                        disabled={!canMoveToTop}
+                        onClick={(e) => stop(e, onMoveToTop)}
+                    >⤒</button>
                 ) : null}
+                {/* Open the full HAPI session view — now on the left cluster (#20). */}
+                <button type="button" className="vd-ico" title="Open full detail" onClick={(e) => stop(e, onOpen)}>↗</button>
+                {/* Mic stays pinned to the right; opens the voice view (#20). */}
                 <button type="button" className="vd-ico vd-mic vd-spacer" title="Talk to this session" onClick={(e) => stop(e, onVoice)}>🎙</button>
-                <button type="button" className="vd-ico" title={expanded ? 'Collapse' : 'Expand'} onClick={(e) => stop(e, onToggle)}>⤢</button>
-                <button type="button" className="vd-ico" title="Open in HAPI" onClick={(e) => stop(e, onOpen)}>↗</button>
             </div>
             {quickActions.length > 0 ? (
                 <div className="vd-qmini">
@@ -245,7 +256,7 @@ function DashboardTile({
                 </div>
             ) : null}
             {expanded ? (
-                <ExpandedTileBody api={api} row={row} onOpen={onOpen} onVoice={onVoice} />
+                <ExpandedTileBody api={api} row={row} onOpen={onOpen} onReplyVoice={onReplyVoice} />
             ) : null}
         </div>
     )
@@ -391,6 +402,12 @@ export default function DashboardPage() {
         navigate({ to: '/voice/$sessionId', params: { sessionId } })
     }, [navigate])
 
+    // "Reply by voice" is an explicit intent to speak — open the voice view with
+    // the mic already armed so the operator doesn't have to tap it again (#23).
+    const talkToSessionWithMic = useCallback((sessionId: string) => {
+        navigate({ to: '/voice/$sessionId', params: { sessionId }, search: { mic: true } })
+    }, [navigate])
+
     const markRowSeen = useCallback((row: DashboardRow) => {
         // Opening/revealing a row counts as seeing it — clear unread server-side.
         if (row.unread && api) {
@@ -432,20 +449,20 @@ export default function DashboardPage() {
         void op.then(invalidatePins).catch(() => { /* pin is best-effort */ })
     }, [api, invalidatePins])
 
-    // Manual reorder via up/down — touch-friendly and library-free. We send the
-    // whole desired order so the hub never has to infer intent; the pinned set
-    // stays exactly where the operator put it (never auto-sorted).
-    const movePinned = useCallback((sessionId: string, direction: -1 | 1) => {
+    // Bump a pinned row to the very top in one tap (#20). We send the whole
+    // desired order so the hub never has to infer intent; the rest keep their
+    // relative order below it.
+    const moveToTop = useCallback((sessionId: string) => {
         if (!api) {
             return
         }
         const order = pinnedRows.map((r) => r.summary.id)
         const from = order.indexOf(sessionId)
-        const to = from + direction
-        if (from === -1 || to < 0 || to >= order.length) {
-            return
+        if (from <= 0) {
+            return // not pinned, or already on top — nothing to do
         }
-        ;[order[from], order[to]] = [order[to], order[from]]
+        order.splice(from, 1)
+        order.unshift(sessionId)
         void api.reorderPins(order).then(invalidatePins).catch(() => { /* best-effort */ })
     }, [api, pinnedRows, invalidatePins])
 
@@ -486,16 +503,15 @@ export default function DashboardPage() {
             api={api}
             row={row}
             expanded={expandedId === row.summary.id}
-            canMoveUp={pinIndex > 0}
-            canMoveDown={pinIndex >= 0 && pinIndex < pinnedRows.length - 1}
+            canMoveToTop={pinIndex > 0}
             quickActions={QUICK_ACTIONS[row.status] ?? []}
             sentNote={sentNotes[row.summary.id] ?? null}
             onToggle={() => toggleExpand(row)}
             onOpen={() => openSession(row.summary.id)}
             onVoice={() => talkToSession(row.summary.id)}
+            onReplyVoice={() => talkToSessionWithMic(row.summary.id)}
             onTogglePin={() => togglePin(row)}
-            onMoveUp={() => movePinned(row.summary.id, -1)}
-            onMoveDown={() => movePinned(row.summary.id, 1)}
+            onMoveToTop={() => moveToTop(row.summary.id)}
             onQuickAction={(a) => runQuickAction(row.summary.id, a)}
         />
         )
