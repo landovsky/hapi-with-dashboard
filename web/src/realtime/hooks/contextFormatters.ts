@@ -224,6 +224,9 @@ export interface LastAssistantSpeakable {
      *  view tracks "played" against (text alone is ambiguous and resets on
      *  re-mount). */
     seq: number
+    /** Epoch ms the reply was created — so the voice view can show how old the
+     *  message is. */
+    createdAt: number
     /** True when the user turn that prompted this reply carried VOICE_PREAMBLE,
      *  i.e. the reply was generated for voice and is safe/short to read aloud.
      *  Older chat replies (long, never meant to be spoken) come back false. */
@@ -264,7 +267,7 @@ export function extractLastAssistantSpeakableDetailed(
             }
         }
 
-        return { text: speakable.text, seq: sorted[i].seq ?? 0, voiceOriginated }
+        return { text: speakable.text, seq: sorted[i].seq ?? 0, createdAt: sorted[i].createdAt ?? 0, voiceOriginated }
     }
 
     return null
