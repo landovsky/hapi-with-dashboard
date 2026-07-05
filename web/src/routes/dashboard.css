@@ -97,10 +97,47 @@
 .vd-toolbar-row {
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 12px;
     flex-wrap: wrap;
     font-size: 12px;
 }
+
+/* Projects | Sessions segmented tabs */
+.vd-tabs {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 9px;
+    border: 1px solid #232730;
+    background: #15171d;
+}
+.vd-tab {
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 13px;
+    border-radius: 7px;
+    border: none;
+    background: none;
+    color: #8b93a1;
+    cursor: pointer;
+}
+.vd-tab:hover { color: #cfd4dc; }
+.vd-tab-on { background: #26304a; color: #eef3fb; }
+.vd-tab-on:hover { color: #fff; }
+
+.vd-sort {
+    font-family: inherit;
+    font-size: 12px;
+    height: 30px;
+    padding: 0 8px;
+    border-radius: 8px;
+    border: 1px solid #232730;
+    background: #15171d;
+    color: #cfd4dc;
+    cursor: pointer;
+}
+.vd-sort:focus { outline: none; border-color: #3d7df2; }
 .vd-check {
     display: flex;
     align-items: center;
@@ -251,25 +288,45 @@
 }
 .vd-pjscroll::-webkit-scrollbar { height: 4px; }
 .vd-pjscroll::-webkit-scrollbar-thumb { background: #2a303b; border-radius: 2px; }
+/* Fixed-width boxes, tall enough for two wrapped lines of the project name, so
+   more of the name reads at a glance (#1 of the pill tweaks). */
 .vd-pjpill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+    position: relative;
     flex: none;
-    height: 28px;
-    padding: 0 11px;
-    border-radius: 999px;
+    width: 108px;
+    height: 48px;
+    padding: 6px 9px;
+    border-radius: 10px;
     border: 1px solid #262a33;
     background: #15171d;
     color: #cfd4dc;
     font-family: inherit;
-    font-size: 12px;
     font-weight: 600;
-    white-space: nowrap;
+    text-align: left;
     cursor: pointer;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
 }
 .vd-pjpill:hover { background: #1b1f27; border-color: #33507f; color: #fff; }
-.vd-pjpill-n { font-size: 10px; font-weight: 700; color: #6b7686; }
+.vd-pjpill-name {
+    font-size: 11.5px;
+    line-height: 1.22;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+    padding-right: 12px;
+}
+.vd-pjpill-n {
+    position: absolute;
+    top: 5px;
+    right: 7px;
+    font-size: 9px;
+    font-weight: 700;
+    color: #6b7686;
+}
 .vd-collapse-all {
     flex: none;
     width: 30px;

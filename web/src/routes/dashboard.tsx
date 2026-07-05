@@ -274,15 +274,20 @@ export default function DashboardPage() {
     // "Jump" actually dismisses the pill instead of leaving it stuck on screen.
     const [dismissedWaitingId, setDismissedWaitingId] = useState<string | null>(null)
     // Toolbar state: show-all overrides the backend 5-day window; search filters
-    // locally; group toggles the project layout.
+    // locally in both tabs.
     const [showAll, setShowAll] = useState(false)
     const [search, setSearch] = useState('')
-    // Default the board to project-grouped ordering (#12) — most operators think
-    // in projects, not one flat recency stream. Toggle off for the flat view.
-    const [grouped, setGrouped] = useState(true)
-    // Which project groups are collapsed (by project key). Collapse is display
-    // only — grouping, ordering and status are untouched. #3
-    const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set())
+    // Two tabs instead of a grouping checkbox: Projects (grouped board) and
+    // Sessions (flat list). Default to Projects — that's where the operator lives.
+    const [view, setView] = useState<'projects' | 'sessions'>('projects')
+    const grouped = view === 'projects'
+    // Sort applied to sessions (both tabs) and to the project groups. Recency by
+    // default — freshest first.
+    const [sortBy, setSortBy] = useState<'recent' | 'oldest' | 'name'>('recent')
+    // Which project groups are EXPANDED (by project key). Tracking expansion (not
+    // collapse) means the empty default = every group collapsed, which is what we
+    // want on load. Display-only; grouping/ordering/status are untouched.
+    const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set())
     const searchRef = useRef<HTMLInputElement | null>(null)
 
     // Desktop power-move: ⌘F / Ctrl+F jumps into the board's own search instead
@@ -348,19 +353,29 @@ export default function DashboardPage() {
         ))
     }, [allRows, search])
 
+    // One comparator, driven by the sort select, used for loose sessions in both
+    // tabs and (below) for ordering projects. Recency (freshest first) default.
+    const sortRows = useCallback((a: DashboardRow, b: DashboardRow) => {
+        if (sortBy === 'name') {
+            return a.title.localeCompare(b.title)
+        }
+        if (sortBy === 'oldest') {
+            return a.summary.updatedAt - b.summary.updatedAt
+        }
+        return b.summary.updatedAt - a.summary.updatedAt
+    }, [sortBy])
+
     const pinnedRows = useMemo(
         () => filteredRows
             .filter((r) => r.pinned)
             .sort((a, b) => (pinOrder.get(a.summary.id) ?? 0) - (pinOrder.get(b.summary.id) ?? 0)),
         [filteredRows, pinOrder]
     )
-    // "Everything else" most-recent-first; pinned rows are the manually ordered
-    // set, the rest follows recency so fresh activity floats up.
+    // "Everything else" follows the chosen sort; the manually-ordered pinned set
+    // stays above it.
     const otherRows = useMemo(
-        () => filteredRows
-            .filter((r) => !r.pinned)
-            .sort((a, b) => b.summary.updatedAt - a.summary.updatedAt),
-        [filteredRows]
+        () => filteredRows.filter((r) => !r.pinned).sort(sortRows),
+        [filteredRows, sortRows]
     )
     const waitingRow = useMemo(
         () => otherRows.find((r) => r.status === 'waiting') ?? pinnedRows.find((r) => r.status === 'waiting') ?? null,
@@ -389,28 +404,33 @@ export default function DashboardPage() {
             if (a.pinned && b.pinned) {
                 return (pinOrder.get(a.summary.id) ?? 0) - (pinOrder.get(b.summary.id) ?? 0)
             }
-            return b.summary.updatedAt - a.summary.updatedAt
+            return sortRows(a, b)
         })
-        return groupRowsByProject(input, (r) => r.project)
-    }, [grouped, filteredRows, pinOrder])
+        const groups = groupRowsByProject(input, (r) => r.project)
+        // Order the projects themselves by the same sort — recency uses each
+        // project's most-recent message, so the freshest project floats to top.
+        const recencyOf = (g: typeof groups[number]) => g.rows.reduce((max, r) => Math.max(max, r.summary.updatedAt), 0)
+        return groups.sort((a, b) => {
+            if (sortBy === 'name') {
+                return a.label.localeCompare(b.label)
+            }
+            if (sortBy === 'oldest') {
+                return recencyOf(a) - recencyOf(b)
+            }
+            return recencyOf(b) - recencyOf(a)
+        })
+    }, [grouped, filteredRows, pinOrder, sortRows, sortBy])
 
-    // Quick-jump pills (#4): one per project, ordered by most-recent activity
-    // (the freshest project first), each carrying its row count.
+    // Quick-jump pills (#4): one per project, in the same order as the groups so
+    // the pill row and the board agree.
     const projectPills = useMemo(
-        () => projectGroups
-            .map((g) => ({
-                key: g.key,
-                label: g.label,
-                count: g.rows.length,
-                lastAt: g.rows.reduce((max, r) => Math.max(max, r.summary.updatedAt), 0)
-            }))
-            .sort((a, b) => b.lastAt - a.lastAt),
+        () => projectGroups.map((g) => ({ key: g.key, label: g.label, count: g.rows.length })),
         [projectGroups]
     )
-    const allCollapsed = projectGroups.length > 0 && projectGroups.every((g) => collapsedProjects.has(g.key))
+    const allExpanded = projectGroups.length > 0 && projectGroups.every((g) => expandedProjects.has(g.key))
 
-    const toggleGroupCollapsed = useCallback((key: string) => {
-        setCollapsedProjects((prev) => {
+    const toggleGroupExpanded = useCallback((key: string) => {
+        setExpandedProjects((prev) => {
             const next = new Set(prev)
             if (next.has(key)) {
                 next.delete(key)
@@ -420,26 +440,22 @@ export default function DashboardPage() {
             return next
         })
     }, [])
-    const collapseAllGroups = useCallback(() => {
-        setCollapsedProjects(new Set(projectGroups.map((g) => g.key)))
-    }, [projectGroups])
-    const expandAllGroups = useCallback(() => setCollapsedProjects(new Set()), [])
+    const expandProject = useCallback((key: string) => {
+        setExpandedProjects((prev) => (prev.has(key) ? prev : new Set(prev).add(key)))
+    }, [])
+    const collapseAllGroups = useCallback(() => setExpandedProjects(new Set()), [])
+    const expandAllGroups = useCallback(
+        () => setExpandedProjects(new Set(projectGroups.map((g) => g.key))),
+        [projectGroups]
+    )
 
-    // Tap a pill: make sure that project is expanded, then scroll its header to
-    // the top of the board.
+    // Tap a pill: expand that project, then scroll its header to the top.
     const jumpToProject = useCallback((key: string) => {
-        setCollapsedProjects((prev) => {
-            if (!prev.has(key)) {
-                return prev
-            }
-            const next = new Set(prev)
-            next.delete(key)
-            return next
-        })
+        expandProject(key)
         requestAnimationFrame(() => {
             document.getElementById(`vd-group-${key}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
         })
-    }, [])
+    }, [expandProject])
 
     const activeCount = useMemo(() => sessions.filter((s) => s.active).length, [sessions])
     const visibleCount = filteredRows.length
@@ -480,21 +496,14 @@ export default function DashboardPage() {
         setDismissedWaitingId(row.summary.id)
         // If the blocked session sits in a collapsed project group, open it so
         // the tile actually exists to scroll to.
-        setCollapsedProjects((prev) => {
-            if (!prev.has(row.project)) {
-                return prev
-            }
-            const next = new Set(prev)
-            next.delete(row.project)
-            return next
-        })
+        expandProject(row.project)
         markRowSeen(row)
         requestAnimationFrame(() => {
             const el = document.getElementById(`vd-tile-${row.summary.id}`)
             el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
             el?.focus?.()
         })
-    }, [markRowSeen])
+    }, [markRowSeen, expandProject])
 
     const invalidatePins = useCallback(
         () => queryClient.invalidateQueries({ queryKey: ['dashboard', 'pins'] }),
@@ -602,13 +611,36 @@ export default function DashboardPage() {
                         aria-label="Search sessions"
                     />
                     <div className="vd-toolbar-row">
+                        <div className="vd-tabs" role="tablist">
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={view === 'projects'}
+                                className={`vd-tab${view === 'projects' ? ' vd-tab-on' : ''}`}
+                                onClick={() => setView('projects')}
+                            >Projects</button>
+                            <button
+                                type="button"
+                                role="tab"
+                                aria-selected={view === 'sessions'}
+                                className={`vd-tab${view === 'sessions' ? ' vd-tab-on' : ''}`}
+                                onClick={() => setView('sessions')}
+                            >Sessions</button>
+                        </div>
+                        <select
+                            className="vd-sort"
+                            value={sortBy}
+                            onChange={(e) => setSortBy(e.target.value as 'recent' | 'oldest' | 'name')}
+                            aria-label="Sort by"
+                            title="Sort by"
+                        >
+                            <option value="recent">Recent</option>
+                            <option value="oldest">Oldest</option>
+                            <option value="name">Name</option>
+                        </select>
                         <label className="vd-check">
                             <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
                             Show all
-                        </label>
-                        <label className="vd-check">
-                            <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
-                            Group by project
                         </label>
                         <span className="vd-count">
                             {visibleCount} of {total}{showAll ? '' : ` · last ${days}d`}
@@ -629,9 +661,7 @@ export default function DashboardPage() {
                                     title={p.label}
                                     onClick={() => jumpToProject(p.key)}
                                 >
-                                    <span className="vd-pjpill-name">
-                                        {p.label.length > 15 ? `${p.label.slice(0, 14)}…` : p.label}
-                                    </span>
+                                    <span className="vd-pjpill-name">{p.label}</span>
                                     <span className="vd-pjpill-n">{p.count}</span>
                                 </button>
                             ))}
@@ -639,10 +669,10 @@ export default function DashboardPage() {
                         <button
                             type="button"
                             className="vd-collapse-all"
-                            onClick={allCollapsed ? expandAllGroups : collapseAllGroups}
-                            title={allCollapsed ? 'Expand all projects' : 'Collapse all projects'}
+                            onClick={allExpanded ? collapseAllGroups : expandAllGroups}
+                            title={allExpanded ? 'Collapse all projects' : 'Expand all projects'}
                         >
-                            {allCollapsed ? '⊞' : '⊟'}
+                            {allExpanded ? '⊟' : '⊞'}
                         </button>
                     </div>
                 ) : null}
@@ -676,15 +706,15 @@ export default function DashboardPage() {
 
                 {grouped ? (
                     projectGroups.map((group) => {
-                        // An active search force-expands every group so matches are
-                        // never hidden behind a collapsed header.
-                        const collapsed = collapsedProjects.has(group.key) && !search.trim()
+                        // Collapsed by default (#2); an active search force-expands
+                        // every group so matches are never hidden behind a header.
+                        const collapsed = !expandedProjects.has(group.key) && !search.trim()
                         return (
                             <div key={group.key} id={`vd-group-${group.key}`} className="vd-projgroup">
                                 <button
                                     type="button"
                                     className="vd-projsec"
-                                    onClick={() => toggleGroupCollapsed(group.key)}
+                                    onClick={() => toggleGroupExpanded(group.key)}
                                     aria-expanded={!collapsed}
                                 >
                                     <span className="vd-projchev">{collapsed ? '▸' : '▾'}</span>

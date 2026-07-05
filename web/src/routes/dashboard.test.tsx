@@ -77,9 +77,9 @@ describe('DashboardPage', () => {
                 makeSummary({ id: 'b', active: false, metadata: { path: '/x/old-spike', lifecycleState: 'exited:error' } })
             ])
             const { container } = render(<DashboardPage />)
-            // Tile titles come from the working-directory basename. Scope to the
-            // title span so we don't collide with the (identically-named) project
-            // group header now that the board groups by project by default.
+            // The Projects tab opens collapsed; the flat Sessions tab always
+            // shows every tile, so assert titles there.
+            fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
             const titles = Array.from(container.querySelectorAll('.vd-ttl')).map((el) => el.textContent)
             expect(titles).toContain('blog-redesign')
             expect(titles).toContain('old-spike')
@@ -111,12 +111,27 @@ describe('DashboardPage', () => {
             expect(pills).toEqual(['bravo', 'alpha'])
         })
 
-        it('collapses a project group in place when its header is tapped (#3)', () => {
+        it('opens with every project collapsed and toggles a group when its header is tapped (#2, #3)', () => {
             setSessions([makeSummary({ id: 'a', metadata: { path: '/x/alpha' } })])
             const { container } = render(<DashboardPage />)
-            expect(container.querySelector('.vd-tile')).toBeTruthy()
-            fireEvent.click(container.querySelector('.vd-projsec') as HTMLElement)
+            const header = container.querySelector('.vd-projsec') as HTMLElement
+            // Collapsed by default — the header shows but no tile does.
             expect(container.querySelector('.vd-tile')).toBeNull()
+            fireEvent.click(header)
+            expect(container.querySelector('.vd-tile')).toBeTruthy()
+            fireEvent.click(header)
+            expect(container.querySelector('.vd-tile')).toBeNull()
+        })
+
+        it('splits into Projects and Sessions tabs — the Sessions tab is a flat list with no project headers (#3)', () => {
+            setSessions([makeSummary({ id: 'a', metadata: { path: '/x/alpha' } })])
+            const { container } = render(<DashboardPage />)
+            // Projects tab (default): a project header, no tiles (collapsed).
+            expect(container.querySelector('.vd-projname')).toBeTruthy()
+            fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
+            // Sessions tab: flat — the tile shows, no project header.
+            expect(container.querySelector('.vd-projname')).toBeNull()
+            expect(container.querySelector('.vd-tile')).toBeTruthy()
         })
     })
 
@@ -157,6 +172,8 @@ describe('DashboardPage', () => {
                 makeSummary({ id: 'd', metadata: { path: '/x/auth-rate-limit' }, todoProgress: { completed: 3, total: 3 } })
             ])
             render(<DashboardPage />)
+            // Tiles (and their quick-actions) live under the flat Sessions tab.
+            fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
             expect(screen.getByText('DONE')).toBeInTheDocument()
             expect(screen.getByRole('button', { name: 'commit' })).toBeInTheDocument()
             expect(screen.getByRole('button', { name: 'PR' })).toBeInTheDocument()
