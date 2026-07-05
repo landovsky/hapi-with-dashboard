@@ -147,7 +147,7 @@ function ExpandedTileBody({
                     type="button"
                     className={`vd-qbtn vd-arch${archiveArmed ? ' vd-arch-armed' : ''}`}
                     onClick={(e) => stop(e, onArchive)}
-                >{archiveArmed ? '⚠ Confirm archive' : '🗄 Archive'}</button>
+                >{archiveArmed ? '⚠ Confirm' : '🗄 Archive'}</button>
             </div>
         </div>
     )
@@ -548,7 +548,7 @@ export default function DashboardPage() {
         }
         setArmedArchive(null)
         setExpandedId((cur) => (cur === sessionId ? null : cur))
-        void api.archiveSession(sessionId)
+        void api.dashboardArchiveSession(sessionId)
             .then(() => queryClient.invalidateQueries({ queryKey: ['dashboard', 'sessions'] }))
             .catch(() => { /* best-effort — the poll will re-sync if it failed */ })
     }, [api, armedArchive, queryClient])

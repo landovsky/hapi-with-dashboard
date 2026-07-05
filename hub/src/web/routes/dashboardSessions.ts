@@ -32,7 +32,11 @@ export function createDashboardSessionsRoutes(getSyncEngine: () => SyncEngine | 
         const days = Number.isFinite(daysRaw) && daysRaw > 0 ? daysRaw : DEFAULT_DAYS
         const cutoff = Date.now() - days * DAY_MS
 
+        // Archived sessions are "put away" — never surface them on the board,
+        // even under "show all". Archiving sets metadata.lifecycleState =
+        // 'archived' (see syncEngine), so filter on that before anything else.
         const records = engine.getSessionsByNamespace(namespace)
+            .filter((s) => s.metadata?.lifecycleState !== 'archived')
         const recent = all ? records : records.filter((s) => s.updatedAt >= cutoff)
         const sessions = recent
             .slice()
@@ -40,6 +44,24 @@ export function createDashboardSessionsRoutes(getSyncEngine: () => SyncEngine | 
             .map((s) => toSessionSummary(s))
 
         return c.json({ sessions, total: records.length, shown: sessions.length, days })
+    })
+
+    // Archive a session straight from the board (#1) — works for idle rows too,
+    // which upstream's /archive rejects. Recoverable (reopen revives it); the
+    // list filter above then hides it.
+    app.post('/dashboard/sessions/:id/archive', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+        const namespace = c.get('namespace')
+        const id = c.req.param('id')
+        const exists = engine.getSessionsByNamespace(namespace).some((s) => s.id === id)
+        if (!exists) {
+            return c.json({ error: 'Session not found' }, 404)
+        }
+        await engine.archiveFromDashboard(id, namespace)
+        return c.json({ ok: true })
     })
 
     return app
