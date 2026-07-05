@@ -193,7 +193,7 @@ function DashboardTile({
     return (
         <div
             id={`vd-tile-${row.summary.id}`}
-            className={`vd-tile${expanded ? ' vd-exp' : ''}${row.status === 'dead' ? ' vd-dead' : ''}`}
+            className={`vd-tile${expanded ? ' vd-exp' : ''}${row.pinned ? ' vd-pinned' : ''}${row.status === 'dead' ? ' vd-dead' : ''}`}
             style={{ borderLeftColor: meta.accent }}
             onClick={onToggle}
             onKeyDown={(e) => {
@@ -397,6 +397,10 @@ export default function DashboardPage() {
         if (!grouped) {
             return []
         }
+        // Within a project: pinned sessions first (in manual pin order), then the
+        // rest by the selected sort. Pins are a deliberate "keep this on top" — a
+        // distinct tile background (below) makes that obvious so the order doesn't
+        // read as broken.
         const input = [...filteredRows].sort((a, b) => {
             if (a.pinned !== b.pinned) {
                 return a.pinned ? -1 : 1

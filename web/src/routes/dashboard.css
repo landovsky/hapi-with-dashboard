@@ -461,8 +461,17 @@
 }
 .vd-sent.vd-sent-fail { color: #e0796f; }
 
+/* Pinned tiles carry a warm "kept" tint (matching the gold pin) so a pinned row
+   sitting on top of its group reads as deliberate, not as a broken sort. */
+.vd-tile.vd-pinned {
+    background: #1a1710;
+    border-color: #33301f;
+}
+.vd-tile.vd-pinned:hover { background: #1f1b12; }
+
 /* expanded (dense) */
 .vd-tile.vd-exp { border-color: #3a4150; background: #171b22; }
+.vd-tile.vd-pinned.vd-exp { background: #201c13; border-color: #4a401d; }
 .vd-expbody { margin-top: 10px; padding-top: 11px; border-top: 1px solid #232934; }
 .vd-fullwrap { position: relative; }
 .vd-full {
