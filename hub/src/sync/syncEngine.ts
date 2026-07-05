@@ -475,6 +475,25 @@ export class SyncEngine {
     }
 
     /**
+     * Archive a session from the voice dashboard regardless of active state
+     * (additive — the upstream `/archive` route only accepts active/running
+     * rows). An active session is stopped-and-archived first; then the row is
+     * marked `lifecycleState: 'archived'` in place so the dashboard filter hides
+     * it. Recoverable: `reopenSession` revives an archived row. No-ops on an
+     * unknown id.
+     */
+    async archiveFromDashboard(sessionId: string, namespace: string): Promise<void> {
+        const record = this.getSessionsByNamespace(namespace).find((s) => s.id === sessionId)
+        if (!record) {
+            return
+        }
+        if (record.active) {
+            await this.archiveSession(sessionId)
+        }
+        this.sessionCache.markSessionArchivedFromHub(sessionId, 'Archived from dashboard')
+    }
+
+    /**
      * Apply the post-migration metadata flip in hapi.db:
      *   - metadata.cursorSessionProtocol = 'acp'
      *   - session.model = lastUsedModel (if provided)

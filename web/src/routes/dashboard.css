@@ -536,8 +536,17 @@
     cursor: pointer;
 }
 .vd-qbtn.vd-alt { border-color: #1d3354; background: #0f1d33; color: #6ea8ff; }
-/* Archive — muted "put away" tone; turns danger-amber once armed for confirm. */
-.vd-qbtn.vd-arch { border-color: #33302a; background: #1b1a16; color: #b0a894; }
+/* Archive — muted "put away" tone; turns danger-amber once armed for confirm.
+   Fixed width + nowrap so swapping to the "Confirm" label can't resize the
+   button or bump it onto a new line. */
+.vd-qbtn.vd-arch {
+    border-color: #33302a;
+    background: #1b1a16;
+    color: #b0a894;
+    min-width: 108px;
+    justify-content: center;
+    white-space: nowrap;
+}
 .vd-qbtn.vd-arch:hover { background: #22201a; }
 .vd-qbtn.vd-arch.vd-arch-armed { border-color: #7a3b2e; background: #2c1512; color: #f0a79c; }
 .vd-difst-loading { color: #5b6068; font-size: 12px; margin-top: 11px; }

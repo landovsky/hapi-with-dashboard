@@ -218,6 +218,14 @@ export class ApiClient {
         return await this.request<DashboardSessionsResponse>(`/api/dashboard/sessions${qs ? `?${qs}` : ''}`)
     }
 
+    /** Archive a session from the dashboard — works for idle rows too (unlike the
+     *  upstream /archive, which only accepts active sessions). Recoverable. */
+    async dashboardArchiveSession(sessionId: string): Promise<void> {
+        await this.request(`/api/dashboard/sessions/${encodeURIComponent(sessionId)}/archive`, {
+            method: 'POST'
+        })
+    }
+
     /** Pinned sessions in the operator's manual order (never auto-sorted). */
     async listPins(): Promise<PinsResponse> {
         return await this.request<PinsResponse>('/api/pins')
