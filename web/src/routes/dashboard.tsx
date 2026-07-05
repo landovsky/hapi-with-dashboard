@@ -266,7 +266,9 @@ export default function DashboardPage() {
     // locally; group toggles the project layout.
     const [showAll, setShowAll] = useState(false)
     const [search, setSearch] = useState('')
-    const [grouped, setGrouped] = useState(false)
+    // Default the board to project-grouped ordering (#12) — most operators think
+    // in projects, not one flat recency stream. Toggle off for the flat view.
+    const [grouped, setGrouped] = useState(true)
     const searchRef = useRef<HTMLInputElement | null>(null)
 
     // Desktop power-move: ⌘F / Ctrl+F jumps into the board's own search instead
@@ -358,12 +360,25 @@ export default function DashboardPage() {
         }
     }, [waitingRow])
     const showWaitingPill = waitingRow && waitingRow.summary.id !== dismissedWaitingId
-    // When grouping is on, the non-pinned rows are bucketed by project; pinned
-    // stays its own manual section on top.
-    const projectGroups = useMemo(
-        () => grouped ? groupRowsByProject(otherRows, (r) => r.project) : [],
-        [grouped, otherRows]
-    )
+    // When grouping is on, EVERY row is bucketed by project — pinned included
+    // (#10). Within a project, pinned rows come first (in manual pin order), then
+    // the rest by recency, so a project's "kept" sessions stay on top of its
+    // group instead of living in a separate island.
+    const projectGroups = useMemo(() => {
+        if (!grouped) {
+            return []
+        }
+        const input = [...filteredRows].sort((a, b) => {
+            if (a.pinned !== b.pinned) {
+                return a.pinned ? -1 : 1
+            }
+            if (a.pinned && b.pinned) {
+                return (pinOrder.get(a.summary.id) ?? 0) - (pinOrder.get(b.summary.id) ?? 0)
+            }
+            return b.summary.updatedAt - a.summary.updatedAt
+        })
+        return groupRowsByProject(input, (r) => r.project)
+    }, [grouped, filteredRows, pinOrder])
 
     const activeCount = useMemo(() => sessions.filter((s) => s.active).length, [sessions])
     const visibleCount = filteredRows.length
@@ -460,14 +475,19 @@ export default function DashboardPage() {
         })
     }, [api, flashSent])
 
-    const renderRow = (row: DashboardRow, index: number, list: DashboardRow[]) => (
+    const renderRow = (row: DashboardRow) => {
+        // Reorder is relative to the GLOBAL pinned set, not the row's position in
+        // whatever section renders it — so up/down stay correct even when a
+        // pinned row is nested inside its project group (#10).
+        const pinIndex = row.pinned ? pinnedRows.findIndex((r) => r.summary.id === row.summary.id) : -1
+        return (
         <DashboardTile
             key={row.summary.id}
             api={api}
             row={row}
             expanded={expandedId === row.summary.id}
-            canMoveUp={row.pinned && index > 0}
-            canMoveDown={row.pinned && index < list.length - 1}
+            canMoveUp={pinIndex > 0}
+            canMoveDown={pinIndex >= 0 && pinIndex < pinnedRows.length - 1}
             quickActions={QUICK_ACTIONS[row.status] ?? []}
             sentNote={sentNotes[row.summary.id] ?? null}
             onToggle={() => toggleExpand(row)}
@@ -478,7 +498,8 @@ export default function DashboardPage() {
             onMoveDown={() => movePinned(row.summary.id, 1)}
             onQuickAction={(a) => runQuickAction(row.summary.id, a)}
         />
-    )
+        )
+    }
 
     return (
         <div className="vd-root">
@@ -537,7 +558,9 @@ export default function DashboardPage() {
                     <LoadingState label="Loading sessions…" className="text-sm" />
                 ) : null}
 
-                {pinnedRows.length > 0 ? (
+                {/* Flat "Pinned" island only in ungrouped mode — when grouped,
+                    pinned rows live inside their project group (#10). */}
+                {!grouped && pinnedRows.length > 0 ? (
                     <>
                         <div className="vd-sec">Pinned</div>
                         {pinnedRows.map(renderRow)}
@@ -546,9 +569,10 @@ export default function DashboardPage() {
 
                 {grouped ? (
                     projectGroups.map((group) => (
-                        <div key={group.key}>
-                            <div className="vd-sec">
-                                {group.label}<span className="vd-sec-n">·{group.rows.length}</span>
+                        <div key={group.key} className="vd-projgroup">
+                            <div className="vd-projsec">
+                                <span className="vd-projname">{group.label}</span>
+                                <span className="vd-projn">{group.rows.length}</span>
                             </div>
                             {group.rows.map(renderRow)}
                         </div>
