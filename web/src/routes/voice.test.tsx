@@ -1,6 +1,22 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeEach, beforeAll } from 'vitest'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import type { SessionSummary } from '@/types/api'
+
+// jsdom has no <audio> or object URLs. Stub just enough that playTts can reach
+// the "playing" state (so the Stop control renders) without real media. play()
+// never resolves, so playback stays "in progress" until stop() supersedes it.
+beforeAll(() => {
+    class FakeAudio {
+        play = vi.fn(() => new Promise<void>(() => {}))
+        pause = vi.fn()
+        src = ''
+        onended: (() => void) | null = null
+        onerror: (() => void) | null = null
+    }
+    globalThis.Audio = FakeAudio as unknown as typeof Audio
+    globalThis.URL.createObjectURL = () => 'blob:voice-test'
+    globalThis.URL.revokeObjectURL = () => {}
+})
 
 const context = describe
 
@@ -79,16 +95,33 @@ describe('VoicePage', () => {
             expect(screen.getByText(/Want me to wire the tokens in/)).toBeInTheDocument()
         })
 
-        it('offers the always-available controls — summarize aloud and a tap-to-talk mic', () => {
+        it('offers summarize-aloud and a self-explanatory mic — no redundant "tap to talk" caption (#31)', () => {
             render(<VoicePage />)
             expect(screen.getByText(/summarize this session aloud/)).toBeInTheDocument()
-            expect(screen.getByText('tap to talk')).toBeInTheDocument()
+            // The idle caption is gone; the mic is reachable by its stable label.
+            expect(screen.queryByText('tap to talk')).not.toBeInTheDocument()
+            expect(screen.getByLabelText('Record a voice message')).toBeInTheDocument()
         })
 
         it('surfaces tappable suggested replies once the model proposes them', async () => {
             render(<VoicePage />)
             await waitFor(() => expect(screen.getByText('Wire them in')).toBeInTheDocument())
             expect(screen.getByText('Hold for review')).toBeInTheDocument()
+        })
+    })
+
+    context('a reply reading itself aloud must be interruptible — the operator needs a way to shut it up (#32)', () => {
+        it('shows a stop control while playing and halts playback when tapped', async () => {
+            // Let this session's auto-read actually reach playback (default mock
+            // rejects); once playing, the Stop control must appear.
+            api.synthesizeSpeech.mockResolvedValueOnce(new Blob(['x']))
+            render(<VoicePage />)
+            const stop = await screen.findByText('⏹ stop')
+            expect(stop).toBeInTheDocument()
+            fireEvent.click(stop)
+            // Tapping stop returns the bar to its idle "replay" affordance.
+            await waitFor(() => expect(screen.queryByText('⏹ stop')).not.toBeInTheDocument())
+            expect(screen.getByText('↺ replay')).toBeInTheDocument()
         })
     })
 

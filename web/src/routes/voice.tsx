@@ -123,6 +123,16 @@ export default function VoicePage() {
         return next
     }, [api])
 
+    // Stop whatever's being read aloud — auto-read, replay, or summarize (#32).
+    // Bumping the token makes any still-pending synth in the chain self-cancel
+    // (it sees token !== current and bails before playing); pausing kills the
+    // audio that's already sounding.
+    const stopTts = useCallback(() => {
+        ttsTokenRef.current += 1
+        audioRef.current?.pause()
+        setSpeaking(false)
+    }, [])
+
     const loadSuggestions = useCallback(async (assistantText: string) => {
         if (!api || !assistantText.trim()) {
             return
@@ -250,11 +260,13 @@ export default function VoicePage() {
     }, [api, bubbles, lastAssistant, title, playTts])
 
     const phase: MicPhase = sending ? 'sending' : recorder.state === 'recording' ? 'listening' : 'idle'
+    // Idle needs no caption — the mic glyph is self-explanatory (#31). The
+    // listening/sending states keep their captions since they convey progress.
     const micHint = phase === 'sending'
         ? 'sending · fire & forget ✓'
         : phase === 'listening'
             ? 'listening — tap to send'
-            : 'tap to talk'
+            : ''
 
     const goBack = useCallback(() => navigate({ to: '/dashboard' }), [navigate])
 
@@ -287,9 +299,11 @@ export default function VoicePage() {
                                             <span /><span /><span /><span /><span /><span />
                                         </div>
                                         <span className="vv-spk-txt">reading aloud…</span>
+                                        <button type="button" className="vv-stop" onClick={() => stopTts()}>⏹ stop</button>
                                     </>
-                                ) : null}
-                                <button type="button" className="vv-replay" onClick={() => void playTts(b.text)}>↺ replay</button>
+                                ) : (
+                                    <button type="button" className="vv-replay" onClick={() => void playTts(b.text)}>↺ replay</button>
+                                )}
                             </div>
                         ) : null}
                     </div>
@@ -322,11 +336,11 @@ export default function VoicePage() {
                     className={`vv-mic-btn${phase === 'listening' ? ' vv-listening' : ''}${phase === 'sending' ? ' vv-sending' : ''}`}
                     onClick={() => void onMicTap()}
                     disabled={phase === 'sending'}
-                    aria-label={micHint}
+                    aria-label={phase === 'listening' ? 'Stop recording and send' : phase === 'sending' ? 'Sending' : 'Record a voice message'}
                 >
                     🎙
                 </button>
-                <div className="vv-mic-hint">{micHint}</div>
+                {micHint ? <div className="vv-mic-hint">{micHint}</div> : null}
             </div>
         </div>
     )
