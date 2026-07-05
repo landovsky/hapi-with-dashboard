@@ -11,7 +11,19 @@ import type { SessionSummary } from '@/types/api'
  * (`metadata.machineId`); we keep it simple here and bucket them together.
  */
 export function projectKey(summary: SessionSummary): string {
-    return summary.metadata?.worktree?.basePath ?? summary.metadata?.path ?? 'Other'
+    const raw = summary.metadata?.worktree?.basePath ?? summary.metadata?.path ?? 'Other'
+    if (raw === 'Other') {
+        return 'Other'
+    }
+    // Collapse the machine's home prefix so the same repo checked out on
+    // different machines groups as ONE project instead of duplicating per home
+    // root — `/home/tomas/git/x`, `/Users/tomas/git/x`, `/root/git/x` all become
+    // `~/git/x`. A distinct repo at a different *relative* path stays separate, so
+    // this is safer than grouping by bare name. Trailing slash stripped too so
+    // `x/` and `x` don't split.
+    return raw
+        .replace(/\/+$/, '')
+        .replace(/^\/(?:home\/[^/]+|Users\/[^/]+|root)(?=\/)/, '~')
 }
 
 /** Short, human label for a project key — the last path segment (repo/dir name). */

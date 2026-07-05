@@ -28,15 +28,31 @@ describe('projectKey', () => {
     context('grouping should agree with the rest of HAPI — repo root if it is a worktree, else the cwd', () => {
         it('prefers the worktree base path (the repo root) over the working dir', () => {
             const s = summary({ path: '/home/t/git/blog/packages/web', worktree: { basePath: '/home/t/git/blog' } as never })
-            expect(projectKey(s)).toBe('/home/t/git/blog')
+            expect(projectKey(s)).toBe('~/git/blog')
         })
 
         it('falls back to the working directory when there is no worktree', () => {
-            expect(projectKey(summary({ path: '/home/t/git/api' }))).toBe('/home/t/git/api')
+            expect(projectKey(summary({ path: '/home/t/git/api' }))).toBe('~/git/api')
         })
 
         it('buckets a session with no path into Other', () => {
             expect(projectKey(summary(null as never))).toBe('Other')
+        })
+    })
+
+    context('the same repo on different machines should be ONE project, not a duplicate per home root', () => {
+        it('collapses /home/<u>, /Users/<u> and /root home prefixes to ~', () => {
+            expect(projectKey(summary({ path: '/home/tomas/git/hriste' }))).toBe('~/git/hriste')
+            expect(projectKey(summary({ path: '/Users/tomas/git/hriste' }))).toBe('~/git/hriste')
+            expect(projectKey(summary({ path: '/root/git/hriste' }))).toBe('~/git/hriste')
+        })
+
+        it('leaves a non-home path alone so unrelated repos never merge', () => {
+            expect(projectKey(summary({ path: '/opt/data/repo' }))).toBe('/opt/data/repo')
+        })
+
+        it('ignores a trailing slash so a/ and a are one key', () => {
+            expect(projectKey(summary({ path: '/home/tomas/git/hriste/' }))).toBe('~/git/hriste')
         })
     })
 })
