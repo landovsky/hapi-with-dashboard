@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vitest'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import type { SessionSummary } from '@/types/api'
 
@@ -38,7 +38,16 @@ vi.mock('@/lib/app-context', () => ({
     useAppContext: () => ({ api: {} })
 }))
 
-import DashboardPage from './dashboard'
+import DashboardPage, { boardMemory } from './dashboard'
+
+// The board remembers view/sort/expansion in module state (so returning from
+// voice restores it) — reset it between tests so they don't leak into each other.
+beforeEach(() => {
+    boardMemory.view = 'projects'
+    boardMemory.sortBy = 'recent'
+    boardMemory.expandedId = null
+    boardMemory.expandedProjects = []
+})
 
 function makeSummary(overrides: Partial<SessionSummary> = {}): SessionSummary {
     return {
@@ -132,6 +141,17 @@ describe('DashboardPage', () => {
             // Sessions tab: flat — the tile shows, no project header.
             expect(container.querySelector('.vd-projname')).toBeNull()
             expect(container.querySelector('.vd-tile')).toBeTruthy()
+        })
+    })
+
+    context('leaving for the voice/detail view and coming back should not dump you at square one', () => {
+        it('remembers the active tab across an unmount/remount (#2)', () => {
+            setSessions([makeSummary({ id: 'a', metadata: { path: '/x/alpha' } })])
+            const { unmount } = render(<DashboardPage />)
+            fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
+            unmount() // like navigating away to the voice page
+            render(<DashboardPage />) // …and coming back
+            expect(screen.getByRole('tab', { name: 'Sessions' }).getAttribute('aria-selected')).toBe('true')
         })
     })
 
