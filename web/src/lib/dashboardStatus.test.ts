@@ -46,6 +46,23 @@ describe('deriveDashboardStatus', () => {
         })
     })
 
+    context('a session that has gone inactive cannot be interactively waiting — a stale pending flag must not zombie-pulse the board (#2)', () => {
+        it('does not read waiting when a pending request lingers on an inactive session', () => {
+            const summary = makeSummary({
+                active: false,
+                pendingRequestsCount: 1,
+                pendingRequestKinds: ['input'],
+                metadata: { path: '/x', lifecycleState: 'stopped' }
+            })
+            expect(deriveDashboardStatus(summary, { lastSeenAt: 0, now: NOW })).not.toBe('waiting')
+        })
+
+        it('still reads waiting for an active session with an open request', () => {
+            const summary = makeSummary({ active: true, pendingRequestsCount: 1, pendingRequestKinds: ['input'] })
+            expect(deriveDashboardStatus(summary, { lastSeenAt: 0, now: NOW })).toBe('waiting')
+        })
+    })
+
     context('a long-running agent must surface as working with its elapsed clock so it cannot hide (a 4h+ session was once found by accident)', () => {
         it('reads as working whenever the agent is thinking', () => {
             const summary = makeSummary({ thinking: true, activeAt: NOW - 4 * 60 * 60 * 1000 })
@@ -103,7 +120,13 @@ describe('dashboardSessionTitle', () => {
             expect(dashboardSessionTitle(makeSummary({ metadata: { path: '/x', name: 'auth-rate-limit' } }))).toBe('auth-rate-limit')
         })
 
-        it('falls back to the working-directory basename so the row is still recognisable', () => {
+        it('falls back to the running summary before the bare repo name, so an unnamed session shows its real title (#1)', () => {
+            expect(dashboardSessionTitle(makeSummary({
+                metadata: { path: '/home/tomas/git/hapi-with-dashboard', summary: { text: 'Dashboard improvements — deploy by chapters' } }
+            }))).toBe('Dashboard improvements — deploy by chapters')
+        })
+
+        it('falls back to the working-directory basename when there is neither name nor summary', () => {
             expect(dashboardSessionTitle(makeSummary({ metadata: { path: '/home/tomas/git/blog-redesign' } }))).toBe('blog-redesign')
         })
 

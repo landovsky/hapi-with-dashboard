@@ -280,6 +280,9 @@ export default function DashboardPage() {
     // Default the board to project-grouped ordering (#12) — most operators think
     // in projects, not one flat recency stream. Toggle off for the flat view.
     const [grouped, setGrouped] = useState(true)
+    // Which project groups are collapsed (by project key). Collapse is display
+    // only — grouping, ordering and status are untouched. #3
+    const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => new Set())
     const searchRef = useRef<HTMLInputElement | null>(null)
 
     // Desktop power-move: ⌘F / Ctrl+F jumps into the board's own search instead
@@ -391,6 +394,53 @@ export default function DashboardPage() {
         return groupRowsByProject(input, (r) => r.project)
     }, [grouped, filteredRows, pinOrder])
 
+    // Quick-jump pills (#4): one per project, ordered by most-recent activity
+    // (the freshest project first), each carrying its row count.
+    const projectPills = useMemo(
+        () => projectGroups
+            .map((g) => ({
+                key: g.key,
+                label: g.label,
+                count: g.rows.length,
+                lastAt: g.rows.reduce((max, r) => Math.max(max, r.summary.updatedAt), 0)
+            }))
+            .sort((a, b) => b.lastAt - a.lastAt),
+        [projectGroups]
+    )
+    const allCollapsed = projectGroups.length > 0 && projectGroups.every((g) => collapsedProjects.has(g.key))
+
+    const toggleGroupCollapsed = useCallback((key: string) => {
+        setCollapsedProjects((prev) => {
+            const next = new Set(prev)
+            if (next.has(key)) {
+                next.delete(key)
+            } else {
+                next.add(key)
+            }
+            return next
+        })
+    }, [])
+    const collapseAllGroups = useCallback(() => {
+        setCollapsedProjects(new Set(projectGroups.map((g) => g.key)))
+    }, [projectGroups])
+    const expandAllGroups = useCallback(() => setCollapsedProjects(new Set()), [])
+
+    // Tap a pill: make sure that project is expanded, then scroll its header to
+    // the top of the board.
+    const jumpToProject = useCallback((key: string) => {
+        setCollapsedProjects((prev) => {
+            if (!prev.has(key)) {
+                return prev
+            }
+            const next = new Set(prev)
+            next.delete(key)
+            return next
+        })
+        requestAnimationFrame(() => {
+            document.getElementById(`vd-group-${key}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        })
+    }, [])
+
     const activeCount = useMemo(() => sessions.filter((s) => s.active).length, [sessions])
     const visibleCount = filteredRows.length
 
@@ -428,6 +478,16 @@ export default function DashboardPage() {
     const jumpToWaiting = useCallback((row: DashboardRow) => {
         setExpandedId(row.summary.id)
         setDismissedWaitingId(row.summary.id)
+        // If the blocked session sits in a collapsed project group, open it so
+        // the tile actually exists to scroll to.
+        setCollapsedProjects((prev) => {
+            if (!prev.has(row.project)) {
+                return prev
+            }
+            const next = new Set(prev)
+            next.delete(row.project)
+            return next
+        })
         markRowSeen(row)
         requestAnimationFrame(() => {
             const el = document.getElementById(`vd-tile-${row.summary.id}`)
@@ -556,6 +616,37 @@ export default function DashboardPage() {
                     </div>
                 </div>
 
+                {/* Project quick-jump pills (#4): scrollable, freshest project
+                    first; plus a collapse/expand-all control (#3). */}
+                {grouped && projectPills.length > 1 ? (
+                    <div className="vd-pjbar">
+                        <div className="vd-pjscroll">
+                            {projectPills.map((p) => (
+                                <button
+                                    key={p.key}
+                                    type="button"
+                                    className="vd-pjpill"
+                                    title={p.label}
+                                    onClick={() => jumpToProject(p.key)}
+                                >
+                                    <span className="vd-pjpill-name">
+                                        {p.label.length > 15 ? `${p.label.slice(0, 14)}…` : p.label}
+                                    </span>
+                                    <span className="vd-pjpill-n">{p.count}</span>
+                                </button>
+                            ))}
+                        </div>
+                        <button
+                            type="button"
+                            className="vd-collapse-all"
+                            onClick={allCollapsed ? expandAllGroups : collapseAllGroups}
+                            title={allCollapsed ? 'Expand all projects' : 'Collapse all projects'}
+                        >
+                            {allCollapsed ? '⊞' : '⊟'}
+                        </button>
+                    </div>
+                ) : null}
+
                 {error ? <div className="vd-empty">{error}</div> : null}
 
                 {showWaitingPill ? (
@@ -584,15 +675,26 @@ export default function DashboardPage() {
                 ) : null}
 
                 {grouped ? (
-                    projectGroups.map((group) => (
-                        <div key={group.key} className="vd-projgroup">
-                            <div className="vd-projsec">
-                                <span className="vd-projname">{group.label}</span>
-                                <span className="vd-projn">{group.rows.length}</span>
+                    projectGroups.map((group) => {
+                        // An active search force-expands every group so matches are
+                        // never hidden behind a collapsed header.
+                        const collapsed = collapsedProjects.has(group.key) && !search.trim()
+                        return (
+                            <div key={group.key} id={`vd-group-${group.key}`} className="vd-projgroup">
+                                <button
+                                    type="button"
+                                    className="vd-projsec"
+                                    onClick={() => toggleGroupCollapsed(group.key)}
+                                    aria-expanded={!collapsed}
+                                >
+                                    <span className="vd-projchev">{collapsed ? '▸' : '▾'}</span>
+                                    <span className="vd-projname">{group.label}</span>
+                                    <span className="vd-projn">{group.rows.length}</span>
+                                </button>
+                                {collapsed ? null : group.rows.map(renderRow)}
                             </div>
-                            {group.rows.map(renderRow)}
-                        </div>
-                    ))
+                        )
+                    })
                 ) : otherRows.length > 0 ? (
                     <>
                         {pinnedRows.length > 0 ? <div className="vd-sec">Everything else</div> : null}

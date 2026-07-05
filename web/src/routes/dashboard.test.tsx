@@ -99,6 +99,25 @@ describe('DashboardPage', () => {
             const projNames = Array.from(container.querySelectorAll('.vd-projname')).map((el) => el.textContent)
             expect(projNames).toEqual(expect.arrayContaining(['blog-redesign', 'api-svc']))
         })
+
+        it('offers a scrollable quick-jump pill per project, freshest first (#4)', () => {
+            setSessions([
+                makeSummary({ id: 'a', updatedAt: 100, metadata: { path: '/x/alpha' } }),
+                makeSummary({ id: 'b', updatedAt: 200, metadata: { path: '/x/bravo' } })
+            ])
+            const { container } = render(<DashboardPage />)
+            const pills = Array.from(container.querySelectorAll('.vd-pjpill-name')).map((el) => el.textContent)
+            // bravo updated more recently than alpha, so its pill comes first.
+            expect(pills).toEqual(['bravo', 'alpha'])
+        })
+
+        it('collapses a project group in place when its header is tapped (#3)', () => {
+            setSessions([makeSummary({ id: 'a', metadata: { path: '/x/alpha' } })])
+            const { container } = render(<DashboardPage />)
+            expect(container.querySelector('.vd-tile')).toBeTruthy()
+            fireEvent.click(container.querySelector('.vd-projsec') as HTMLElement)
+            expect(container.querySelector('.vd-tile')).toBeNull()
+        })
     })
 
     context('a blocking session must be impossible to miss — the off-screen waiting pill jumps you to it', () => {
