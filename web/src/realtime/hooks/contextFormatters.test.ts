@@ -120,6 +120,7 @@ describe('extractLastAssistantSpeakableDetailed', () => {
             expect(extractLastAssistantSpeakableDetailed(messages)).toEqual({
                 text: 'All green.',
                 seq: 2,
+                createdAt: 0,
                 voiceOriginated: true
             })
         })
@@ -132,6 +133,7 @@ describe('extractLastAssistantSpeakableDetailed', () => {
             expect(extractLastAssistantSpeakableDetailed(messages)).toEqual({
                 text: 'a very long answer…',
                 seq: 2,
+                createdAt: 0,
                 voiceOriginated: false
             })
         })
