@@ -24,6 +24,18 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export HOME="${HOME:-/home/tomas}"
 
+# Unattended runs have NO ssh-agent, and the default github.com identity in
+# ~/.ssh/config (~/.ssh/github) is passphrase-protected — so every git-over-SSH
+# op (fetch/push origin, k3s pull/push) died at the first `git fetch origin`
+# with "Permission denied (publickey)". Force git to use the passphraseless
+# automation key (an account-level GitHub key on this box) instead.
+# IdentitiesOnly=yes stops ssh from also offering the config's passphrase key.
+# (Fixed 2026-08-06 after the daily cron failed on this line.)
+# ControlMaster=no/ControlPath=none: the global ssh_config multiplexes github.com
+# connections (ControlPersist 600); without this, a run firing within 10 min of an
+# interactive session would silently reuse that session's socket and ignore -i.
+export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/hp-ubuntu-github-access -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none"
+
 REPO="$HOME/git/hapi-with-dashboard"
 K3S_REPO="$HOME/git/k3s"
 K3S_MANIFEST="$K3S_REPO/apps/hapi-hub/deployment.yaml"
