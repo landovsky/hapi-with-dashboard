@@ -4,8 +4,9 @@ project: hapi-with-dashboard
 jobs:
   weekly-upstream-deploy:
     description: Sync upstream/main, gate (typecheck+build+tests), build image, deploy via ttl.sh+Flux, ping DevOps Telegram
-    # Temporarily daily while awaiting an upstream bug fix; revert to weekly ("0 7 * * 1") once it lands.
-    schedule: "0 7 * * *"
+    # Weekly (Mondays 07:00). Was temporarily daily to chase an upstream fix;
+    # reverted 2026-08-06 after the 233-commit backlog was synced & deployed.
+    schedule: "0 7 * * 1"
     command: bash /home/tomas/git/hapi-with-dashboard/scripts/weekly-upstream-deploy.sh
     working_dir: /home/tomas/git/hapi-with-dashboard
     timeout: 1800
