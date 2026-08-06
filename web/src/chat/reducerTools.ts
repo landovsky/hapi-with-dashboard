@@ -65,6 +65,9 @@ export function ensureToolBlock(
         name: string
         input: unknown
         description: string | null
+        nativeTitle?: string | null
+        nativeKind?: string | null
+        progress?: unknown
         permission?: ToolPermission
         /** Claude entry execution-machine timestamp for the tool_use, if known (see `ChatToolCall.execStartedAt`). */
         agentTimestamp?: number | null
@@ -74,7 +77,10 @@ export function ensureToolBlock(
     if (existing) {
         const isPlaceholderToolName = (name: string): boolean => {
             const normalized = name.trim().toLowerCase()
-            return normalized === '' || normalized === 'tool' || normalized === 'unknown'
+            // 'generic' is agy's non-specific result wrapper (e.g. manage_subagents
+            // surfaces its result as GENERIC); don't let it overwrite the specific
+            // tool name the permission request already set when the two merge.
+            return normalized === '' || normalized === 'tool' || normalized === 'unknown' || normalized === 'generic'
         }
 
         // Preserve earliest createdAt for stable ordering.
@@ -98,6 +104,15 @@ export function ensureToolBlock(
         }
         if (seed.description !== null) {
             existing.tool = { ...existing.tool, description: seed.description }
+        }
+        if (seed.nativeTitle != null) {
+            existing.tool = { ...existing.tool, nativeTitle: seed.nativeTitle }
+        }
+        if (seed.nativeKind != null) {
+            existing.tool = { ...existing.tool, nativeKind: seed.nativeKind }
+        }
+        if (seed.progress !== undefined && existing.tool.state === 'running') {
+            existing.tool = { ...existing.tool, result: seed.progress }
         }
         // The first call (tool_use) records when the tool was invoked. The
         // second call (tool_result) carries the result message's invokedAt,
@@ -139,6 +154,9 @@ export function ensureToolBlock(
         execStartedAt: initialState === 'running' ? (seed.agentTimestamp ?? null) : null,
         execCompletedAt: null,
         description: seed.description,
+        nativeTitle: seed.nativeTitle ?? null,
+        nativeKind: seed.nativeKind ?? null,
+        ...(seed.progress !== undefined ? { result: seed.progress } : {}),
         permission: seed.permission
     }
 

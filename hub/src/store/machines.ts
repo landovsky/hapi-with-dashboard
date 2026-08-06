@@ -34,6 +34,41 @@ function toStoredMachine(row: DbMachineRow): StoredMachine {
     }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+// Rows created before the CLI reported full metadata (or by older versions)
+// would keep missing fields like `host` forever — get-or-create returns the
+// existing row untouched and every client hits it on startup. Merge incoming
+// machine-owned fields over the stored ones so registration doubles as a
+// refresh; hub-side fields the CLI never sends (e.g. displayName) survive.
+// Returns undefined when the merge would not change anything.
+export function mergeMachineMetadata(stored: unknown, incoming: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(incoming)) return undefined
+    const base = isPlainObject(stored) ? stored : {}
+    const merged = { ...base, ...incoming }
+    return JSON.stringify(merged) === JSON.stringify(base) ? undefined : merged
+}
+
+// Registration also carries the runner's self-declared capabilities (e.g.
+// `piExistingSessionResume`), but live fields of runner_state (status, pid,
+// startedAt, ...) are owned by the socket heartbeat and must not be clobbered
+// by an HTTP registration. For machines created before a capability existed,
+// the upgrade would otherwise never be observed: get-or-create returns the
+// existing row untouched and the socket heartbeat only replays what the hub
+// already persisted. Merge only the capability set, leaving everything else
+// socket-owned. Returns undefined when nothing changes.
+function mergeRunnerCapabilities(stored: unknown, incoming: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(incoming)) return undefined
+    const incomingCaps = incoming.capabilities
+    if (!isPlainObject(incomingCaps) || Object.keys(incomingCaps).length === 0) return undefined
+    const base = isPlainObject(stored) ? stored : {}
+    const currentCaps = isPlainObject(base.capabilities) ? base.capabilities : {}
+    const mergedCaps = { ...currentCaps, ...incomingCaps }
+    return JSON.stringify(mergedCaps) === JSON.stringify(currentCaps) ? undefined : { ...base, capabilities: mergedCaps }
+}
+
 export function getOrCreateMachine(
     db: Database,
     id: string,
@@ -47,7 +82,48 @@ export function getOrCreateMachine(
         if (stored.namespace !== namespace) {
             throw new Error('Machine namespace mismatch')
         }
-        return stored
+        const merged = mergeMachineMetadata(stored.metadata, metadata)
+        let current = stored
+        if (merged !== undefined) {
+            db.prepare(`
+                UPDATE machines
+                SET metadata = @metadata,
+                    metadata_version = metadata_version + 1,
+                    updated_at = @updated_at,
+                    seq = seq + 1
+                WHERE id = @id
+            `).run({
+                metadata: JSON.stringify(merged),
+                updated_at: Date.now(),
+                id
+            })
+            const row = getMachine(db, id)
+            if (!row) {
+                throw new Error('Failed to refresh machine metadata')
+            }
+            current = row
+        }
+        const mergedRunnerState = mergeRunnerCapabilities(current.runnerState, runnerState)
+        if (mergedRunnerState !== undefined) {
+            db.prepare(`
+                UPDATE machines
+                SET runner_state = @runner_state,
+                    runner_state_version = runner_state_version + 1,
+                    updated_at = @updated_at,
+                    seq = seq + 1
+                WHERE id = @id
+            `).run({
+                runner_state: JSON.stringify(mergedRunnerState),
+                updated_at: Date.now(),
+                id
+            })
+            const row = getMachine(db, id)
+            if (!row) {
+                throw new Error('Failed to refresh machine runner state')
+            }
+            current = row
+        }
+        return current
     }
 
     const now = Date.now()

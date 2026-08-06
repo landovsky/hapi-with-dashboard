@@ -21,6 +21,14 @@ const generatedImageSchema = z.object({
     imageId: z.string().min(1)
 })
 
+function normalizeFileSearchPath(path: string): string {
+    return path.replaceAll('\\', '/')
+}
+
+function isWindowsSessionPath(path: string): boolean {
+    return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
+}
+
 function parseBooleanParam(value: string | undefined): boolean | undefined {
     if (value === 'true') return true
     if (value === 'false') return false
@@ -227,22 +235,37 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         }
 
         const stdout = result.stdout ?? ''
-        const files = stdout
+        const normalizePath = isWindowsSessionPath(sessionPath)
+            ? normalizeFileSearchPath
+            : (path: string) => path
+        const paths = stdout
             .split('\n')
             .map((line) => line.trim())
             .filter((line) => line.length > 0)
+            .map(normalizePath)
             .slice(0, limit)
-            .map((fullPath) => {
-                const parts = fullPath.split('/')
-                const fileName = parts[parts.length - 1] || fullPath
-                const filePath = parts.slice(0, -1).join('/')
-                return {
-                    fileName,
-                    filePath,
-                    fullPath,
-                    fileType: 'file' as const
-                }
-            })
+
+        const metadataResult = await runRpc(() => engine.statFiles(sessionResult.sessionId, paths))
+        const metadataByPath = new Map(
+            metadataResult.success
+                ? (metadataResult.entries ?? []).map((entry) => [entry.path, entry] as const)
+                : []
+        )
+
+        const files = paths.map((fullPath) => {
+            const parts = fullPath.split('/')
+            const fileName = parts[parts.length - 1] || fullPath
+            const filePath = parts.slice(0, -1).join('/')
+            const metadata = metadataByPath.get(fullPath)
+            return {
+                fileName,
+                filePath,
+                fullPath,
+                fileType: 'file' as const,
+                size: metadata?.size,
+                modified: metadata?.modified
+            }
+        })
 
         return c.json({ success: true, files })
     })

@@ -18,15 +18,12 @@ type AcpPromptUsage = {
     totalTokens?: number;
     thoughtTokens?: number;
     cacheReadTokens?: number;
+    cacheCreationTokens?: number;
 };
 
 type AcpUsageUpdate = {
     contextTokens: number | undefined;
     contextWindow: number | undefined;
-};
-
-export type AcpSessionInfoUpdate = {
-    title?: string | null;
 };
 
 export type AcpModelDescriptor = {
@@ -38,6 +35,11 @@ export type AcpModelDescriptor = {
 export type AcpSessionModelsMetadata = {
     availableModels: AcpModelDescriptor[];
     currentModelId: string | null;
+};
+
+export type AcpSessionInfoUpdate = {
+    sessionId: string | null;
+    title: string | null;
 };
 
 export type AcpConfigOptionDescriptor = {
@@ -64,6 +66,7 @@ export class AcpSdkBackend implements AgentBackend {
     private readonly pendingPermissions = new Map<string, PendingPermission>();
     private readonly sessionModelsMetadata = new Map<string, AcpSessionModelsMetadata>();
     private readonly sessionConfigOptions = new Map<string, AcpConfigOptionDescriptor[]>();
+    private readonly sessionInfoRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly initialAvailableCommands = new Set<string>();
     private readonly sessionAvailableCommands = new Map<string, Set<string>>();
     private autoPermissionModeEnabled: boolean | null = null;
@@ -72,6 +75,7 @@ export class AcpSdkBackend implements AgentBackend {
     private initializeResult: AcpInitializeResult | null = null;
     private setModeSupported: boolean | undefined = undefined;
     private isProcessingMessage = false;
+    private promptRequestInFlight = false;
     private responseCompleteResolvers: Array<() => void> = [];
     private lastSessionUpdateAt = 0;
     private latestUsageUpdate: AcpUsageUpdate | null = null;
@@ -90,6 +94,7 @@ export class AcpSdkBackend implements AgentBackend {
     private static readonly UPDATE_DRAIN_TIMEOUT_MS = 2000;
     private static readonly PRE_PROMPT_UPDATE_QUIET_PERIOD_MS = 200;
     private static readonly PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS = 1200;
+    private static readonly SESSION_TITLE_REFRESH_DELAYS_MS = [1000, 3000];
     // After the initial post-prompt drain, slow-tailing models (DeepSeek,
     // GPT-5.5, etc.) can keep sending agentMessageChunk notifications. We poll
     // drainBuffers() on a short interval so the UI keeps streaming smoothly,
@@ -386,6 +391,23 @@ export class AcpSdkBackend implements AgentBackend {
     }
 
     /**
+     * Low-level extension RPC for agent-specific methods (e.g. Grok `_x.ai/*`).
+     * Keep method names and schemas in the agent adapter — not here.
+     */
+    async sendExtensionRequest<T = unknown>(
+        method: string,
+        params: Record<string, unknown>,
+        options?: { timeoutMs?: number }
+    ): Promise<T> {
+        if (!this.transport) {
+            throw new Error('ACP transport not initialized');
+        }
+        return await this.transport.sendRequest(method, params, {
+            timeoutMs: options?.timeoutMs
+        }) as T;
+    }
+
+    /**
      * Returns the per-session models metadata captured from session/new (or
      * session/load, or session/set_model). Returns undefined if the agent did
      * not include the optional `models` block in its response.
@@ -411,9 +433,60 @@ export class AcpSdkBackend implements AgentBackend {
         this.usageUpdateListener = listener;
     }
 
-    /** Forwards ACP `session_info_update` metadata independently of prompt turns. */
+    /** Forwards stable ACP session metadata updates independently of prompt streaming. */
     setSessionInfoUpdateListener(listener: ((update: AcpSessionInfoUpdate) => void) | null): void {
         this.sessionInfoUpdateListener = listener;
+    }
+
+    /** Reads the agent's persisted native title through stable ACP session/list. */
+    async refreshSessionInfo(sessionId: string, cwd: string): Promise<void> {
+        const existingTimer = this.sessionInfoRefreshTimers.get(sessionId);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+            this.sessionInfoRefreshTimers.delete(sessionId);
+        }
+        await this.refreshSessionInfoAttempt(sessionId, cwd, 0);
+    }
+
+    private async refreshSessionInfoAttempt(sessionId: string, cwd: string, retryIndex: number): Promise<void> {
+        if (!this.transport) {
+            return;
+        }
+        try {
+            const response = await this.transport.sendRequest('session/list', { cwd }, { timeoutMs: 5000 });
+            if (!isObject(response) || !Array.isArray(response.sessions)) {
+                return;
+            }
+            const match = response.sessions.find((entry) =>
+                isObject(entry) && asString(entry.sessionId) === sessionId
+            );
+            if (!isObject(match) || (typeof match.title !== 'string' && match.title !== null)) {
+                return;
+            }
+            this.sessionInfoUpdateListener?.({ sessionId, title: match.title });
+            if (match.title === null || !this.isPlaceholderSessionTitle(match.title)) {
+                return;
+            }
+            const delayMs = AcpSdkBackend.SESSION_TITLE_REFRESH_DELAYS_MS[retryIndex];
+            if (delayMs === undefined) {
+                return;
+            }
+            const timer = setTimeout(() => {
+                this.sessionInfoRefreshTimers.delete(sessionId);
+                void this.refreshSessionInfoAttempt(sessionId, cwd, retryIndex + 1);
+            }, delayMs);
+            timer.unref();
+            this.sessionInfoRefreshTimers.set(sessionId, timer);
+        } catch (error) {
+            logger.debug('[ACP] session/list title refresh unavailable', error);
+        }
+    }
+
+    private isPlaceholderSessionTitle(title: string): boolean {
+        const normalizedTitle = title.trim();
+        return normalizedTitle.length === 0
+            || normalizedTitle === 'Untitled'
+            || /^(?:New|Child) session - \d{4}-\d{2}-\d{2}T/.test(normalizedTitle);
     }
 
     async prompt(
@@ -449,10 +522,16 @@ export class AcpSdkBackend implements AgentBackend {
         try {
             // No timeout for prompt requests - they can run for extended periods
             // during complex tasks, tool-heavy operations, or slow model responses
-            const response = await this.transport.sendRequest('session/prompt', {
-                sessionId,
-                prompt: content
-            }, { timeoutMs: Infinity });
+            this.promptRequestInFlight = true;
+            let response: unknown;
+            try {
+                response = await this.transport.sendRequest('session/prompt', {
+                    sessionId,
+                    prompt: content
+                }, { timeoutMs: Infinity });
+            } finally {
+                this.promptRequestInFlight = false;
+            }
 
             stopReason = isObject(response) ? asString(response.stopReason) : null;
             promptUsage = this.extractPromptUsage(response);
@@ -477,6 +556,9 @@ export class AcpSdkBackend implements AgentBackend {
                         totalTokens: promptUsage.totalTokens,
                         thoughtTokens: promptUsage.thoughtTokens,
                         cacheReadTokens: promptUsage.cacheReadTokens,
+                        ...(promptUsage.cacheCreationTokens !== undefined
+                            ? { cacheCreationTokens: promptUsage.cacheCreationTokens }
+                            : {}),
                         contextTokens: latestUsageUpdate ? latestUsageUpdate.contextTokens : undefined,
                         contextWindow: latestUsageUpdate ? latestUsageUpdate.contextWindow : undefined
                     });
@@ -551,11 +633,77 @@ export class AcpSdkBackend implements AgentBackend {
     }
 
     /**
+     * Runs `fn` with `session/update` notifications temporarily prevented
+     * from reaching whatever `messageHandler` is currently installed (i.e.
+     * the last prompt() turn's handler), restoring it once `fn` settles.
+     *
+     * Needed for out-of-band calls that don't go through `prompt()` at all —
+     * e.g. OpenCode's /compact bridge, which triggers native compaction via
+     * a raw HTTP request to the agent subprocess instead of `session/prompt`.
+     * The agent keeps streaming `session/update` notifications (thought
+     * chunks etc.) over the same ACP transport while that HTTP call runs,
+     * and `handleSessionUpdate` forwards them unconditionally — with no
+     * prompt() turn in flight to own them, they'd otherwise land on the
+     * previous turn's now-stale `messageHandler` and render as a duplicate
+     * assistant message alongside whatever the caller explicitly displays
+     * from the HTTP response.
+     *
+     * `captureAvailableCommands` / `forwardSessionInfoUpdate` /
+     * `captureUsageUpdate` in `handleSessionUpdate` are untouched by this —
+     * only the `messageHandler.handleUpdate` forwarding is suppressed.
+     *
+     * Session-agnostic: this is a pure prompt()-adjacent utility with no
+     * Gemini/OpenCode-specific behavior, so it's safe on the shared
+     * AcpSdkBackend class — nothing calls it unless a caller opts in.
+     *
+     * The `this.messageHandler === null` guard on restore is defense in
+     * depth: normal serialization (compact and prompts run through the same
+     * single dequeue loop — see opencodeRemoteLauncher.ts) means `fn` should
+     * never overlap with a real prompt() turn, but if `disconnect()` or a
+     * new `prompt()` did run concurrently and changed `messageHandler`
+     * during `fn`, this avoids clobbering whatever it set.
+     *
+     * Restoring the handler waits for the same quiet-drain `prompt()` already
+     * uses before installing a *new* handler for the next turn (see its
+     * `PRE_PROMPT_UPDATE_QUIET_PERIOD_MS`/`_DRAIN_TIMEOUT_MS` call) — the
+     * same class of race, just on the way back in instead of the way out.
+     * Aborting `fn()` client-side (e.g. OpenCode's compact bridge aborting
+     * its HTTP call) does not necessarily stop the agent from continuing the
+     * operation server-side: `session/update` is a separate notification
+     * channel from that HTTP request's lifecycle (confirmed while building
+     * the /compact bridge — see runCompactOperation's doc comment). Without
+     * this wait, late notifications from a still-running server-side
+     * operation would immediately leak into whichever handler gets restored
+     * (or into a brand new one prompt() installs right after) the instant
+     * `fn()` returns. `messageHandler` stays null (suppression still in
+     * effect) for the whole drain, so nothing leaks during it either.
+     */
+    async suppressUpdatesDuring<T>(fn: () => Promise<T>): Promise<T> {
+        const previousHandler = this.messageHandler;
+        this.messageHandler = null;
+        try {
+            return await fn();
+        } finally {
+            await this.waitForSessionUpdateQuiet(
+                AcpSdkBackend.PRE_PROMPT_UPDATE_QUIET_PERIOD_MS,
+                AcpSdkBackend.PRE_PROMPT_UPDATE_DRAIN_TIMEOUT_MS
+            );
+            if (this.messageHandler === null) {
+                this.messageHandler = previousHandler;
+            }
+        }
+    }
+
+    /**
      * Returns true if currently processing a message (prompt in progress).
      * Useful for checking if it's safe to perform session operations.
      */
     get processingMessage(): boolean {
         return this.isProcessingMessage;
+    }
+
+    isPromptRequestInFlight(): boolean {
+        return this.promptRequestInFlight;
     }
 
     getLastSessionUpdateAt(): number {
@@ -579,6 +727,10 @@ export class AcpSdkBackend implements AgentBackend {
 
     async disconnect(): Promise<void> {
         if (!this.transport) return;
+        for (const timer of this.sessionInfoRefreshTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.sessionInfoRefreshTimers.clear();
         this.messageHandler?.drainBuffers();
         this.messageHandler = null;
         this.activeSessionId = null;
@@ -603,19 +755,19 @@ export class AcpSdkBackend implements AgentBackend {
         if (sessionId) {
             this.captureAvailableCommands(sessionId, update);
         }
-        this.captureSessionInfoUpdate(update);
+        this.forwardSessionInfoUpdate(sessionId, update);
         this.captureUsageUpdate(update);
         this.messageHandler?.handleUpdate(update);
     }
 
-    private captureSessionInfoUpdate(update: unknown): void {
-        if (!isObject(update)) return;
-        if (asString(update.sessionUpdate) !== ACP_SESSION_UPDATE_TYPES.sessionInfoUpdate) return;
-        if (!Object.prototype.hasOwnProperty.call(update, 'title')) return;
-
-        const title = update.title;
-        if (typeof title !== 'string' && title !== null) return;
-        this.sessionInfoUpdateListener?.({ title });
+    private forwardSessionInfoUpdate(sessionId: string | null, update: unknown): void {
+        if (!isObject(update) || update.sessionUpdate !== ACP_SESSION_UPDATE_TYPES.sessionInfoUpdate) {
+            return;
+        }
+        if (typeof update.title !== 'string' && update.title !== null) {
+            return;
+        }
+        this.sessionInfoUpdateListener?.({ sessionId, title: update.title });
     }
 
     private captureUsageUpdate(update: unknown): void {
@@ -851,6 +1003,12 @@ export class AcpSdkBackend implements AgentBackend {
                 ?? usage.cached_read_tokens
                 ?? usage.cachedInputTokens
                 ?? usage.cached_input_tokens
+            ) ?? undefined,
+            cacheCreationTokens: this.asFiniteNumber(
+                usage.cachedWriteTokens
+                ?? usage.cached_write_tokens
+                ?? usage.cacheCreationInputTokens
+                ?? usage.cache_creation_input_tokens
             ) ?? undefined
         };
     }

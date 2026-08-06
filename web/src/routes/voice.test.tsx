@@ -56,7 +56,10 @@ const sessions: SessionSummary[] = [{
     futureScheduledMessageCount: 0,
     nextScheduledAt: null,
     model: null,
-    effort: null
+    effort: null,
+    metadataVersion: 0,
+    agentStateVersion: 0,
+    todosUpdatedAt: 0
 }]
 
 vi.mock('@tanstack/react-router', () => ({

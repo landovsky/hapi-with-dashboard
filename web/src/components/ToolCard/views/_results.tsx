@@ -10,6 +10,7 @@ import {
     getCodexAgentActivity,
     getCodexAgentTargets,
     parseCodexCloseAgentResult,
+    parseCodexListAgentsResult,
     parseCodexSpawnAgentResult,
     parseCodexWaitAgentResult
 } from '@/components/ToolCard/codexAgents'
@@ -241,9 +242,13 @@ function inferCodeLanguage(path: string | null, text: string): string | null {
 }
 
 function resultCodeBlockProps(surface: ToolViewProps['surface'], collapseLongContent?: boolean) {
+    // The inline surface renders inside ToolCard's role="button" preview,
+    // so the wrap toggle's <button> would nest inside an interactive
+    // ancestor (invalid HTML / hydration violation). Suppress it here; the
+    // dialog surface (button-free) keeps the toggle.
     return surface === 'dialog'
         ? { collapseLongContent: false, size: 'comfortable' as const, scrollY: true }
-        : { collapseLongContent }
+        : { collapseLongContent, showWrapToggle: false }
 }
 
 function renderResultBody(
@@ -395,12 +400,49 @@ function extractReadPathFromInput(input: unknown): string | null {
     return null
 }
 
-function renderReadTextResult(text: string, path: string | null, surface: ToolViewProps['surface']) {
-    const language = inferCodeLanguage(path, text)
-    if (language) {
-        return <CodeBlock code={text} language={language} title="File content" {...resultCodeBlockProps(surface, surface === 'inline')} />
+/**
+ * Some agents (agy) prefix every read line with its true file line number
+ * ("50: <line>", "51: <line>", …). Detect that format when the prefixes are
+ * strictly consecutive, strip them, and return the starting line so the code
+ * block's gutter can be offset to the real numbers instead of restarting at 1
+ * (which misleads a partial read into looking like it started at line 1).
+ * Returns null when the text isn't a consecutively-numbered block.
+ */
+export function parseNumberedFileLines(text: string): { startLine: number; body: string } | null {
+    const lines = text.split('\n')
+    if (lines.length < 2) return null
+    let startLine: number | null = null
+    let expected = 0
+    const body: string[] = []
+    for (const line of lines) {
+        const match = line.match(/^(\d+): ?(.*)$/)
+        if (!match) return null
+        const n = Number(match[1])
+        if (startLine === null) { startLine = n; expected = n }
+        if (n !== expected) return null
+        expected++
+        body.push(match[2])
     }
-    return renderPlainTextQuote(text, surface)
+    return startLine === null ? null : { startLine, body: body.join('\n') }
+}
+
+function renderReadTextResult(text: string, path: string | null, surface: ToolViewProps['surface'], parseNumberedLines: boolean) {
+    // A file read is line-oriented content: render it in a code block (monospace
+    // + line-number gutter) even when the extension is unknown (.txt, .log, agy
+    // step output …), so it reads as clean numbered lines instead of a
+    // soft-wrapped prose quote.
+    const numbered = parseNumberedLines ? parseNumberedFileLines(text) : null
+    const body = numbered ? numbered.body : text
+    const language = inferCodeLanguage(path, body) ?? 'text'
+    return (
+        <CodeBlock
+            code={body}
+            language={language}
+            title="File content"
+            startLineNumber={numbered?.startLine}
+            {...resultCodeBlockProps(surface, surface === 'inline')}
+        />
+    )
 }
 
 function ResultMetaPill(props: { children: ReactNode }) {
@@ -615,7 +657,7 @@ const ReadResultView: ToolViewComponent = (props: ToolViewProps) => {
                         {basename(path)}
                     </div>
                 ) : null}
-                {renderReadTextResult(file.content, path, props.surface)}
+                {renderReadTextResult(file.content, path, props.surface, props.block.tool.nativeKind === 'agy-numbered-read')}
                 <RawJsonDevOnly value={result} surface={props.surface} />
             </>
         )
@@ -627,7 +669,7 @@ const ReadResultView: ToolViewComponent = (props: ToolViewProps) => {
         const displayPath = path ? resolveDisplayPath(path, props.metadata) : null
         return (
             <>
-                {renderReadTextResult(text, displayPath, props.surface)}
+                {renderReadTextResult(text, displayPath, props.surface, props.block.tool.nativeKind === 'agy-numbered-read')}
                 <RawJsonDevOnly value={result} surface={props.surface} />
             </>
         )
@@ -791,6 +833,7 @@ const CodexAgentResultView: ToolViewComponent = (props: ToolViewProps) => {
                 <div className="flex flex-wrap gap-2">
                     <ResultStatusPill text="Agent launched" />
                     {parsed.nickname ? <AgentIdPill label="Name" value={parsed.nickname} /> : null}
+                    {parsed.taskName ? <AgentIdPill label="Task" value={parsed.taskName} /> : null}
                     {parsed.agentId ? <AgentIdPill label="ID" value={parsed.agentId} /> : null}
                     {showDetails ? <RawJsonDevOnly value={result} surface={props.surface} /> : null}
                 </div>
@@ -802,7 +845,7 @@ const CodexAgentResultView: ToolViewComponent = (props: ToolViewProps) => {
         const parsed = parseCodexWaitAgentResult(result)
         if (parsed) {
             if (parsed.statuses.length === 0) {
-                return <ResultStatusPill text={parsed.timedOut ? 'Timed out' : 'No status'} />
+                return <ResultStatusPill text={parsed.timedOut ? 'Timed out' : parsed.message ?? 'No status'} />
             }
 
             return (
@@ -840,20 +883,53 @@ const CodexAgentResultView: ToolViewComponent = (props: ToolViewProps) => {
         }
     }
 
-    if (name === 'close_agent') {
+    if (name === 'close_agent' || name === 'interrupt_agent') {
         const parsed = parseCodexCloseAgentResult(result)
         if (parsed) {
             const targets = getCodexAgentTargets(input)
             return (
                 <div className="flex flex-col gap-2">
                     <div className="flex flex-wrap gap-2">
-                        <ResultStatusPill text="Agent closed" />
+                        <ResultStatusPill text={name === 'interrupt_agent' ? 'Agent interrupted' : 'Agent closed'} />
                         {targets[0] ? <AgentIdPill label="ID" value={targets[0]} /> : null}
                         <ResultStatusPill text={parsed.state} />
                     </div>
                     {showDetails && parsed.text ? (
                         <div className="text-sm text-[var(--app-fg)]">
                             {renderText(parsed.text, { mode: 'auto', collapseLongContent: props.surface === 'inline', surface: props.surface })}
+                        </div>
+                    ) : null}
+                    {showDetails ? <RawJsonDevOnly value={result} surface={props.surface} /> : null}
+                </div>
+            )
+        }
+    }
+
+    if (name === 'list_agents') {
+        const agents = parseCodexListAgentsResult(result)
+        if (agents) {
+            return (
+                <div className="flex flex-col gap-3">
+                    <div className="flex flex-wrap gap-2">
+                        <ResultStatusPill text={`${agents.length} live agent${agents.length === 1 ? '' : 's'}`} />
+                        {Object.entries(agents.reduce<Record<string, number>>((counts, agent) => {
+                            counts[agent.state] = (counts[agent.state] ?? 0) + 1
+                            return counts
+                        }, {})).map(([status, count]) => (
+                            <ResultStatusPill key={status} text={`${count} ${status}`} />
+                        ))}
+                    </div>
+                    {showDetails ? (
+                        <div className="flex flex-col gap-2">
+                            {agents.map((agent) => (
+                                <div key={agent.agentId} className="border-b border-[var(--app-border)] py-2 last:border-b-0">
+                                    <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--app-hint)]">
+                                        <ResultStatusPill text={agent.state} />
+                                        <span className="font-mono break-all">{agent.agentId}</span>
+                                    </div>
+                                    {agent.text ? <div className="mt-1 text-sm text-[var(--app-fg)]">{agent.text}</div> : null}
+                                </div>
+                            ))}
                         </div>
                     ) : null}
                     {showDetails ? <RawJsonDevOnly value={result} surface={props.surface} /> : null}
@@ -929,7 +1005,8 @@ const GenericResultView: ToolViewComponent = (props: ToolViewProps) => {
                         ? renderReadTextResult(
                             parsed.output.trim(),
                             extractReadPathFromInput(props.block.tool.input),
-                            props.surface
+                            props.surface,
+                            props.block.tool.nativeKind === 'agy-numbered-read'
                         )
                         : renderText(parsed.output.trim(), { mode: 'code', language: 'text', collapseLongContent: props.surface === 'inline', surface: props.surface })}
                     <RawJsonDevOnly value={result} surface={props.surface} />
@@ -943,7 +1020,7 @@ const GenericResultView: ToolViewComponent = (props: ToolViewProps) => {
         return (
             <>
                 {isReadFileToolCall(props.block.tool.name, props.block.tool.input)
-                    ? renderReadTextResult(text, extractReadPathFromInput(props.block.tool.input), props.surface)
+                    ? renderReadTextResult(text, extractReadPathFromInput(props.block.tool.input), props.surface, props.block.tool.nativeKind === 'agy-numbered-read')
                     : renderText(text, { mode: 'auto', collapseLongContent: props.surface === 'inline', surface: props.surface })}
                 {typeof result === 'object' ? <RawJsonDevOnly value={result} surface={props.surface} /> : null}
             </>
@@ -980,9 +1057,13 @@ export const toolResultViewRegistry: Record<string, ToolViewComponent> = {
     Skill: SkillResultView,
     spawn_agent: CodexAgentResultView,
     send_input: CodexAgentResultView,
+    send_message: CodexAgentResultView,
     resume_agent: CodexAgentResultView,
+    followup_task: CodexAgentResultView,
     wait_agent: CodexAgentResultView,
     close_agent: CodexAgentResultView,
+    interrupt_agent: CodexAgentResultView,
+    list_agents: CodexAgentResultView,
     AskUserQuestion: AskUserQuestionResultView,
     ExitPlanMode: MarkdownResultView,
     ask_user_question: AskUserQuestionResultView,

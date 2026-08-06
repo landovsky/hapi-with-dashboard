@@ -1,6 +1,8 @@
 import { useTranslation } from '@/lib/use-translation'
 import { getComposerEnterBehaviorOptions, useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
 import { getTerminalToolDisplayModeOptions, useTerminalToolDisplayMode } from '@/hooks/useTerminalToolDisplayMode'
+import { useCodexExplorationCollapse } from '@/hooks/useCodexExplorationCollapse'
+import { useReasoningCollapse } from '@/hooks/useReasoningCollapse'
 import {
     getChatSurfaceColorPickerValue,
     getChatSurfaceColorPresetOptions,
@@ -10,7 +12,8 @@ import {
     type ChatSurfaceColorPreference,
     type ChatSurfaceColorPreset,
 } from '@/hooks/useChatSurfaceColors'
-import { SettingsChoiceGroup, SettingsPageContent, SettingsSection } from '@/components/settings/SettingsPrimitives'
+import { SettingsChoiceGroup, SettingsFieldLabel, SettingsPageContent, SettingsSection, SettingsSwitch } from '@/components/settings/SettingsPrimitives'
+import { ComposerToolbarLayoutControl } from '@/components/settings/ComposerToolbarLayoutControl'
 
 function ChatSurfaceColorControl(props: {
     label: string
@@ -21,8 +24,8 @@ function ChatSurfaceColorControl(props: {
     const { t } = useTranslation()
     const pickerValue = getChatSurfaceColorPickerValue(props.preference)
     return (
-        <fieldset className="px-3 py-3">
-            <legend className="mb-2 text-[var(--app-fg)]">{props.label}</legend>
+        <div className="px-3 py-3">
+            <SettingsFieldLabel>{props.label}</SettingsFieldLabel>
             <div role="radiogroup" aria-label={props.label} className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 {getChatSurfaceColorPresetOptions().map((option) => {
                     const preference = toPresetChatSurfaceColorPreference(option.value)
@@ -39,7 +42,7 @@ function ChatSurfaceColorControl(props: {
                 {t('settings.chat.surfaceColor.custom')}
                 <input type="color" value={pickerValue} onChange={(event) => props.onCustomChange(event.target.value)} className="h-9 w-12 cursor-pointer border-0 bg-transparent p-0" />
             </label>
-        </fieldset>
+        </div>
     )
 }
 
@@ -47,9 +50,11 @@ export default function SettingsChatPage() {
     const { t } = useTranslation()
     const { composerEnterBehavior, setComposerEnterBehavior } = useComposerEnterBehavior()
     const { terminalToolDisplayMode, setTerminalToolDisplayMode } = useTerminalToolDisplayMode()
+    const { codexExplorationCollapsed, setCodexExplorationCollapsed } = useCodexExplorationCollapse()
+    const { reasoningCollapsed, setReasoningCollapsed } = useReasoningCollapse()
     const { toolGroupBackground, userMessageBackground, setToolGroupBackground, setUserMessageBackground } = useChatSurfaceColors()
     return (
-        <SettingsPageContent title={t('settings.chat.title')} description={t('settings.chat.description')}>
+        <SettingsPageContent description={t('settings.chat.description')}>
             <SettingsSection title={t('settings.chat.input')}>
                 <SettingsChoiceGroup
                     label={t('settings.chat.enterBehavior')}
@@ -57,6 +62,7 @@ export default function SettingsChatPage() {
                     options={getComposerEnterBehaviorOptions().map((option) => ({ value: option.value, label: t(option.labelKey) }))}
                     onChange={setComposerEnterBehavior}
                 />
+                <ComposerToolbarLayoutControl />
             </SettingsSection>
             <SettingsSection title={t('settings.chat.tools')}>
                 <SettingsChoiceGroup
@@ -64,6 +70,18 @@ export default function SettingsChatPage() {
                     value={terminalToolDisplayMode}
                     options={getTerminalToolDisplayModeOptions().map((option) => ({ value: option.value, label: t(option.labelKey) }))}
                     onChange={setTerminalToolDisplayMode}
+                />
+                <SettingsSwitch
+                    label={t('settings.chat.codexExplorationCollapsed')}
+                    description={t('settings.chat.codexExplorationCollapsed.desc')}
+                    checked={codexExplorationCollapsed}
+                    onChange={setCodexExplorationCollapsed}
+                />
+                <SettingsSwitch
+                    label={t('settings.chat.reasoningCollapsed')}
+                    description={t('settings.chat.reasoningCollapsed.desc')}
+                    checked={reasoningCollapsed}
+                    onChange={setReasoningCollapsed}
                 />
             </SettingsSection>
             <SettingsSection title={t('settings.chat.colors')}>

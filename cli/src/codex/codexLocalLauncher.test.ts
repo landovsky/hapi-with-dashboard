@@ -80,6 +80,9 @@ function createSessionStub(
     let localLaunchFailure: { message: string; exitReason: 'switch' | 'exit' } | null = null;
     let sessionId: string | null = null;
     let transcriptPath: string | null = initialTranscriptPath;
+    let transcriptHistoryReplayPending = replayTranscriptHistoryOnStart;
+    let modelReasoningEffort: string | null = null;
+    const modelReasoningEffortUpdates: Array<string | null> = [];
     const transcriptPathCallbacks: Array<(path: string) => void> = [];
 
     return {
@@ -94,7 +97,10 @@ function createSessionStub(
             startedBy: 'terminal' as const,
             startingMode: 'local' as const,
             codexArgs,
-            replayTranscriptHistoryOnStart,
+            shouldReplayTranscriptHistory: () => transcriptHistoryReplayPending,
+            markTranscriptHistoryReplayConsumed: () => {
+                transcriptHistoryReplayPending = false;
+            },
             client: {
                 isPending: () => pendingClient,
                 rpcHandlerManager: {
@@ -102,7 +108,11 @@ function createSessionStub(
                 }
             },
             getPermissionMode: () => permissionMode,
-            getModelReasoningEffort: () => null,
+            getModelReasoningEffort: () => modelReasoningEffort,
+            setModelReasoningEffort: (effort: string | null) => {
+                modelReasoningEffort = effort;
+                modelReasoningEffortUpdates.push(effort);
+            },
             onSessionFound: (value: string) => {
                 sessionId = value;
             },
@@ -145,7 +155,9 @@ function createSessionStub(
         userMessages,
         agentMessages,
         getUserActivityCount: () => userActivityCount,
-        getLocalLaunchFailure: () => localLaunchFailure
+        getLocalLaunchFailure: () => localLaunchFailure,
+        getModelReasoningEffort: () => modelReasoningEffort,
+        getModelReasoningEffortUpdates: () => modelReasoningEffortUpdates
     };
 }
 
@@ -361,7 +373,168 @@ describe('codexLocalLauncher', () => {
         });
     });
 
-    it('falls back to fresh transcript activity when SessionStart does not arrive', async () => {
+    it('tracks local turn context and stamps its model on usage', async () => {
+        const transcriptPath = await writeTranscriptMeta('codex-turn-context.jsonl', 'codex-thread-effort');
+        const { session, agentMessages, getModelReasoningEffort, getModelReasoningEffortUpdates } = createSessionStub('default');
+        let releaseRunBarrier: (() => void) | undefined;
+        harness.runBarrier = new Promise((resolve) => {
+            releaseRunBarrier = resolve;
+        });
+
+        const launcherPromise = codexLocalLauncher(session as never);
+        await wait(50);
+        harness.sessionHookHandlers[0]?.('codex-thread-effort', {
+            transcript_path: transcriptPath
+        });
+        await wait(100);
+
+        await appendFile(transcriptPath, [
+            JSON.stringify({
+                type: 'turn_context',
+                payload: { effort: 'max' }
+            }),
+            JSON.stringify({
+                type: 'turn_context',
+                payload: { model: 'gpt-5.4' }
+            }),
+            JSON.stringify({
+                type: 'event_msg',
+                payload: { type: 'token_count', info: {} }
+            })
+        ].join('\n') + '\n');
+        await wait(700);
+
+        releaseRunBarrier?.();
+        await launcherPromise;
+
+        expect(getModelReasoningEffortUpdates()).toEqual(['max', null]);
+        expect(getModelReasoningEffort()).toBeNull();
+        expect(agentMessages).toContainEqual(expect.objectContaining({
+            type: 'token_count',
+            model: 'gpt-5.4'
+        }));
+    });
+
+    it('renders nested Code Mode plans and commands without their covered exec wrapper', async () => {
+        const transcriptPath = join(tempDir, 'codex-hook-transcript.jsonl');
+        const { session, agentMessages } = createSessionStub('default');
+        let releaseRunBarrier: (() => void) | undefined;
+        harness.runBarrier = new Promise((resolve) => {
+            releaseRunBarrier = resolve;
+        });
+
+        await writeFile(
+            transcriptPath,
+            JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-hook' } }) + '\n'
+        );
+
+        const launcherPromise = codexLocalLauncher(session as never);
+        await wait(50);
+        harness.sessionHookHandlers[0]?.('codex-thread-hook', {
+            hook_event_name: 'SessionStart',
+            transcript_path: transcriptPath
+        });
+        await wait(100);
+
+        await appendFile(transcriptPath, JSON.stringify({
+            type: 'response_item',
+            payload: {
+                type: 'custom_tool_call',
+                name: 'exec',
+                call_id: 'call-wrapper',
+                input: [
+                    'await tools.update_plan({ plan: [{ step: "Inspect", status: "completed" }] });',
+                    'const r = await tools.exec_command({ cmd: "pwd" });',
+                    'text(r.output);'
+                ].join('\n'),
+                internal_chat_message_metadata_passthrough: { turn_id: 'turn-hook' }
+            }
+        }) + '\n');
+        await wait(700);
+
+        harness.sessionHookHandlers[0]?.('codex-thread-hook', {
+            hook_event_name: 'PreToolUse',
+            turn_id: 'turn-hook',
+            cwd: '/tmp/worktree',
+            tool_name: 'update_plan',
+            tool_input: { plan: [{ step: 'Inspect', status: 'completed' }] },
+            tool_use_id: 'exec-plan-1'
+        });
+        harness.sessionHookHandlers[0]?.('codex-thread-hook', {
+            hook_event_name: 'PostToolUse',
+            turn_id: 'turn-hook',
+            cwd: '/tmp/worktree',
+            tool_name: 'update_plan',
+            tool_input: { plan: [{ step: 'Inspect', status: 'completed' }] },
+            tool_response: 'Plan updated',
+            tool_use_id: 'exec-plan-1'
+        });
+        harness.sessionHookHandlers[0]?.('codex-thread-hook', {
+            hook_event_name: 'PreToolUse',
+            turn_id: 'turn-hook',
+            cwd: '/tmp/worktree',
+            tool_name: 'Bash',
+            tool_input: { command: 'pwd' },
+            tool_use_id: 'exec-command-1'
+        });
+        harness.sessionHookHandlers[0]?.('codex-thread-hook', {
+            hook_event_name: 'PostToolUse',
+            turn_id: 'turn-hook',
+            cwd: '/tmp/worktree',
+            tool_name: 'Bash',
+            tool_input: { command: 'pwd' },
+            tool_response: '/tmp/worktree\n',
+            tool_use_id: 'exec-command-1'
+        });
+
+        await appendFile(transcriptPath, JSON.stringify({
+            type: 'response_item',
+            payload: {
+                type: 'custom_tool_call_output',
+                call_id: 'call-wrapper',
+                output: [{ type: 'input_text', text: '/tmp/worktree\n' }],
+                internal_chat_message_metadata_passthrough: { turn_id: 'turn-hook' }
+            }
+        }) + '\n');
+        await wait(700);
+
+        releaseRunBarrier?.();
+        await launcherPromise;
+
+        expect(agentMessages).toEqual([{
+            type: 'tool-call',
+            name: 'update_plan',
+            callId: 'exec-plan-1',
+            input: { plan: [{ step: 'Inspect', status: 'completed' }] },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'exec-plan-1',
+            output: 'Plan updated',
+            id: expect.any(String)
+        }, {
+            type: 'tool-call',
+            name: 'CodexBash',
+            callId: 'exec-command-1',
+            input: {
+                command: 'pwd',
+                cwd: '/tmp/worktree',
+                source: 'codex-hook'
+            },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'exec-command-1',
+            output: {
+                stdout: '/tmp/worktree\n',
+                stderr: '',
+                status: 'completed'
+            },
+            id: expect.any(String)
+        }]);
+    });
+
+    it('falls back to the top-level review transcript when a review subagent is active', async () => {
         const originalCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = tempDir;
         const now = new Date();
@@ -373,8 +546,9 @@ describe('codexLocalLauncher', () => {
             String(now.getUTCDate()).padStart(2, '0')
         );
         await mkdir(sessionDirectory, { recursive: true });
-        const transcriptPath = join(sessionDirectory, 'rollout-fallback-thread.jsonl');
-        const { session, userMessages } = createSessionStub(
+        const transcriptPath = join(sessionDirectory, 'rollout-review-primary.jsonl');
+        const reviewSubagentPath = join(sessionDirectory, 'rollout-review-subagent.jsonl');
+        const { session, userMessages, agentMessages } = createSessionStub(
             'default',
             ['--cd', '/tmp/effective-codex-cwd'],
             '/tmp/worktree',
@@ -392,27 +566,66 @@ describe('codexLocalLauncher', () => {
             await vi.waitFor(() => expect(harness.launches).toHaveLength(1));
             expect(session.sessionId).toBeNull();
 
-            await writeFile(transcriptPath, [
-                JSON.stringify({
-                    type: 'session_meta',
-                    payload: { id: 'fallback-thread', cwd: '/tmp/effective-codex-cwd' }
-                }),
-                JSON.stringify({
-                    timestamp: new Date().toISOString(),
-                    type: 'event_msg',
-                    payload: { type: 'user_message', message: 'fallback prompt' }
-                })
-            ].join('\n') + '\n');
+            await Promise.all([
+                writeFile(transcriptPath, [
+                    JSON.stringify({
+                        type: 'session_meta',
+                        payload: {
+                            id: 'review-primary',
+                            cwd: '/tmp/effective-codex-cwd',
+                            source: 'cli'
+                        }
+                    }),
+                    JSON.stringify({
+                        timestamp: new Date().toISOString(),
+                        type: 'event_msg',
+                        payload: { type: 'user_message', message: '/review' }
+                    }),
+                    JSON.stringify({
+                        timestamp: new Date().toISOString(),
+                        type: 'event_msg',
+                        payload: { type: 'agent_message', message: 'final review result' }
+                    })
+                ].join('\n') + '\n'),
+                writeFile(reviewSubagentPath, [
+                    JSON.stringify({
+                        type: 'session_meta',
+                        payload: {
+                            id: 'review-subagent',
+                            cwd: '/tmp/effective-codex-cwd',
+                            source: { subagent: 'review' }
+                        }
+                    }),
+                    JSON.stringify({
+                        timestamp: new Date().toISOString(),
+                        type: 'event_msg',
+                        payload: { type: 'user_message', message: 'review instructions' }
+                    }),
+                    JSON.stringify({
+                        timestamp: new Date().toISOString(),
+                        type: 'event_msg',
+                        payload: { type: 'agent_message', message: 'internal review work' }
+                    })
+                ].join('\n') + '\n')
+            ]);
 
             await vi.waitFor(
-                () => expect(session.sessionId).toBe('fallback-thread'),
+                () => expect(session.sessionId).toBe('review-primary'),
                 { timeout: 3_000, interval: 50 }
             );
             if (releaseRunBarrier) releaseRunBarrier();
             await launcherPromise;
 
             expect(session.transcriptPath).toBe(transcriptPath);
-            expect(userMessages).toContain('fallback prompt');
+            expect(userMessages).toContain('/review');
+            expect(agentMessages).toContainEqual(expect.objectContaining({
+                type: 'message',
+                message: 'final review result'
+            }));
+            expect(agentMessages).not.toContainEqual(expect.objectContaining({
+                type: 'message',
+                message: 'internal review work'
+            }));
         } finally {
             if (releaseRunBarrier) releaseRunBarrier();
             if (originalCodexHome === undefined) {
@@ -423,9 +636,9 @@ describe('codexLocalLauncher', () => {
         }
     });
 
-    it('replays existing transcript messages when importing a Codex thread into a new Hapi session', async () => {
+    it('replays imported transcript history only on the first local attachment', async () => {
         const transcriptPath = join(tempDir, 'codex-import-transcript.jsonl');
-        const { session, agentMessages } = createSessionStub('default', undefined, '/tmp/worktree', null, true);
+        const { session, userMessages, agentMessages } = createSessionStub('default', undefined, '/tmp/worktree', null, true);
         let releaseRunBarrier: (() => void) | undefined;
         harness.runBarrier = new Promise((resolve) => {
             releaseRunBarrier = resolve;
@@ -435,7 +648,15 @@ describe('codexLocalLauncher', () => {
             transcriptPath,
             [
                 JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-import' } }),
-                JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'old imported message' } })
+                JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'old imported prompt' } }),
+                JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'old imported message' } }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: {
+                        type: 'token_count',
+                        info: { total_token_usage: { input_tokens: 100, output_tokens: 10 } }
+                    }
+                })
             ].join('\n') + '\n'
         );
 
@@ -447,19 +668,83 @@ describe('codexLocalLauncher', () => {
         });
         await wait(300);
 
+        await appendFile(
+            transcriptPath,
+            JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'tail before switch' } }) + '\n'
+        );
+
         if (releaseRunBarrier) {
             releaseRunBarrier();
         }
         await launcherPromise;
 
+        expect(userMessages).toEqual(['old imported prompt', 'tail before switch']);
+        expect(agentMessages.filter((message) => (
+            message as { message?: string }
+        ).message === 'old imported message')).toHaveLength(1);
+
+        let releaseSecondRunBarrier: (() => void) | undefined;
+        harness.runBarrier = new Promise((resolve) => {
+            releaseSecondRunBarrier = resolve;
+        });
+
+        const secondLauncherPromise = codexLocalLauncher(session as never);
+        await wait(50);
+
+        harness.sessionHookHandlers[1]?.('codex-thread-import', {
+            transcript_path: transcriptPath
+        });
+        await wait(300);
+
+        expect(userMessages).toEqual(['old imported prompt', 'tail before switch']);
+        expect(agentMessages.filter((message) => (
+            message as { message?: string }
+        ).message === 'old imported message')).toHaveLength(1);
+
+        await appendFile(
+            transcriptPath,
+            [
+                JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'new local prompt' } }),
+                JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'new local response' } }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: {
+                        type: 'token_count',
+                        info: { total_token_usage: { input_tokens: 120, output_tokens: 12 } }
+                    }
+                })
+            ].join('\n') + '\n'
+        );
+        await wait(700);
+
+        if (releaseSecondRunBarrier) {
+            releaseSecondRunBarrier();
+        }
+        await secondLauncherPromise;
+
+        expect(userMessages).toEqual(['old imported prompt', 'tail before switch', 'new local prompt']);
+        expect(agentMessages.filter((message) => (
+            message as { message?: string }
+        ).message === 'old imported message')).toHaveLength(1);
         expect(agentMessages).toContainEqual({
             type: 'message',
-            message: 'old imported message',
+            message: 'new local response',
             id: expect.any(String)
+        });
+        const tokenMessages = agentMessages.filter((message) => (
+            message as { type?: string }
+        ).type === 'token_count') as Array<Record<string, unknown>>;
+        expect(tokenMessages).toHaveLength(2);
+        expect(tokenMessages[0]).toMatchObject({ hapiUsageScope: 'imported-history' });
+        expect(tokenMessages[0]).not.toHaveProperty('thread_id');
+        expect(tokenMessages[1]).toMatchObject({
+            threadId: 'codex-thread-import',
+            thread_id: 'codex-thread-import',
+            hapiUsageScope: 'managed'
         });
     });
 
-    it('replays semantic chat events once and keeps a same-turn preface before its plan', async () => {
+    it('replays semantic chat and tool events once and keeps a same-turn preface before its plan', async () => {
         const transcriptPath = join(tempDir, 'codex-import-response-item-transcript.jsonl');
         const { session, userMessages, agentMessages, getUserActivityCount } = createSessionStub('default', undefined, '/tmp/worktree', null, true);
         let releaseRunBarrier: (() => void) | undefined;
@@ -482,6 +767,111 @@ describe('codexLocalLauncher', () => {
                 JSON.stringify({
                     type: 'event_msg',
                     payload: { type: 'user_message', message: 'visible user message' }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'function_call',
+                        name: 'LegacyTool',
+                        call_id: 'call-function',
+                        arguments: '{"path":"README.md"}'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'function_call_output',
+                        call_id: 'call-function',
+                        output: { ok: true }
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'custom_tool_call',
+                        call_id: 'call-exec',
+                        name: 'exec',
+                        input: 'pwd'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: {
+                        type: 'exec_command_end',
+                        call_id: 'call-exec',
+                        output: '/tmp/worktree'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'custom_tool_call_output',
+                        call_id: 'call-exec',
+                        output: [{ type: 'input_text', text: '/tmp/worktree' }]
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'custom_tool_call',
+                        call_id: 'call-patch',
+                        name: 'apply_patch',
+                        input: '*** Begin Patch\n*** End Patch'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: {
+                        type: 'patch_apply_end',
+                        call_id: 'call-patch',
+                        output: 'Done!'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'custom_tool_call_output',
+                        call_id: 'call-patch',
+                        output: 'Done!'
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'tool_search_call',
+                        call_id: 'call-tool-search',
+                        arguments: { query: 'hapi change title', limit: 5 }
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'tool_search_output',
+                        call_id: 'call-tool-search',
+                        execution: 'client',
+                        status: 'completed',
+                        tools: [{ name: 'mcp__hapi', description: 'Hapi tools' }]
+                    }
+                }),
+                JSON.stringify({
+                    type: 'response_item',
+                    payload: {
+                        type: 'web_search_call',
+                        status: 'failed',
+                        action: {
+                            type: 'search',
+                            query: 'Codex transcript format',
+                            queries: ['Codex transcript format']
+                        }
+                    }
+                }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: { type: 'web_search_end', query: 'Codex transcript format' }
+                }),
+                JSON.stringify({
+                    type: 'event_msg',
+                    payload: { type: 'mcp_tool_call_end', call_id: 'call-mcp-summary' }
                 }),
                 JSON.stringify({
                     type: 'event_msg',
@@ -546,6 +936,69 @@ describe('codexLocalLauncher', () => {
         expect(userMessages).toEqual(['visible user message']);
         expect(getUserActivityCount()).toBe(0);
         expect(agentMessages).toEqual([{
+            type: 'tool-call',
+            name: 'LegacyTool',
+            callId: 'call-function',
+            input: { path: 'README.md' },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'call-function',
+            output: { ok: true },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call',
+            name: 'exec',
+            callId: 'call-exec',
+            input: 'pwd',
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'call-exec',
+            output: [{ type: 'input_text', text: '/tmp/worktree' }],
+            id: expect.any(String)
+        }, {
+            type: 'tool-call',
+            name: 'apply_patch',
+            callId: 'call-patch',
+            input: '*** Begin Patch\n*** End Patch',
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'call-patch',
+            output: 'Done!',
+            id: expect.any(String)
+        }, {
+            type: 'tool-call',
+            name: 'ToolSearch',
+            callId: 'call-tool-search',
+            input: { query: 'hapi change title', limit: 5 },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: 'call-tool-search',
+            output: {
+                execution: 'client',
+                tools: [{ name: 'mcp__hapi', description: 'Hapi tools' }]
+            },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call',
+            name: 'WebSearch',
+            callId: expect.any(String),
+            input: {
+                type: 'search',
+                query: 'Codex transcript format',
+                queries: ['Codex transcript format']
+            },
+            id: expect.any(String)
+        }, {
+            type: 'tool-call-result',
+            callId: expect.any(String),
+            output: null,
+            id: expect.any(String),
+            is_error: true
+        }, {
             type: 'message',
             message: 'visible assistant preface',
             id: expect.any(String)
@@ -561,6 +1014,9 @@ describe('codexLocalLauncher', () => {
             output: null,
             id: 'plan-1:result'
         }]);
+        expect(agentMessages[9]).toMatchObject({
+            callId: (agentMessages[8] as { callId: string }).callId
+        });
     });
 
     it('replays a plan-only turn when the turn completes', async () => {

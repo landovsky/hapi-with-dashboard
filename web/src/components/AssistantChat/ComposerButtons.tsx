@@ -6,7 +6,41 @@ import { ScheduleTimePicker } from './ScheduleTimePicker'
 import type { PendingSchedule } from './ScheduleTimePicker'
 import { useFue } from '@/lib/use-fue'
 import { FueCallout, FueDot } from '@/components/Fue'
-import { useRef, useState } from 'react'
+import { Children, isValidElement, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { useComposerToolbarLayout, type ComposerToolbarItemId, type ComposerToolbarLayout } from '@/hooks/useComposerToolbarLayout'
+import { useLongPress } from '@/hooks/useLongPress'
+import type { ComposerSendIntent } from '@/lib/messageDelivery'
+
+function ToolbarItemSlot(props: { item: ComposerToolbarItemId; children: ReactNode }) {
+    return <>{props.children}</>
+}
+
+function OrderedToolbarItems(props: { layout: ComposerToolbarLayout; children: ReactNode }) {
+    const slots = Children.toArray(props.children).filter(
+        (child): child is ReactElement<{ item: ComposerToolbarItemId; children: ReactNode }> => isValidElement(child),
+    )
+    const slotsByItem = new Map(slots.map((slot) => [slot.props.item, slot]))
+    const renderItems = (items: ComposerToolbarItemId[]) => items.map((item) => {
+        const slot = slotsByItem.get(item)
+        if (!slot || slot.props.children == null) return null
+        return <div key={item} className="shrink-0">{slot}</div>
+    })
+
+    if (props.layout.mode === 'split') {
+        return <>{renderItems(props.layout.left)}<span className="flex-1" aria-hidden="true" />{renderItems(props.layout.right)}</>
+    }
+    return <>{renderItems([...props.layout.left, ...props.layout.right])}</>
+}
+
+export function getComposerToolbarJustifyContent(
+    mode: ComposerToolbarLayout['mode'],
+): 'safe center' | 'safe end' | 'flex-start' {
+    return mode === 'center'
+        ? 'safe center'
+        : mode === 'right'
+            ? 'safe end'
+            : 'flex-start'
+}
 
 function ChevronIcon() {
     return <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M2.5 3.75L5 6.25L7.5 3.75" /></svg>
@@ -153,6 +187,77 @@ function AttachmentIcon() {
     )
 }
 
+function ComposerExpandIcon(props: { expanded: boolean }) {
+    return props.expanded ? (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+        >
+            <path d="M8 3v5H3" />
+            <path d="m3 3 5 5" />
+            <path d="M16 3v5h5" />
+            <path d="m21 3-5 5" />
+            <path d="M8 21v-5H3" />
+            <path d="m3 21 5-5" />
+            <path d="M16 21v-5h5" />
+            <path d="m21 21-5-5" />
+        </svg>
+    ) : (
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+        >
+            <path d="M8 3H3v5" />
+            <path d="m3 3 5 5" />
+            <path d="M16 3h5v5" />
+            <path d="m21 3-5 5" />
+            <path d="M8 21H3v-5" />
+            <path d="m3 21 5-5" />
+            <path d="M16 21h5v-5" />
+            <path d="m21 21-5-5" />
+        </svg>
+    )
+}
+
+export function ComposerExpandButton(props: {
+    expanded: boolean
+    onToggle: () => void
+}) {
+    const { t } = useTranslation()
+    const label = props.expanded ? t('composer.collapse') : t('composer.expand')
+
+    return (
+        <button
+            type="button"
+            aria-label={label}
+            title={label}
+            aria-pressed={props.expanded}
+            className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors ${
+                props.expanded
+                    ? 'bg-[var(--app-bg)] text-[var(--app-link)]'
+                    : 'text-[var(--app-fg)]/60 hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)]'
+            }`}
+            onClick={props.onToggle}
+        >
+            <ComposerExpandIcon expanded={props.expanded} />
+        </button>
+    )
+}
+
 function AbortIcon(props: { spinning: boolean }) {
     if (props.spinning) {
         return (
@@ -217,10 +322,44 @@ function ScratchlistToggleIcon() {
             strokeLinecap="round"
             strokeLinejoin="round"
         >
-            <path d="M3.5 2.5h6L12.5 5.5v8a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" />
-            <path d="M9.5 2.5v3h3M5 8.5h6M5 11h4" />
+            <g transform="translate(0.5 -0.5)">
+                <path d="M3.5 2.5h6L12.5 5.5v8a1 1 0 0 1-1 1h-8a1 1 0 0 1-1-1v-10a1 1 0 0 1 1-1Z" />
+                <path d="M9.5 2.5v3h3M5 8.5h6M5 11h4" />
+            </g>
         </svg>
     )
+}
+
+export function ComposerToolbarItemPreview(props: { item: ComposerToolbarItemId; label: string }) {
+    const icon = (() => {
+        switch (props.item) {
+            case 'attachment': return <AttachmentIcon />
+            case 'settings': return <SettingsIcon />
+            case 'expand': return <ComposerExpandIcon expanded={false} />
+            case 'terminal': return <TerminalIcon />
+            case 'abort': return <AbortIcon spinning={false} />
+            case 'switch': return <SwitchToRemoteIcon />
+            case 'voiceMic': return <SpeakerIcon />
+            case 'scratchlist': return <ScratchlistToggleIcon />
+            case 'schedule': return <ScheduleIcon className="h-[18px] w-[18px]" />
+            case 'piModel':
+            case 'piThinking':
+                return <><span className="max-w-24 truncate text-xs font-medium">{props.label}</span><ChevronIcon /></>
+        }
+    })()
+    const isTextControl = props.item === 'piModel' || props.item === 'piThinking'
+    return (
+        <span
+            className={`flex h-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 ${isTextControl ? 'gap-1 px-3' : 'w-8'}`}
+            aria-hidden="true"
+        >
+            {icon}
+        </span>
+    )
+}
+
+export function ComposerSendButtonPreview() {
+    return <span className="flex h-10 w-10 items-center justify-center rounded-full bg-black text-white dark:bg-white dark:text-black" aria-hidden="true"><SendIcon /></span>
 }
 
 /**
@@ -336,8 +475,9 @@ export function UnifiedButton(props: {
     voiceStatus: ConversationStatus
     voiceEnabled: boolean
     controlsDisabled: boolean
-    onSend: () => void
+    onSend: (intent?: ComposerSendIntent) => void
     onVoiceToggle: () => void
+    voiceLabel?: string
     /**
      * When true, the send button repaints amber and the aria-label
      * announces "Send to scratchlist" instead of "Send message". The
@@ -345,14 +485,13 @@ export function UnifiedButton(props: {
      * button itself is content-agnostic.
      *
      * Caller MUST compute this from the actual routing decision (mode
-     * AND no-attachments AND no-pending-schedule), not the raw
-     * scratchlist toggle. If the toggle is on but the submission would
-     * fall back to chat (because the scratchlist can't represent the
-     * payload), the button must look like a normal chat send. Per
-     * upstream review on PR #798: [Major] "Send button advertises
-     * scratchlist routing even when the submit will go to chat".
+     * AND no-pending-schedule). Attachments in scratchlist mode still
+     * route to scratchlist. If the toggle is on but a pending schedule
+     * would fall back to chat, the button must look like a normal chat send.
      */
     routesToScratchlist?: boolean
+    /** Pi-only explicit follow-up gesture; never changes the normal click. */
+    allowQueueGesture?: boolean
 }) {
     const { t } = useTranslation()
 
@@ -366,11 +505,30 @@ export function UnifiedButton(props: {
         if (isVoiceActive) {
             props.onVoiceToggle() // Stop voice
         } else if (hasText) {
-            props.onSend() // Send message (or scratchlist add — wrapper decides)
+            props.onSend('default') // Send message (or scratchlist add — wrapper decides)
         } else if (props.voiceEnabled && !routesToScratchlist) {
             props.onVoiceToggle() // Start voice (suppressed in scratchlist mode)
         }
     }
+
+    // This is intentionally narrower than the button's general enabled state:
+    // a touch hold changes only an active Pi-main-thread chat submission. Voice
+    // controls, scratchlist routing, scheduled sends, and desktop input retain
+    // their existing native behavior.
+    const canQueueGesture = Boolean(
+        props.allowQueueGesture
+        && hasText
+        && !isVoiceActive
+        && !routesToScratchlist
+        && !props.controlsDisabled,
+    )
+    const sendButtonHandlers = useLongPress({
+        interaction: 'touch-only-native-click',
+        onClick: handleClick,
+        onLongPress: () => props.onSend('queue'),
+        longPressEnabled: canQueueGesture,
+        disabled: props.controlsDisabled,
+    })
 
     let icon: React.ReactNode
     let className: string
@@ -398,7 +556,7 @@ export function UnifiedButton(props: {
     } else if (props.voiceEnabled) {
         icon = <VoiceAssistantIcon />
         className = 'bg-black text-white'
-        ariaLabel = t('composer.voice')
+        ariaLabel = props.voiceLabel ?? t('composer.voice')
     } else {
         icon = <SendIcon />
         className = 'bg-[#C0C0C0] text-white'
@@ -419,13 +577,44 @@ export function UnifiedButton(props: {
     return (
         <button
             type="button"
-            onClick={handleClick}
+            {...sendButtonHandlers}
             disabled={isDisabled}
             aria-label={ariaLabel}
             title={ariaLabel}
-            className={`flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
+            className={`ml-1 flex h-8 w-8 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
         >
             {icon}
+        </button>
+    )
+}
+
+export function DictationButton(props: {
+    enabled: boolean
+    canSend: boolean
+    voiceEnabled: boolean
+    voiceStatus: ConversationStatus
+    controlsDisabled: boolean
+    onVoiceToggle: () => void
+}) {
+    const { t } = useTranslation()
+    if (
+        !props.enabled
+        || !props.canSend
+        || !props.voiceEnabled
+        || props.voiceStatus === 'connecting'
+        || props.voiceStatus === 'connected'
+    ) return null
+
+    return (
+        <button
+            type="button"
+            onClick={props.onVoiceToggle}
+            disabled={props.controlsDisabled}
+            aria-label={t('composer.dictate')}
+            title={t('composer.dictate')}
+            className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-fg)]/60 transition-colors hover:bg-[var(--app-bg)] hover:text-[var(--app-fg)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+            <VoiceAssistantIcon />
         </button>
     )
 }
@@ -435,6 +624,8 @@ export function ComposerButtons(props: {
     controlsDisabled: boolean
     showSettingsButton: boolean
     onSettingsToggle: () => void
+    expanded: boolean
+    onExpandedToggle: () => void
     showTerminalButton: boolean
     terminalDisabled: boolean
     terminalLabel: string
@@ -448,11 +639,12 @@ export function ComposerButtons(props: {
     isSwitching: boolean
     onSwitch: () => void
     voiceEnabled: boolean
+    dictationEnabled?: boolean
     voiceStatus: ConversationStatus
     voiceMicMuted?: boolean
     onVoiceToggle: () => void
     onVoiceMicToggle?: () => void
-    onSend: () => void
+    onSend: (intent?: ComposerSendIntent) => void
     pendingSchedule?: PendingSchedule | null
     onSchedule?: (pending: PendingSchedule) => void
     onClearSchedule?: () => void
@@ -477,18 +669,28 @@ export function ComposerButtons(props: {
     scratchlistMode?: boolean
     scratchlistCount?: number
     onScratchlistToggle?: () => void
+    /** Enables touch hold as an explicit queue intent for an in-flight Pi turn. */
+    allowQueueGesture?: boolean
 }) {
     const { t } = useTranslation()
+    const { layout } = useComposerToolbarLayout()
     const isVoiceConnected = props.voiceStatus === 'connected'
     const [showSchedulePicker, setShowSchedulePicker] = useState(false)
     const scheduleButtonRef = useRef<HTMLButtonElement>(null)
 
     const hasSchedule = props.pendingSchedule != null
     const hasAttachments = props.hasAttachments ?? false
+    const toolbarJustifyContent = getComposerToolbarJustifyContent(layout.mode)
 
     return (
-        <div className="flex items-center justify-between px-2 pb-2">
-            <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1 px-2 pb-2">
+            <div
+                data-testid="composer-toolbar-items"
+                className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                style={{ justifyContent: toolbarJustifyContent }}
+            >
+                <OrderedToolbarItems layout={layout}>
+                <ToolbarItemSlot item="attachment">
                 <ComposerPrimitive.AddAttachment
                     aria-label={t('composer.attach')}
                     title={t('composer.attach')}
@@ -497,7 +699,9 @@ export function ComposerButtons(props: {
                 >
                     <AttachmentIcon />
                 </ComposerPrimitive.AddAttachment>
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="settings">
                 {props.showSettingsButton ? (
                     <button
                         type="button"
@@ -510,7 +714,16 @@ export function ComposerButtons(props: {
                         <SettingsIcon />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="expand">
+                <ComposerExpandButton
+                    expanded={props.expanded}
+                    onToggle={props.onExpandedToggle}
+                />
+                </ToolbarItemSlot>
+
+                <ToolbarItemSlot item="piModel">
                 {props.piModelLabel ? (
                     <button
                         type="button"
@@ -528,7 +741,9 @@ export function ComposerButtons(props: {
                         <ChevronIcon />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="piThinking">
                 {props.piThinkingLabel ? (
                     <button
                         type="button"
@@ -546,7 +761,9 @@ export function ComposerButtons(props: {
                         <ChevronIcon />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="terminal">
                 {props.showTerminalButton ? (
                     <button
                         type="button"
@@ -559,7 +776,9 @@ export function ComposerButtons(props: {
                         <TerminalIcon />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="abort">
                 {props.showAbortButton ? (
                     <button
                         type="button"
@@ -572,7 +791,9 @@ export function ComposerButtons(props: {
                         <AbortIcon spinning={props.isAborting} />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="switch">
                 {props.showSwitchButton ? (
                     <button
                         type="button"
@@ -585,7 +806,9 @@ export function ComposerButtons(props: {
                         <SwitchToRemoteIcon />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
+                <ToolbarItemSlot item="voiceMic">
                 {isVoiceConnected && props.onVoiceMicToggle ? (
                     <button
                         type="button"
@@ -601,6 +824,7 @@ export function ComposerButtons(props: {
                         <SpeakerIcon muted={props.voiceMicMuted} />
                     </button>
                 ) : null}
+                </ToolbarItemSlot>
 
                 {/*
                  * Scratchlist toggle - prototype of the composer-controlled
@@ -613,18 +837,23 @@ export function ComposerButtons(props: {
                  * submission to addScratchlistEntry() instead of the chat.
                  * Mode is sticky - operator clicks the icon again to exit.
                  */}
+                <ToolbarItemSlot item="scratchlist">
                 {props.onScratchlistToggle ? (
-                    <ScratchlistToggleButton
-                        scratchlistMode={props.scratchlistMode ?? false}
-                        scratchlistCount={props.scratchlistCount ?? 0}
-                        onScratchlistToggle={props.onScratchlistToggle}
-                        controlsDisabled={props.controlsDisabled}
-                    />
+                    <div>
+                        <ScratchlistToggleButton
+                            scratchlistMode={props.scratchlistMode ?? false}
+                            scratchlistCount={props.scratchlistCount ?? 0}
+                            onScratchlistToggle={props.onScratchlistToggle}
+                            controlsDisabled={props.controlsDisabled}
+                        />
+                    </div>
                 ) : null}
+                </ToolbarItemSlot>
 
                 {/* Schedule button — only shown when onSchedule handler is provided */}
+                <ToolbarItemSlot item="schedule">
                 {props.onSchedule ? (
-                    <>
+                    <div>
                         <button
                             ref={scheduleButtonRef}
                             type="button"
@@ -657,9 +886,20 @@ export function ComposerButtons(props: {
                                 pendingSchedule={props.pendingSchedule}
                             />
                         )}
-                    </>
+                    </div>
                 ) : null}
+                </ToolbarItemSlot>
+                </OrderedToolbarItems>
             </div>
+
+            <DictationButton
+                enabled={props.dictationEnabled ?? false}
+                canSend={props.canSend}
+                voiceEnabled={props.voiceEnabled}
+                voiceStatus={props.voiceStatus}
+                controlsDisabled={props.controlsDisabled}
+                onVoiceToggle={props.onVoiceToggle}
+            />
 
             <UnifiedButton
                 canSend={props.canSend}
@@ -668,21 +908,18 @@ export function ComposerButtons(props: {
                 controlsDisabled={props.controlsDisabled}
                 onSend={props.onSend}
                 onVoiceToggle={props.onVoiceToggle}
+                voiceLabel={props.dictationEnabled ? t('composer.dictate') : undefined}
                 /*
                  * Derived, NOT raw scratchlistMode. Mirror SessionChat's
-                 * shouldRouteToScratchlist so the visible send-button state
-                 * matches the actual routing decision: amber + "Send to
-                 * scratchlist" only when mode is on AND the payload would
-                 * be a pure-text scratchlist add. Attachments or a pending
-                 * schedule force a chat fallback in onSendForComposer; the
-                 * button must reflect that, otherwise the UI lies about
-                 * where the user's content is going.
+                 * shouldRouteToScratchlist: amber + "Send to scratchlist"
+                 * whenever mode is on and there is no pending schedule.
+                 * Attachments route to scratchlist too (hub upload adapter).
                  */
                 routesToScratchlist={
                     (props.scratchlistMode ?? false)
-                    && !hasAttachments
                     && props.pendingSchedule == null
                 }
+                allowQueueGesture={props.allowQueueGesture && props.pendingSchedule == null}
             />
         </div>
     )

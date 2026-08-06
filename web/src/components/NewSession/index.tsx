@@ -1,14 +1,17 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type { ApiClient } from '@/api/client'
-import type { CodexLocalSessionSummary, Machine } from '@/types/api'
-import type { GrokPermissionMode } from '@hapi/protocol'
+import type { CodexDuplicateSessionGroup, CodexLocalSessionSummary, Machine, PiLocalSessionSummary } from '@/types/api'
+import type { CodexCollaborationMode, GrokPermissionMode, PermissionMode, CopilotAgentMode } from '@hapi/protocol'
+import { codexModelAdvertisesFastTier } from '@/components/AssistantChat/codexFastMode'
 import { usePlatform } from '@/hooks/usePlatform'
 import { useMachinePathsExists } from '@/hooks/useMachinePathsExists'
 import { useSpawnSession } from '@/hooks/mutations/useSpawnSession'
 import { useCodexModels } from '@/hooks/queries/useCodexModels'
 import { useCursorModelsForMachine } from '@/hooks/queries/useCursorModelsForMachine'
+import { useAgyModels } from '@/hooks/queries/useAgyModels'
 import { useOpencodeModelsForCwd } from '@/hooks/queries/useOpencodeModelsForCwd'
 import { useGrokModelsForCwd } from '@/hooks/queries/useGrokModelsForCwd'
+import { useCopilotModelsForCwd } from '@/hooks/queries/useCopilotModelsForCwd'
 import { useSessions } from '@/hooks/queries/useSessions'
 import { useActiveSuggestions, type Suggestion } from '@/hooks/useActiveSuggestions'
 import { useDirectorySuggestions } from '@/hooks/useDirectorySuggestions'
@@ -16,6 +19,7 @@ import { useRecentPaths } from '@/hooks/useRecentPaths'
 import { useTranslation } from '@/lib/use-translation'
 import { getCodexModelReasoningEfforts } from '@/lib/codexModelCapabilities'
 import {
+    buildNewSessionCursorModelCatalog,
     buildNewSessionCursorPickerState,
     isCursorEffortWireAllowed,
     resolveCursorBaseFromWire,
@@ -32,11 +36,19 @@ import {
     saveNewSessionFormDraft,
     shouldRestoreNewSessionFormDraft
 } from './newSessionFormDraft'
-import type { AgentType, LaunchEffort, CodexReasoningEffort, SessionType } from './types'
+import type { AgentType, LaunchEffort, CodexReasoningEffort, NewSessionServiceTier, SessionType } from './types'
 import { ActionButtons } from './ActionButtons'
 import { AgentSelector } from './AgentSelector'
+import { CollaborationModeSelector } from './CollaborationModeSelector'
+import { CodexImportActions } from './CodexImportActions'
+import { PiImportActions } from './PiImportActions'
+import { clearBatchImportedCodexSelection, resolveCodexImportRedirectSessionId } from './codexImportMerge'
+import { AgyModelSelector } from './AgyModelSelector'
 import { DirectorySection } from './DirectorySection'
 import { GrokPermissionModeSelector } from './GrokPermissionModeSelector'
+import { CodexFamilyPermissionModeSelector } from './CodexFamilyPermissionModeSelector'
+import { CopilotAgentModeSelector } from './CopilotAgentModeSelector'
+import { FastModeSelector } from './FastModeSelector'
 import { MachineSelector } from './MachineSelector'
 import { ModelSelector } from './ModelSelector'
 import { OpencodeModelSelector } from './OpencodeModelSelector'
@@ -46,57 +58,25 @@ import { buildGrokEffortOptions, buildGrokModelOptions, shouldEnableGrokModelDis
 import { ReasoningEffortSelector } from './ReasoningEffortSelector'
 import {
     loadPreferredAgent,
+    loadPreferredLaunchSettings,
     loadPreferredYoloMode,
+    resolvePreferredLaunchSettings,
     savePreferredAgent,
+    savePreferredLaunchSettings,
     savePreferredYoloMode,
 } from './preferences'
 import { SessionTypeSelector } from './SessionTypeSelector'
 import { YoloToggle } from './YoloToggle'
+import { usesCodexFamilyPermissionModes } from '@/lib/codexFamilyPermissionAgents'
 import { CodexSessionSyncDialog } from '@/components/CodexSessionSyncDialog'
+import { PiSessionImportDialog } from '@/components/PiSessionImportDialog'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { formatRunnerSpawnError } from '../../utils/formatRunnerSpawnError'
 import { markCodexSessionsImported } from '@/lib/codexImportedSessions'
+import { useToast } from '@/lib/toast-context'
 
 
 
-
-function CodexImportSelectButton(props: {
-    selectedSession: CodexLocalSessionSummary | null
-    isLoading: boolean
-    isDisabled: boolean
-    error: string | null
-    onOpen: () => void
-    onClear: () => void
-}) {
-    const { t } = useTranslation()
-    return (
-        <div className="flex flex-col gap-2 px-3 py-3">
-            <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                    <div className="text-xs font-medium text-[var(--app-hint)]">{t('codexSync.newSessionInline.title')}</div>
-                    <div className="truncate text-[11px] text-[var(--app-hint)]">
-                        {props.selectedSession ? props.selectedSession.title : t('codexSync.newSessionInline.description')}
-                    </div>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                    {props.selectedSession ? (
-                        <button type="button" className="text-xs text-[var(--app-link)]" onClick={props.onClear} disabled={props.isDisabled}>
-                            {t('codexSync.newSessionInline.clear')}
-                        </button>
-                    ) : null}
-                    <button
-                        type="button"
-                        className="rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-2 py-1.5 text-xs text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] disabled:opacity-50"
-                        onClick={props.onOpen}
-                        disabled={props.isDisabled || props.isLoading}
-                    >
-                        {props.isLoading ? t('codexSync.confirm.loading') : t('codexSync.newSessionInline.choose')}
-                    </button>
-                </div>
-            </div>
-            {props.error ? <div className="text-xs text-red-600">{props.error}</div> : null}
-        </div>
-    )
-}
 
 export function NewSession(props: {
     api: ApiClient
@@ -110,8 +90,9 @@ export function NewSession(props: {
 }) {
     const { haptic } = usePlatform()
     const { t } = useTranslation()
+    const { addToast } = useToast()
     const { spawnSession, isPending, error: spawnError } = useSpawnSession(props.api)
-    const { sessions } = useSessions(props.api)
+    const { sessions, refetch: refetchSessions } = useSessions(props.api)
     const { getRecentPaths, addRecentPath, getLastUsedMachineId, setLastUsedMachineId } = useRecentPaths()
 
     const [machineId, setMachineId] = useState<string | null>(props.initialMachineId ?? null)
@@ -124,7 +105,12 @@ export function NewSession(props: {
     const pendingCursorBaseRef = useRef<string | null>(null)
     const [effort, setEffort] = useState<LaunchEffort>('auto')
     const [modelReasoningEffort, setModelReasoningEffort] = useState<CodexReasoningEffort>('default')
+    const [opencodeSelectedModel, setOpencodeSelectedModel] = useState<string | null>(null)
+    const [serviceTier, setServiceTier] = useState<NewSessionServiceTier>('standard')
+    const [collaborationMode, setCollaborationMode] = useState<CodexCollaborationMode>('default')
+    const [copilotAgentMode, setCopilotAgentMode] = useState<CopilotAgentMode>('interactive')
     const [yoloMode, setYoloMode] = useState(loadPreferredYoloMode)
+    const [codexFamilyPermissionMode, setCodexFamilyPermissionMode] = useState<PermissionMode>('default')
     const [grokPermissionMode, setGrokPermissionMode] = useState<GrokPermissionMode>('default')
     const [sessionType, setSessionType] = useState<SessionType>('simple')
     const [worktreeName, setWorktreeName] = useState('')
@@ -137,8 +123,35 @@ export function NewSession(props: {
     const [codexImportError, setCodexImportError] = useState<string | null>(null)
     const [isImportingCodexSession, setIsImportingCodexSession] = useState(false)
     const [isCodexImportDialogOpen, setIsCodexImportDialogOpen] = useState(false)
-    const isFormDisabled = Boolean(isPending || props.isLoading || isImportingCodexSession)
+    const [piImportSessions, setPiImportSessions] = useState<PiLocalSessionSummary[]>([])
+    const [selectedPiImportSessionId, setSelectedPiImportSessionId] = useState<string | null>(null)
+    const [piImportMachineId, setPiImportMachineId] = useState<string | null>(null)
+    const [isLoadingPiImportSessions, setIsLoadingPiImportSessions] = useState(false)
+    const [piImportError, setPiImportError] = useState<string | null>(null)
+    const [isImportingPiSession, setIsImportingPiSession] = useState(false)
+    const [isBulkImportingPiSessions, setIsBulkImportingPiSessions] = useState(false)
+    const [isPiImportDialogOpen, setIsPiImportDialogOpen] = useState(false)
+    const piLoadGenerationRef = useRef(0)
+    const [isCreating, setIsCreating] = useState(false)
+    const createInFlightRef = useRef(false)
+    const [isBulkImportingCodexSessions, setIsBulkImportingCodexSessions] = useState(false)
+    const [isRestartingCodexDesktop, setIsRestartingCodexDesktop] = useState(false)
+    const [pendingDuplicateSessionIds, setPendingDuplicateSessionIds] = useState<string[]>([])
+    const [pendingDuplicateHapiSessionIds, setPendingDuplicateHapiSessionIds] = useState<string[]>([])
+    const [duplicateSessionGroups, setDuplicateSessionGroups] = useState<CodexDuplicateSessionGroup[]>([])
+    const [isDuplicateMergeConfirmOpen, setIsDuplicateMergeConfirmOpen] = useState(false)
+    const [isMergingDuplicateSessions, setIsMergingDuplicateSessions] = useState(false)
+    const isFormDisabled = Boolean(
+        isCreating
+        || isPending
+        || props.isLoading
+        || isImportingCodexSession
+        || isBulkImportingCodexSessions
+        || isImportingPiSession
+        || isBulkImportingPiSessions
+    )
     const worktreeInputRef = useRef<HTMLInputElement>(null)
+    const preserveRestoredDraftRef = useRef(false)
 
     useEffect(() => {
         if (sessionType === 'worktree') {
@@ -147,9 +160,16 @@ export function NewSession(props: {
     }, [sessionType])
 
     useEffect(() => {
+        if (preserveRestoredDraftRef.current) {
+            return
+        }
         setEffort('auto')
         setModelReasoningEffort('default')
         setGrokPermissionMode('default')
+        setCodexFamilyPermissionMode('default')
+        setServiceTier('standard')
+        setCollaborationMode('default')
+        setCopilotAgentMode('interactive')
         if (agent !== 'cursor') {
             setModel('auto')
             setCursorSelectedBase('auto')
@@ -206,12 +226,23 @@ export function NewSession(props: {
             return
         }
         restoredFromBrowseRef.current = true
+        preserveRestoredDraftRef.current = true
         setAgent(draft.agent)
         setModel(draft.model)
         setCursorSelectedBase(draft.cursorSelectedBase)
         setEffort(draft.effort)
         setModelReasoningEffort(draft.modelReasoningEffort)
+        setOpencodeSelectedModel(
+            draft.agent === 'opencode' && draft.model !== 'auto' ? draft.model : null
+        )
+        setAgySelectedModel(
+            draft.agent === 'agy' && draft.model !== 'auto' ? draft.model : null
+        )
+        setServiceTier(draft.serviceTier)
+        setCollaborationMode(draft.collaborationMode)
+        setCopilotAgentMode(draft.copilotAgentMode)
         setYoloMode(draft.yoloMode)
+        setCodexFamilyPermissionMode(draft.codexFamilyPermissionMode)
         setGrokPermissionMode(draft.grokPermissionMode)
         setSessionType(draft.sessionType)
         setWorktreeName(draft.worktreeName)
@@ -249,7 +280,7 @@ export function NewSession(props: {
         machineId,
         enabled: agent === 'codex' && Boolean(machineId)
     })
-    const [opencodeSelectedModel, setOpencodeSelectedModel] = useState<string | null>(null)
+    const [agySelectedModel, setAgySelectedModel] = useState<string | null>(null)
     const runnerSpawnError = useMemo(
         () => formatRunnerSpawnError(selectedMachine),
         [selectedMachine]
@@ -287,6 +318,35 @@ export function NewSession(props: {
         }
         setModelReasoningEffort('default')
     }, [agent, codexSupportedReasoningEfforts, modelReasoningEffort])
+
+    useEffect(() => {
+        if (
+            agent !== 'codex'
+            || model === 'auto'
+            || codexModelsState.isLoading
+            || codexModelsState.error
+        ) {
+            return
+        }
+        if (!codexModelsState.models.some((candidate) => candidate.id === model)) {
+            setModel('auto')
+        }
+    }, [agent, codexModelsState.error, codexModelsState.isLoading, codexModelsState.models, model])
+    const showCodexFastMode = agent === 'codex'
+        && !codexModelsState.error
+        && codexModelAdvertisesFastTier(model === 'auto' ? null : model, codexModelsState.models)
+
+    useEffect(() => {
+        // Wait for the Codex model catalog to settle before clearing Fast;
+        // otherwise Browse → remount restores serviceTier: 'fast' and this
+        // effect would wipe it while models are still loading.
+        if (agent === 'codex' && codexModelsState.isLoading) {
+            return
+        }
+        if (!showCodexFastMode && serviceTier !== 'standard') {
+            setServiceTier('standard')
+        }
+    }, [agent, codexModelsState.isLoading, showCodexFastMode, serviceTier])
     const cursorModelsState = useCursorModelsForMachine({
         api: props.api,
         machineId,
@@ -300,6 +360,42 @@ export function NewSession(props: {
         ),
         [cursorModelsState.availableModels, cursorModelsState.cliModelSkus, model]
     )
+    const availableCursorCatalog = useMemo(
+        () => buildNewSessionCursorModelCatalog(
+            cursorModelsState.availableModels,
+            'auto',
+            cursorModelsState.cliModelSkus
+        ),
+        [cursorModelsState.availableModels, cursorModelsState.cliModelSkus]
+    )
+
+    useEffect(() => {
+        if (
+            agent !== 'cursor'
+            || cursorModelsState.isLoading
+            || cursorModelsState.error
+        ) {
+            return
+        }
+        if (model !== 'auto' && !availableCursorCatalog.wireToBase.has(model)) {
+            setModel('auto')
+            setCursorSelectedBase('auto')
+            return
+        }
+        if (
+            cursorSelectedBase !== 'auto'
+            && !availableCursorCatalog.variantsByBase.has(cursorSelectedBase)
+        ) {
+            setCursorSelectedBase('auto')
+        }
+    }, [
+        agent,
+        availableCursorCatalog,
+        cursorModelsState.error,
+        cursorModelsState.isLoading,
+        cursorSelectedBase,
+        model
+    ])
 
     const cursorBaseSelectValue = useMemo(
         () => resolveNewSessionCursorBaseSelectValue(cursorPicker, cursorSelectedBase),
@@ -442,6 +538,24 @@ export function NewSession(props: {
             cwdExists: deferredDirectoryExists,
         })
     })
+    const copilotModelsState = useCopilotModelsForCwd({
+        api: props.api,
+        machineId,
+        cwd: deferredDirectory,
+        enabled: agent === 'copilot' && deferredDirectoryExists === true
+    })
+    const copilotModelOptions = useMemo(
+        () => [
+            { value: 'auto', label: 'Auto' },
+            ...copilotModelsState.availableModels
+                .filter((candidate) => candidate.modelId !== 'auto')
+                .map((candidate) => ({
+                    value: candidate.modelId,
+                    label: candidate.name ?? candidate.modelId
+                }))
+        ],
+        [copilotModelsState.availableModels]
+    )
     const grokModelOptions = useMemo(
         () => buildGrokModelOptions(grokModelsState.availableModels),
         [grokModelsState.availableModels]
@@ -463,22 +577,164 @@ export function NewSession(props: {
             setGrokPermissionMode('default')
         }
     }, [agent, grokPermissionMode, grokModelsState.autoPermissionModeSupported])
+    const agyModelsState = useAgyModels({
+        api: props.api,
+        machineId,
+        enabled: agent === 'agy' && Boolean(machineId)
+    })
     useEffect(() => {
-        // Auto-pick the OpenCode default model when discovery finishes, so the
-        // form has a sensible value if the user hits Enter without scrolling.
-        if (agent !== 'opencode') return
-        if (opencodeSelectedModel !== null) return
-        const fallback = opencodeModelsState.currentModelId
+        if (preserveRestoredDraftRef.current) {
+            return
+        }
+        // Reset selection when agent / machine changes. The default is "Default"
+        // (null → no --model → agy uses its own default); we intentionally do NOT
+        // auto-pick the first model, so the user's explicit "Default" choice
+        // sticks instead of snapping to the first option.
+        setAgySelectedModel(null)
+    }, [agent, machineId])
+
+    useEffect(() => {
+        if (
+            agent !== 'agy'
+            || agyModelsState.isLoading
+            || agyModelsState.error
+            || agySelectedModel === null
+        ) {
+            return
+        }
+        if (!agyModelsState.availableModels.some((candidate) => candidate.modelId === agySelectedModel)) {
+            setAgySelectedModel(null)
+        }
+    }, [
+        agent,
+        agyModelsState.availableModels,
+        agyModelsState.error,
+        agyModelsState.isLoading,
+        agySelectedModel
+    ])
+
+    useEffect(() => {
+        // Restore a remembered model when it is still advertised for this cwd;
+        // otherwise auto-pick the backend default.
+        if (
+            agent !== 'opencode'
+            || deferredDirectoryExists !== true
+            || opencodeModelsState.isLoading
+            || opencodeModelsState.error
+        ) {
+            return
+        }
+        if (
+            opencodeSelectedModel !== null
+            && opencodeModelsState.availableModels.some(
+                (candidate) => candidate.modelId === opencodeSelectedModel
+            )
+        ) {
+            return
+        }
+        const rememberedModel = machineId
+            ? loadPreferredLaunchSettings(machineId, 'opencode')?.model
+            : null
+        const rememberedModelAvailable = rememberedModel
+            && rememberedModel !== 'auto'
+            && opencodeModelsState.availableModels.some(
+                (candidate) => candidate.modelId === rememberedModel
+            )
+        const fallback = (rememberedModelAvailable ? rememberedModel : null)
+            ?? opencodeModelsState.currentModelId
             ?? opencodeModelsState.availableModels[0]?.modelId
             ?? null
-        if (fallback) {
-            setOpencodeSelectedModel(fallback)
-        }
-    }, [agent, opencodeSelectedModel, opencodeModelsState.currentModelId, opencodeModelsState.availableModels])
+        setOpencodeSelectedModel(fallback)
+    }, [
+        agent,
+        deferredDirectoryExists,
+        opencodeModelsState.availableModels,
+        opencodeModelsState.currentModelId,
+        opencodeModelsState.error,
+        opencodeModelsState.isLoading,
+        opencodeSelectedModel,
+        machineId
+    ])
     useEffect(() => {
         // Reset selection when agent / machine / directory changes; new probe = new defaults.
+        if (preserveRestoredDraftRef.current) {
+            return
+        }
         setOpencodeSelectedModel(null)
     }, [agent, machineId, deferredDirectory])
+
+    useEffect(() => {
+        if (!machineId || preserveRestoredDraftRef.current) {
+            return
+        }
+
+        const preferred = resolvePreferredLaunchSettings(
+            agent,
+            loadPreferredLaunchSettings(machineId, agent)
+        )
+
+        setModel(agent === 'opencode' ? 'auto' : preferred.model)
+        setCursorSelectedBase(preferred.cursorSelectedBase)
+        setEffort(preferred.effort)
+        setModelReasoningEffort(preferred.modelReasoningEffort)
+        setOpencodeSelectedModel(
+            agent === 'opencode' && preferred.model !== 'auto' ? preferred.model : null
+        )
+        setAgySelectedModel(
+            agent === 'agy' && preferred.model !== 'auto' ? preferred.model : null
+        )
+    }, [agent, machineId])
+
+    useEffect(() => {
+        if (
+            agent !== 'grok'
+            || deferredDirectoryExists !== true
+            || grokModelsState.isLoading
+            || grokModelsState.error
+        ) {
+            return
+        }
+        if (
+            model !== 'auto'
+            && !grokModelsState.availableModels.some((candidate) => candidate.modelId === model)
+        ) {
+            setModel('auto')
+        }
+        if (
+            effort !== 'auto'
+            && !grokEffortOptions.some((option) => option.value === effort)
+        ) {
+            setEffort('auto')
+        }
+    }, [
+        agent,
+        deferredDirectoryExists,
+        effort,
+        grokEffortOptions,
+        grokModelsState.availableModels,
+        grokModelsState.error,
+        grokModelsState.isLoading,
+        model
+    ])
+    useEffect(() => {
+        if (
+            agent === 'copilot'
+            && deferredDirectoryExists === true
+            && !copilotModelsState.isLoading
+            && !copilotModelsState.error
+            && model !== 'auto'
+            && !copilotModelsState.availableModels.some((candidate) => candidate.modelId === model)
+        ) {
+            setModel('auto')
+        }
+    }, [
+        agent,
+        copilotModelsState.availableModels,
+        copilotModelsState.error,
+        copilotModelsState.isLoading,
+        deferredDirectoryExists,
+        model
+    ])
 
     const currentDirectoryExists = trimmedDirectory ? pathExistence[trimmedDirectory] : undefined
     const needsDirectoryCreationWarning = sessionType === 'simple' && trimmedDirectory !== '' && currentDirectoryExists === false
@@ -554,18 +810,323 @@ export function NewSession(props: {
         }
     }, [agent, machineId, props.api, trimmedDirectory, t])
 
+    useEffect(() => {
+        piLoadGenerationRef.current += 1
+        setIsLoadingPiImportSessions(false)
+    }, [agent, machineId, trimmedDirectory])
+
+    useEffect(() => () => {
+        piLoadGenerationRef.current += 1
+    }, [])
+
+    const loadPiImportSessions = useCallback(async () => {
+        if (agent !== 'pi' || !machineId) return
+        const generation = ++piLoadGenerationRef.current
+        setIsLoadingPiImportSessions(true)
+        setPiImportError(null)
+        try {
+            const result = await props.api.getPiSessions(trimmedDirectory || null, machineId)
+            if (generation !== piLoadGenerationRef.current) return
+            if (!result.success) throw new Error(result.error)
+            setPiImportSessions(result.sessions)
+            setPiImportMachineId(result.machineId ?? machineId)
+            setSelectedPiImportSessionId((current) => current && result.sessions.some((session) => session.id === current) ? current : null)
+        } catch (loadError) {
+            if (generation !== piLoadGenerationRef.current) return
+            setPiImportSessions([])
+            setPiImportMachineId(null)
+            setSelectedPiImportSessionId(null)
+            setPiImportError(loadError instanceof Error ? loadError.message : t('piImport.failed.body'))
+        } finally {
+            if (generation === piLoadGenerationRef.current) setIsLoadingPiImportSessions(false)
+        }
+    }, [agent, machineId, props.api, trimmedDirectory, t])
+
+    const formatPiImportError = useCallback((code?: string, message?: string): string => {
+        if (code === 'transcript_diverged') return t('piImport.error.diverged')
+        if (code === 'session_active') return t('piImport.error.active')
+        return message?.trim() || t('piImport.failed.body')
+    }, [t])
+
+    const normalizeCodexScriptError = useCallback((message: string | null | undefined, fallback: string): string => {
+        const raw = (message ?? '').trim()
+        if (!raw) return fallback
+        if (/执行超时|timed\s*out|timeout/i.test(raw)) return t('codexSync.error.timeout')
+        if (/当前会话仍处于活跃状态，请等待会话结束后重试|Active Hapi process already has this Codex thread/i.test(raw)) {
+            return t('codexSync.error.active')
+        }
+        if (/未安装\/找不到codex客户端|unable to find codex launcher|找不到.*codex/i.test(raw)) {
+            return t('codexSync.restart.failed.notFound')
+        }
+        return raw
+    }, [t])
+
+    const formatCodexImportFailure = useCallback((reason: string): string => {
+        if (
+            reason === t('codexSync.error.timeout')
+            || reason === t('codexSync.error.active')
+            || reason === t('codexSync.restart.failed.notFound')
+        ) {
+            return reason
+        }
+        return t('codexSync.failed.bodyWithReason', { reason })
+    }, [t])
+
+    const handleRestartCodexDesktop = useCallback(async () => {
+        setIsRestartingCodexDesktop(true)
+        try {
+            const status = await props.api.getCodexDesktopStatus()
+            if (!status.codexClientAvailable) throw new Error(t('codexSync.restart.failed.notFound'))
+
+            const result = await props.api.restartCodexDesktop()
+            if (!result.success) {
+                throw new Error(normalizeCodexScriptError(result.error, t('codexSync.restart.failed.body')))
+            }
+            addToast({
+                title: t('codexSync.restart.started.title'),
+                body: t('codexSync.restart.started.body'),
+                sessionId: '',
+                url: ''
+            })
+        } catch (restartError) {
+            addToast({
+                title: t('codexSync.restart.failed.title'),
+                body: normalizeCodexScriptError(
+                    restartError instanceof Error ? restartError.message : null,
+                    t('codexSync.restart.failed.body')
+                ),
+                sessionId: '',
+                url: ''
+            })
+        } finally {
+            setIsRestartingCodexDesktop(false)
+        }
+    }, [addToast, normalizeCodexScriptError, props.api, t])
+
+    const closeDuplicateMergeDialog = useCallback(() => {
+        setIsDuplicateMergeConfirmOpen(false)
+        setPendingDuplicateSessionIds([])
+        setPendingDuplicateHapiSessionIds([])
+        setDuplicateSessionGroups([])
+    }, [])
+
+    const handleBulkImportCodexSessions = useCallback(async (sessionIds: string[]) => {
+        if (isBulkImportingCodexSessions || isLoadingCodexImportSessions) return
+
+        setIsBulkImportingCodexSessions(true)
+        try {
+            const result = await props.api.syncCodexSession({
+                sessionIds,
+                cwd: trimmedDirectory || null,
+                machineId: codexImportMachineId ?? machineId
+            })
+            if (!result.success) {
+                throw new Error(normalizeCodexScriptError(result.error, t('codexSync.failed.body')))
+            }
+
+            markCodexSessionsImported(sessionIds)
+            setSelectedCodexImportSessionId((current) =>
+                clearBatchImportedCodexSelection(current, sessionIds)
+            )
+            setIsCodexImportDialogOpen(false)
+            addToast({
+                title: t('codexSync.success.title'),
+                body: t('codexSync.success.body', { n: result.syncedCount ?? sessionIds.length }),
+                sessionId: '',
+                url: ''
+            })
+            await refetchSessions()
+
+            closeDuplicateMergeDialog()
+            setPendingDuplicateHapiSessionIds(result.hapiSessionIds ?? [])
+            try {
+                const duplicateResult = await props.api.getCodexDuplicateSessions({ sessionIds })
+                if (!duplicateResult.success) {
+                    throw new Error(normalizeCodexScriptError(
+                        duplicateResult.error,
+                        t('codexSync.duplicates.detect.failed.body')
+                    ))
+                }
+                if (duplicateResult.duplicates.length > 0) {
+                    setPendingDuplicateSessionIds(sessionIds)
+                    setPendingDuplicateHapiSessionIds(result.hapiSessionIds ?? [])
+                    setDuplicateSessionGroups(duplicateResult.duplicates)
+                    setIsDuplicateMergeConfirmOpen(true)
+                }
+            } catch (duplicateError) {
+                addToast({
+                    title: t('codexSync.duplicates.detect.failed.title'),
+                    body: normalizeCodexScriptError(
+                        duplicateError instanceof Error ? duplicateError.message : null,
+                        t('codexSync.duplicates.detect.failed.body')
+                    ),
+                    sessionId: '',
+                    url: ''
+                })
+            }
+        } catch (importError) {
+            const reason = normalizeCodexScriptError(
+                importError instanceof Error ? importError.message : null,
+                t('dialog.error.default')
+            )
+            addToast({
+                title: t('codexSync.failed.title'),
+                body: formatCodexImportFailure(reason),
+                sessionId: '',
+                url: ''
+            })
+        } finally {
+            setIsBulkImportingCodexSessions(false)
+        }
+    }, [
+        addToast,
+        closeDuplicateMergeDialog,
+        codexImportMachineId,
+        formatCodexImportFailure,
+        isBulkImportingCodexSessions,
+        isLoadingCodexImportSessions,
+        machineId,
+        normalizeCodexScriptError,
+        props.api,
+        refetchSessions,
+        t,
+        trimmedDirectory
+    ])
+
+    const handleMergeDuplicateSessions = useCallback(async () => {
+        if (isMergingDuplicateSessions || pendingDuplicateSessionIds.length === 0) return
+
+        setIsMergingDuplicateSessions(true)
+        try {
+            const result = await props.api.mergeCodexDuplicateSessions({ sessionIds: pendingDuplicateSessionIds })
+            if (!result.success) {
+                throw new Error(normalizeCodexScriptError(result.error, t('codexSync.duplicates.merge.failed.body')))
+            }
+            addToast({
+                title: t('codexSync.duplicates.merge.success.title'),
+                body: t('codexSync.duplicates.merge.success.body'),
+                sessionId: '',
+                url: ''
+            })
+            const redirectSessionId = resolveCodexImportRedirectSessionId(
+                result.merged,
+                pendingDuplicateHapiSessionIds
+            )
+            closeDuplicateMergeDialog()
+            await refetchSessions()
+            if (redirectSessionId) props.onSuccess(redirectSessionId)
+        } catch (mergeError) {
+            addToast({
+                title: t('codexSync.duplicates.merge.failed.title'),
+                body: normalizeCodexScriptError(
+                    mergeError instanceof Error ? mergeError.message : null,
+                    t('codexSync.duplicates.merge.failed.body')
+                ),
+                sessionId: '',
+                url: ''
+            })
+            throw mergeError
+        } finally {
+            setIsMergingDuplicateSessions(false)
+        }
+    }, [
+        addToast,
+        closeDuplicateMergeDialog,
+        isMergingDuplicateSessions,
+        normalizeCodexScriptError,
+        pendingDuplicateHapiSessionIds,
+        pendingDuplicateSessionIds,
+        props.api,
+        props.onSuccess,
+        refetchSessions,
+        t
+    ])
+
+    const handleBulkImportPiSessions = useCallback(async (sessionIds: string[]) => {
+        if (isBulkImportingPiSessions || isLoadingPiImportSessions) return
+        setIsBulkImportingPiSessions(true)
+        try {
+            const result = await props.api.importPiSessions({
+                sessionIds,
+                cwd: trimmedDirectory || null,
+                machineId: piImportMachineId ?? machineId
+            })
+            const importedCount = result.results.filter((item) => item.hapiSessionId && !item.error).length
+            const failed = result.results.filter((item) => item.error)
+            if (importedCount > 0) {
+                addToast({
+                    title: t('piImport.success.title'),
+                    body: t('piImport.success.body', { n: importedCount }),
+                    sessionId: '',
+                    url: ''
+                })
+                await refetchSessions()
+                await loadPiImportSessions()
+            }
+            if (failed.length > 0) {
+                const first = failed[0]!.error!
+                addToast({
+                    title: t('piImport.failed.title'),
+                    body: t('piImport.failed.partial', {
+                        failed: failed.length,
+                        reason: formatPiImportError(first.code, first.message)
+                    }),
+                    sessionId: '',
+                    url: ''
+                })
+                return
+            }
+            setIsPiImportDialogOpen(false)
+            setSelectedPiImportSessionId(null)
+        } catch (importError) {
+            addToast({
+                title: t('piImport.failed.title'),
+                body: importError instanceof Error ? importError.message : t('piImport.failed.body'),
+                sessionId: '',
+                url: ''
+            })
+        } finally {
+            setIsBulkImportingPiSessions(false)
+        }
+    }, [
+        addToast,
+        formatPiImportError,
+        isBulkImportingPiSessions,
+        isLoadingPiImportSessions,
+        loadPiImportSessions,
+        machineId,
+        piImportMachineId,
+        props.api,
+        refetchSessions,
+        t,
+        trimmedDirectory
+    ])
+
     const selectedCodexImportSession = useMemo(
         () => codexImportSessions.find((session) => session.id === selectedCodexImportSessionId) ?? null,
         [codexImportSessions, selectedCodexImportSessionId]
     )
+    const selectedPiImportSession = useMemo(
+        () => piImportSessions.find((session) => session.id === selectedPiImportSessionId) ?? null,
+        [piImportSessions, selectedPiImportSessionId]
+    )
+
+    const handleAgentChange = useCallback((newAgent: AgentType) => {
+        preserveRestoredDraftRef.current = false
+        setAgent(newAgent)
+    }, [])
 
     const handleMachineChange = useCallback((newMachineId: string) => {
+        preserveRestoredDraftRef.current = false
         setMachineId(newMachineId)
         setModel('auto')
         setCursorSelectedBase('auto')
         setSelectedCodexImportSessionId(null)
         setCodexImportSessions([])
         setCodexImportMachineId(null)
+        setSelectedPiImportSessionId(null)
+        setPiImportSessions([])
+        setPiImportMachineId(null)
         const paths = getRecentPaths(newMachineId)
         if (paths[0]) {
             setDirectory(paths[0])
@@ -610,12 +1171,20 @@ export function NewSession(props: {
         }
         saveNewSessionFormDraft({
             agent,
-            model,
+            model: agent === 'agy'
+                ? (agySelectedModel ?? 'auto')
+                : agent === 'opencode'
+                    ? (opencodeSelectedModel ?? 'auto')
+                    : model,
             cursorSelectedBase,
             machineId,
             effort,
             modelReasoningEffort,
+            serviceTier,
+            collaborationMode,
+            copilotAgentMode,
             yoloMode,
+            codexFamilyPermissionMode,
             grokPermissionMode,
             sessionType,
             worktreeName
@@ -625,11 +1194,17 @@ export function NewSession(props: {
         props.onChooseFolder,
         agent,
         model,
+        opencodeSelectedModel,
+        agySelectedModel,
         cursorSelectedBase,
         machineId,
         effort,
         modelReasoningEffort,
+        serviceTier,
+        collaborationMode,
+        copilotAgentMode,
         yoloMode,
+        codexFamilyPermissionMode,
         grokPermissionMode,
         sessionType,
         worktreeName,
@@ -641,6 +1216,11 @@ export function NewSession(props: {
         if (session.cwd?.trim()) {
             setDirectory(session.cwd.trim())
         }
+    }, [])
+
+    const handleSelectPiImportSession = useCallback((session: PiLocalSessionSummary) => {
+        setSelectedPiImportSessionId(session.id)
+        if (session.cwd?.trim()) setDirectory(session.cwd.trim())
     }, [])
 
     const handlePathClick = useCallback((path: string) => {
@@ -696,8 +1276,10 @@ export function NewSession(props: {
     }, [suggestions, selectedIndex, moveUp, moveDown, clearSuggestions, handleSuggestionSelect])
 
     async function handleCreate() {
-        if (!machineId || !trimmedDirectory) return
+        if (!machineId || !trimmedDirectory || createInFlightRef.current) return
 
+        createInFlightRef.current = true
+        setIsCreating(true)
         setError(null)
         try {
             const existsResult = await checkPathsExists([trimmedDirectory])
@@ -728,13 +1310,33 @@ export function NewSession(props: {
 
             const resolvedModel = agent === 'opencode'
                 ? (opencodeSelectedModel ?? undefined)
-                : (model !== 'auto' ? model : undefined)
+                : agent === 'agy'
+                    ? (agySelectedModel ?? undefined)
+                    : (model !== 'auto' ? model : undefined)
             const resolvedEffort = (agent === 'claude' || agent === 'grok') && effort !== 'auto'
                 ? effort
                 : undefined
             const resolvedModelReasoningEffort = (agent === 'codex' || agent === 'opencode') && modelReasoningEffort !== 'default'
                 ? modelReasoningEffort
                 : undefined
+            const preferredLaunchSettings = {
+                model: agent === 'agy'
+                    ? (agySelectedModel ?? 'auto')
+                    : agent === 'opencode'
+                        ? (opencodeSelectedModel ?? 'auto')
+                        : model,
+                cursorSelectedBase,
+                effort,
+                modelReasoningEffort
+            }
+            const resolvedServiceTier = agent === 'codex' && showCodexFastMode
+                ? serviceTier
+                : undefined
+            const resolvedCollaborationMode = agent === 'codex' && collaborationMode !== 'default'
+                ? collaborationMode
+                : undefined
+
+            const usesCodexFamilyPermissions = usesCodexFamilyPermissionModes(agent)
 
             if (agent === 'codex' && selectedCodexImportSession) {
                 setIsImportingCodexSession(true)
@@ -744,7 +1346,9 @@ export function NewSession(props: {
                     machineId: codexImportMachineId ?? machineId,
                     model: resolvedModel ?? null,
                     modelReasoningEffort: resolvedModelReasoningEffort ?? null,
-                    yolo: yoloMode
+                    serviceTier: resolvedServiceTier,
+                    collaborationMode: resolvedCollaborationMode ?? 'default',
+                    yolo: codexFamilyPermissionMode === 'yolo'
                 })
                 if (result.success) {
                     const importedSessionId = result.hapiSessionIds?.[0]
@@ -755,10 +1359,13 @@ export function NewSession(props: {
                     // 这里立刻 resume，避免进入会话页时先看到离线，等首条消息才触发启动。
                     const resumedSessionId = await props.api.resumeSession(
                         importedSessionId,
-                        yoloMode ? { permissionMode: 'yolo' } : undefined
+                        codexFamilyPermissionMode !== 'default'
+                            ? { permissionMode: codexFamilyPermissionMode }
+                            : undefined
                     )
                     haptic.notification('success')
                     markCodexSessionsImported([selectedCodexImportSession.id])
+                    savePreferredLaunchSettings(machineId, agent, preferredLaunchSettings)
                     clearNewSessionFormDraft()
                     setLastUsedMachineId(machineId)
                     addRecentPath(machineId, trimmedDirectory)
@@ -771,6 +1378,31 @@ export function NewSession(props: {
                 return
             }
 
+            if (agent === 'pi' && selectedPiImportSession) {
+                setIsImportingPiSession(true)
+                const result = await props.api.importPiSessions({
+                    sessionIds: [selectedPiImportSession.id],
+                    cwd: selectedPiImportSession.cwd ?? trimmedDirectory,
+                    machineId: piImportMachineId ?? machineId
+                })
+                const imported = result.results.find((item) => item.piSessionId === selectedPiImportSession.id)
+                if (imported?.error) {
+                    setIsImportingPiSession(false)
+                    haptic.notification('error')
+                    setError(formatPiImportError(imported.error.code, imported.error.message))
+                    return
+                }
+                if (!imported?.hapiSessionId) throw new Error(result.error || t('piImport.failed.body'))
+                const reopened = await props.api.reopenSession(imported.hapiSessionId)
+                haptic.notification('success')
+                savePreferredLaunchSettings(machineId, agent, preferredLaunchSettings)
+                clearNewSessionFormDraft()
+                setLastUsedMachineId(machineId)
+                addRecentPath(machineId, trimmedDirectory)
+                props.onSuccess(reopened.sessionId)
+                return
+            }
+
             const result = await spawnSession({
                 machineId,
                 directory: trimmedDirectory,
@@ -778,14 +1410,24 @@ export function NewSession(props: {
                 model: resolvedModel,
                 effort: resolvedEffort,
                 modelReasoningEffort: resolvedModelReasoningEffort,
-                yolo: agent === 'grok' ? undefined : yoloMode,
-                permissionMode: agent === 'grok' ? grokPermissionMode : undefined,
+                yolo: agent === 'grok' || usesCodexFamilyPermissions ? undefined : yoloMode,
+                permissionMode: agent === 'grok'
+                    ? grokPermissionMode
+                    : usesCodexFamilyPermissions
+                        ? codexFamilyPermissionMode
+                        : undefined,
                 sessionType,
-                worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined
+                worktreeName: sessionType === 'worktree' ? (worktreeName.trim() || undefined) : undefined,
+                serviceTier: resolvedServiceTier,
+                collaborationMode: resolvedCollaborationMode,
+                copilotAgentMode: agent === 'copilot' ? copilotAgentMode : undefined,
+                startingMode: agent === 'agy' ? 'pty' : undefined
             })
+
 
             if (result.type === 'success') {
                 haptic.notification('success')
+                savePreferredLaunchSettings(machineId, agent, preferredLaunchSettings)
                 clearNewSessionFormDraft()
                 setLastUsedMachineId(machineId)
                 addRecentPath(machineId, trimmedDirectory)
@@ -797,12 +1439,56 @@ export function NewSession(props: {
             setError(result.message)
         } catch (e) {
             setIsImportingCodexSession(false)
+            setIsImportingPiSession(false)
             haptic.notification('error')
             setError(e instanceof Error ? e.message : 'Failed to create session')
+        } finally {
+            createInFlightRef.current = false
+            setIsCreating(false)
         }
     }
 
-    const canCreate = Boolean(machineId && trimmedDirectory && !isFormDisabled && !missingWorktreeDirectory)
+    const isLaunchPreferenceValidationPending =
+        (agent === 'codex'
+            && (model !== 'auto' || modelReasoningEffort !== 'default')
+            && codexModelsState.isLoading)
+        || (agent === 'agy'
+            && agySelectedModel !== null
+            && agyModelsState.isLoading)
+        || (agent === 'cursor'
+            && (model !== 'auto' || cursorSelectedBase !== 'auto')
+            && cursorModelsState.isLoading)
+        || (agent === 'grok'
+            && deferredDirectory !== ''
+            && (model !== 'auto' || effort !== 'auto')
+            && (
+                deferredDirectoryExists === undefined
+                || (deferredDirectoryExists === true && grokModelsState.isLoading)
+            ))
+        || (agent === 'opencode'
+            && deferredDirectory !== ''
+            && opencodeSelectedModel !== null
+            && (
+                deferredDirectoryExists === undefined
+                || (deferredDirectoryExists === true && opencodeModelsState.isLoading)
+            ))
+        || (agent === 'copilot'
+            && model !== 'auto'
+            && (
+                deferredDirectoryExists === undefined
+                || (deferredDirectoryExists === true && copilotModelsState.isLoading)
+            ))
+    const fastModeSelectionPending = agent === 'codex'
+        && serviceTier === 'fast'
+        && codexModelsState.isLoading
+    const canCreate = Boolean(
+        machineId
+        && trimmedDirectory
+        && !isFormDisabled
+        && !missingWorktreeDirectory
+        && !isLaunchPreferenceValidationPending
+        && !fastModeSelectionPending
+    )
 
     return (
         <div className="flex flex-col divide-y divide-[var(--app-divider)]">
@@ -845,22 +1531,45 @@ export function NewSession(props: {
             <AgentSelector
                 agent={agent}
                 isDisabled={isFormDisabled}
-                onAgentChange={setAgent}
+                onAgentChange={handleAgentChange}
             />
             {agent === 'codex' ? (
-                <CodexImportSelectButton
+                <CodexImportActions
                     selectedSession={selectedCodexImportSession}
                     isLoading={isLoadingCodexImportSessions}
                     isDisabled={isFormDisabled}
                     error={codexImportError}
-                    onOpen={() => {
+                    onChooseHistory={() => {
                         setIsCodexImportDialogOpen(true)
                         void loadCodexImportSessions()
                     }}
                     onClear={() => setSelectedCodexImportSessionId(null)}
                 />
             ) : null}
-            {agent === 'opencode' ? (
+            {agent === 'pi' ? (
+                <PiImportActions
+                    selectedSession={selectedPiImportSession}
+                    isLoading={isLoadingPiImportSessions}
+                    isDisabled={isFormDisabled}
+                    error={piImportError}
+                    onChooseHistory={() => {
+                        setIsPiImportDialogOpen(true)
+                        void loadPiImportSessions()
+                    }}
+                    onClear={() => setSelectedPiImportSessionId(null)}
+                />
+            ) : null}
+            {agent === 'agy' ? (
+                <AgyModelSelector
+                    machineId={machineId}
+                    isLoading={agyModelsState.isLoading}
+                    error={agyModelsState.error}
+                    availableModels={agyModelsState.availableModels}
+                    selectedModel={agySelectedModel}
+                    onModelChange={setAgySelectedModel}
+                    onRetry={agyModelsState.refetch}
+                />
+            ) : agent === 'opencode' ? (
                 <OpencodeModelSelector
                     cwd={deferredDirectory}
                     machineId={machineId}
@@ -921,19 +1630,25 @@ export function NewSession(props: {
                                 ? codexModelOptions
                                 : agent === 'grok'
                                     ? grokModelOptions
+                                    : agent === 'copilot'
+                                        ? copilotModelOptions
                                 : undefined
                         }
                         isDisabled={
                             isFormDisabled
                             || (agent === 'codex' && Boolean(codexModelsState.error))
                             || (agent === 'grok' && Boolean(grokModelsState.error))
+                            || (agent === 'copilot' && Boolean(copilotModelsState.error))
                         }
                         isLoading={(agent === 'codex' && codexModelsState.isLoading)
-                            || (agent === 'grok' && grokModelsState.isLoading)}
+                            || (agent === 'grok' && grokModelsState.isLoading)
+                            || (agent === 'copilot' && copilotModelsState.isLoading)}
                         error={agent === 'codex' && codexModelsState.error
                             ? `${t('newSession.model.loadFailed')}: ${codexModelsState.error}`
                             : agent === 'grok' && grokModelsState.error
                                 ? `${t('newSession.model.loadFailed')}: ${grokModelsState.error}`
+                                : agent === 'copilot' && copilotModelsState.error
+                                    ? `${t('newSession.model.loadFailed')}: ${copilotModelsState.error}`
                                 : null}
                         onModelChange={setModel}
                     />
@@ -960,7 +1675,31 @@ export function NewSession(props: {
                 isDisabled={isFormDisabled}
                 onChange={setGrokPermissionMode}
             />
-            {agent !== 'grok' ? (
+            <CodexFamilyPermissionModeSelector
+                agent={agent}
+                value={codexFamilyPermissionMode}
+                isDisabled={isFormDisabled}
+                onChange={setCodexFamilyPermissionMode}
+            />
+            <CollaborationModeSelector
+                agent={agent}
+                value={collaborationMode}
+                isDisabled={isFormDisabled}
+                onChange={setCollaborationMode}
+            />
+            <CopilotAgentModeSelector
+                agent={agent}
+                value={copilotAgentMode}
+                isDisabled={isFormDisabled}
+                onChange={setCopilotAgentMode}
+            />
+            <FastModeSelector
+                visible={showCodexFastMode}
+                value={serviceTier}
+                isDisabled={isFormDisabled}
+                onChange={setServiceTier}
+            />
+            {agent !== 'grok' && !usesCodexFamilyPermissionModes(agent) ? (
                 <YoloToggle
                     yoloMode={yoloMode}
                     isDisabled={isFormDisabled}
@@ -975,7 +1714,7 @@ export function NewSession(props: {
             ) : null}
 
             <ActionButtons
-                isPending={isPending || isImportingCodexSession}
+                isPending={isCreating || isPending || isImportingCodexSession || isImportingPiSession}
                 canCreate={canCreate}
                 isDisabled={isFormDisabled}
                 createLabel={createLabel}
@@ -988,17 +1727,54 @@ export function NewSession(props: {
                 sessions={codexImportSessions}
                 currentCodexSessionId={selectedCodexImportSessionId}
                 currentWorkDirectory={trimmedDirectory}
-                selectionMode="single"
-                onSelectOnly={(session) => {
-                    handleSelectCodexImportSession(session)
-                    setIsCodexImportDialogOpen(false)
+                selectionMode="multiple"
+                onConfirm={async (sessionIds) => {
+                    if (sessionIds.length === 1) {
+                        const session = codexImportSessions.find((candidate) => candidate.id === sessionIds[0])
+                        if (session) {
+                            handleSelectCodexImportSession(session)
+                            setIsCodexImportDialogOpen(false)
+                        }
+                        return
+                    }
+                    await handleBulkImportCodexSessions(sessionIds)
                 }}
-                onConfirm={async () => {}}
-                onRestartCodexDesktop={async () => { await loadCodexImportSessions() }}
+                onRestartCodexDesktop={handleRestartCodexDesktop}
                 onArchiveSession={handleArchiveCodexImportSession}
-                isPending={false}
-                isRestartingCodexDesktop={false}
+                isPending={isBulkImportingCodexSessions}
+                isRestartingCodexDesktop={isRestartingCodexDesktop}
                 isLoading={isLoadingCodexImportSessions}
+            />
+            <PiSessionImportDialog
+                isOpen={isPiImportDialogOpen}
+                onClose={() => setIsPiImportDialogOpen(false)}
+                sessions={piImportSessions}
+                currentSessionId={selectedPiImportSessionId}
+                currentWorkDirectory={trimmedDirectory}
+                onConfirm={async (sessionIds) => {
+                    if (sessionIds.length === 1) {
+                        const session = piImportSessions.find((candidate) => candidate.id === sessionIds[0])
+                        if (session) {
+                            handleSelectPiImportSession(session)
+                            setIsPiImportDialogOpen(false)
+                        }
+                        return
+                    }
+                    await handleBulkImportPiSessions(sessionIds)
+                }}
+                isPending={isBulkImportingPiSessions}
+                isLoading={isLoadingPiImportSessions}
+            />
+            <ConfirmDialog
+                isOpen={isDuplicateMergeConfirmOpen && duplicateSessionGroups.length > 0}
+                onClose={closeDuplicateMergeDialog}
+                title={t('codexSync.duplicates.confirm.title')}
+                description={t('codexSync.duplicates.confirm.description')}
+                confirmLabel={t('codexSync.duplicates.confirm.confirm')}
+                confirmingLabel={t('codexSync.duplicates.confirm.confirming')}
+                onConfirm={handleMergeDuplicateSessions}
+                isPending={isMergingDuplicateSessions}
+                centerTitle
             />
         </div>
     )

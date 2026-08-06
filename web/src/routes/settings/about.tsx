@@ -6,7 +6,7 @@ import { CheckForUpdatesRow } from '@/components/CheckForUpdatesRow'
 export default function SettingsAboutPage() {
     const { t } = useTranslation()
     return (
-        <SettingsPageContent title={t('settings.about.title')} description={t('settings.about.description')}>
+        <SettingsPageContent description={t('settings.about.description')}>
             <SettingsSection>
                 <SettingsRow label={t('settings.about.website')} trailing={
                     <a href="https://hapi.run" target="_blank" rel="noopener noreferrer" className="text-[var(--app-link)] hover:underline">hapi.run</a>

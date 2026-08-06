@@ -4,9 +4,11 @@ import { randomUUID } from 'node:crypto'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { AGENT_MESSAGE_PAYLOAD_TYPE } from '@hapi/protocol'
+import type { CodexCollaborationMode } from '@hapi/protocol/types'
 import { Hono } from 'hono'
 import type { Machine, SyncEngine } from '../../sync/syncEngine'
 import type { Store, StoredMessage } from '../../store'
+import { truncateOversizedMessageContent } from '../../store/contentCodec'
 import type { WebAppEnv } from '../middleware/auth'
 
 type ScriptLogKind = 'sync' | 'restart'
@@ -117,6 +119,7 @@ type ImportCandidate = {
     active: boolean
     updatedAt: number
     metadata: Record<string, unknown> | null
+    persisted: boolean
 }
 
 type ImportTargetSelection = {
@@ -130,6 +133,8 @@ type SyncSessionRequestParseResult = {
     machineId?: string | null
     model?: string | null
     modelReasoningEffort?: string | null
+    serviceTier?: string | null
+    collaborationMode?: CodexCollaborationMode
     yolo?: boolean
     error?: string
 }
@@ -169,6 +174,11 @@ const NO_SYNC_SESSION_SELECTED_ERROR = '未选择需要导入的 Codex 会话'
 const CODEX_TRANSCRIPT_IMPORT_NAMESPACE_ERROR = 'Codex transcript import is not available outside the default namespace'
 const DEFAULT_SCRIPT_TIMEOUT_MS = 60_000
 const DEFAULT_CODEX_SESSION_SCAN_LIMIT = 500
+const DARWIN_CODEX_APP_NAME = 'Codex'
+const DARWIN_CODEX_APP_CANDIDATES = [
+    '/Applications/Codex.app',
+    join(homedir(), 'Applications', 'Codex.app')
+]
 
 function resolveLocalPath(pathValue: string): string {
     return isAbsolute(pathValue) ? pathValue : resolve(process.cwd(), pathValue)
@@ -926,7 +936,7 @@ function resolveCodexImportMachineId(
         const resolved = resolveImportMachineId(cwd, namespace, engine)
         if (resolved) return resolved
     }
-    return onlineMachines.length === 1 ? onlineMachines[0].id : null
+    return onlineMachines.length >= 1 ? onlineMachines[0].id : null
 }
 
 function asRemoteCodexSessions(value: unknown, requireMessages: boolean): RemoteCodexSession[] {
@@ -1047,7 +1057,11 @@ function normalizeComparableAgentData(value: unknown): unknown {
 }
 
 function normalizeComparableContent(content: unknown): string | null {
-    const record = asRecord(content)
+    // Stored rows are truncated at ingest (contentCodec) while transcript
+    // messages arrive in full; truncation is idempotent, so applying it here
+    // makes both sides of the prefix comparison canonical. Pre-codec stored
+    // rows (never truncated) get normalized the same way.
+    const record = asRecord(truncateOversizedMessageContent(content))
     if (!record) {
         return null
     }
@@ -1079,7 +1093,9 @@ function normalizeComparableContent(content: unknown): string | null {
 
 function getComparableStoredMessageKey(message: StoredMessage): string {
     // 中文注释：重复会话合并时优先按标准 user/agent 结构去重；遇到非标准消息再回退到稳定序列化，确保不会遗漏相同内容。
-    return normalizeComparableContent(message.content) ?? stableSerialize(message.content)
+    // Fallback also truncates so a pre-codec (full) row and a post-codec
+    // (truncated) copy of the same message still dedupe to one key.
+    return normalizeComparableContent(message.content) ?? stableSerialize(truncateOversizedMessageContent(message.content))
 }
 
 function collectImportCandidates(
@@ -1087,27 +1103,43 @@ function collectImportCandidates(
     namespace: string,
     getSyncEngine?: () => SyncEngine | null
 ): ImportCandidate[] {
-    const engineSessions = getSyncEngine?.()?.getSessionsByNamespace(namespace) ?? []
-    if (engineSessions.length > 0) {
-        return engineSessions.map((session) => ({
+    const candidatesBySessionId = new Map<string, ImportCandidate>()
+    for (const session of store.sessions.getSessionsByNamespace(namespace)) {
+        candidatesBySessionId.set(session.id, {
             sessionId: session.id,
             active: session.active,
             updatedAt: session.updatedAt,
-            metadata: asRecord(session.metadata)
-        }))
+            metadata: asRecord(session.metadata),
+            persisted: true
+        })
     }
 
-    return store.sessions.getSessionsByNamespace(namespace).map((session) => ({
-        sessionId: session.id,
-        active: session.active,
-        updatedAt: session.updatedAt,
-        metadata: asRecord(session.metadata)
-    }))
+    const engineSessions = getSyncEngine?.()?.getSessionsByNamespace(namespace) ?? []
+    for (const session of engineSessions) {
+        const existing = candidatesBySessionId.get(session.id)
+        candidatesBySessionId.set(session.id, {
+            sessionId: session.id,
+            active: session.active || Boolean(existing?.active),
+            updatedAt: Math.max(session.updatedAt, existing?.updatedAt ?? 0),
+            metadata: asRecord(session.metadata) ?? existing?.metadata ?? null,
+            persisted: Boolean(existing?.persisted)
+        })
+    }
+
+    return Array.from(candidatesBySessionId.values())
 }
 
 function getCodexImportIds(metadata: Record<string, unknown> | null | undefined): string[] {
-    return [metadata?.codexSessionId, metadata?.codexSourceSessionId]
-        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+    return Array.from(new Set([metadata?.codexSessionId, metadata?.codexSourceSessionId]
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)))
+}
+
+function isImportCandidateReusable(candidate: ImportCandidate): boolean {
+    const lifecycleState = candidate.metadata?.lifecycleState
+    if (lifecycleState === 'archived' || lifecycleState === 'deleted') {
+        return false
+    }
+    return true
 }
 
 function selectImportTargetSession(
@@ -1118,6 +1150,7 @@ function selectImportTargetSession(
     sourceMachineId?: string | null
 ): ImportTargetSelection {
     const relatedCandidates = candidates
+        .filter((candidate) => candidate.persisted && isImportCandidateReusable(candidate))
         .filter((candidate) => (
             candidate.metadata?.codexSessionId === codexSessionId
             || candidate.metadata?.codexSourceSessionId === codexSessionId
@@ -1178,6 +1211,9 @@ function listDuplicateCodexSessionGroups(
 
     const groups = new Map<string, ImportCandidate[]>()
     for (const candidate of collectImportCandidates(store, namespace, getSyncEngine)) {
+        if (!candidate.persisted || !isImportCandidateReusable(candidate)) {
+            continue
+        }
         for (const codexSessionId of getCodexImportIds(candidate.metadata)) {
             if (!requestedSessionIds.has(codexSessionId)) {
                 continue
@@ -1245,7 +1281,8 @@ async function mergeSingleDuplicateCodexSessionGroup(options: {
     getSyncEngine?: () => SyncEngine | null
 }): Promise<CodexDuplicateSessionGroup> {
     const engine = options.getSyncEngine?.() ?? null
-    const sessionStates = options.group.sessions
+    const uniqueSessions = Array.from(new Map(options.group.sessions.map((session) => [session.sessionId, session])).values())
+    const sessionStates = uniqueSessions
         .map((candidate) => ({
             ...candidate,
             storedMessages: options.store.messages.getAllMessages(candidate.sessionId),
@@ -1410,6 +1447,23 @@ function isCodexLauncherAvailable(): boolean {
     })
 }
 
+function getDarwinCodexAppCandidates(): string[] {
+    return [
+        process.env.HAPI_CODEX_APP_PATH?.trim() ?? '',
+        ...DARWIN_CODEX_APP_CANDIDATES
+    ].filter(Boolean)
+}
+
+function isDarwinCodexAppInstalled(): boolean {
+    return getDarwinCodexAppCandidates().some(candidate => {
+        try {
+            return existsSync(candidate)
+        } catch {
+            return false
+        }
+    })
+}
+
 function isCodexDesktopPath(pathValue: string): boolean {
     return /\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\(?:Codex|resources\\codex)\.exe$/i.test(pathValue)
 }
@@ -1443,6 +1497,10 @@ function isCodexDesktopPackageInstalled(): boolean {
 }
 
 function isCodexDesktopInstallAvailable(): boolean {
+    if (process.platform === 'darwin') {
+        return isDarwinCodexAppInstalled() || isCodexLauncherAvailable()
+    }
+
     if (process.platform !== 'win32') {
         return isCodexLauncherAvailable()
     }
@@ -1461,6 +1519,18 @@ function isCodexDesktopInstallAvailable(): boolean {
 }
 
 function isCodexDesktopRunning(): boolean {
+    if (process.platform === 'darwin') {
+        try {
+            const result = spawnSync('pgrep', ['-x', DARWIN_CODEX_APP_NAME], {
+                encoding: 'utf-8',
+                timeout: 5000
+            })
+            return result.status === 0
+        } catch {
+            return false
+        }
+    }
+
     if (process.platform !== 'win32') {
         return false
     }
@@ -1620,11 +1690,128 @@ async function runPowerShellScript(scriptPath: string, workspace: string, script
     throw lastError instanceof Error ? lastError : new Error(String(lastError))
 }
 
+function getDarwinCodexOpenTarget(): string {
+    return getDarwinCodexAppCandidates().find((candidate) => {
+        try {
+            return existsSync(candidate)
+        } catch {
+            return false
+        }
+    }) ?? DARWIN_CODEX_APP_NAME
+}
+
+export function getDarwinCodexOpenArgs(target: string): string[] {
+    return target.endsWith('.app') ? [target] : ['-a', target]
+}
+
+async function restartDarwinCodexDesktop(workspace: string): Promise<{ pid: number; command: string; output: string }> {
+    const output: string[] = []
+    try {
+        const quit = spawnSync('osascript', ['-e', `tell application "${DARWIN_CODEX_APP_NAME}" to quit`], {
+            encoding: 'utf-8',
+            timeout: 5000
+        })
+        const quitOutput = `${quit.stdout ?? ''}${quit.stderr ?? ''}`.trim()
+        if (quitOutput) {
+            output.push(quitOutput)
+        }
+    } catch (error) {
+        output.push(error instanceof Error ? error.message : String(error))
+    }
+
+    return await new Promise((resolvePromise, rejectPromise) => {
+        const target = getDarwinCodexOpenTarget()
+        const child = spawn('open', getDarwinCodexOpenArgs(target), {
+            cwd: workspace,
+            detached: true,
+            stdio: ['ignore', 'pipe', 'pipe']
+        })
+        const launchOutput: string[] = []
+        let settled = false
+        let timeout: ReturnType<typeof setTimeout> | null = null
+
+        const cleanup = () => {
+            if (timeout) {
+                clearTimeout(timeout)
+            }
+            child.off('error', onError)
+            child.off('exit', onExit)
+        }
+
+        const settle = (callback: () => void) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            callback()
+        }
+
+        const onError = (error: Error) => {
+            settle(() => rejectPromise(error))
+        }
+
+        const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+            const combinedLaunchOutput = launchOutput.join('').trim()
+            if (combinedLaunchOutput) {
+                output.push(combinedLaunchOutput)
+            }
+            if (code === 0) {
+                child.unref()
+                settle(() => resolvePromise({
+                    pid: child.pid ?? 0,
+                    command: 'open',
+                    output: output.join('\n').trim()
+                }))
+                return
+            }
+            const detail = output.length > 0 ? `\n${output.join('\n')}` : ''
+            settle(() => rejectPromise(new Error(`open exited with code ${code ?? 'null'}${signal ? ` signal ${signal}` : ''}.${detail}`)))
+        }
+
+        timeout = setTimeout(() => {
+            child.kill()
+            settle(() => rejectPromise(new Error(SCRIPT_TIMEOUT_ERROR)))
+        }, getScriptTimeoutMs())
+
+        child.stdout?.on('data', (chunk) => launchOutput.push(String(chunk)))
+        child.stderr?.on('data', (chunk) => launchOutput.push(String(chunk)))
+        child.once('error', onError)
+        child.once('exit', onExit)
+    })
+}
+
 async function launchRestartScript(): Promise<ScriptLaunchResponse> {
     const scriptPath = getRestartScriptPath()
     const workspace = getWorkspace(scriptPath)
 
     if (!existsSync(scriptPath)) {
+        if (process.platform === 'darwin' && !process.env[RESTART_SCRIPT_ENV_NAME]?.trim()) {
+            try {
+                const launched = await restartDarwinCodexDesktop(workspace)
+                const output = launched.output
+                appendScriptLog(
+                    workspace,
+                    'restart',
+                    `SUCCESS: ${RESTART_SCRIPT_MESSAGE}; pid=${launched.pid}; command=${launched.command}${output ? `; output=${output}` : ''}`
+                )
+                return {
+                    success: true,
+                    message: RESTART_SCRIPT_MESSAGE,
+                    pid: launched.pid,
+                    command: launched.command,
+                    cwd: workspace,
+                    output
+                }
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                appendScriptLog(workspace, 'restart', `FAILED: ${message}; native=darwin`)
+                return {
+                    success: false,
+                    error: message,
+                    cwd: workspace
+                }
+            }
+        }
+
         appendScriptLog(workspace, 'restart', `FAILED: Script not found: ${scriptPath}`)
         return {
             success: false,
@@ -1679,7 +1866,7 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         return { sessionIds: [] }
     }
 
-    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; yolo?: unknown }
+    const bodyRecord = body as { sessionIds?: unknown; cwd?: unknown; machineId?: unknown; model?: unknown; modelReasoningEffort?: unknown; serviceTier?: unknown; collaborationMode?: unknown; yolo?: unknown }
     const rawSessionIds = bodyRecord.sessionIds
     if (!Array.isArray(rawSessionIds)) {
         return { sessionIds: [], error: 'Invalid sessionIds' }
@@ -1698,6 +1885,14 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
 
     const hasModel = Object.prototype.hasOwnProperty.call(bodyRecord, 'model')
     const hasModelReasoningEffort = Object.prototype.hasOwnProperty.call(bodyRecord, 'modelReasoningEffort')
+    const hasServiceTier = Object.prototype.hasOwnProperty.call(bodyRecord, 'serviceTier')
+    const hasCollaborationMode = Object.prototype.hasOwnProperty.call(bodyRecord, 'collaborationMode')
+    if (hasServiceTier && bodyRecord.serviceTier !== null && bodyRecord.serviceTier !== 'fast' && bodyRecord.serviceTier !== 'standard') {
+        return { sessionIds: [], error: 'Invalid serviceTier' }
+    }
+    if (hasCollaborationMode && bodyRecord.collaborationMode !== 'default' && bodyRecord.collaborationMode !== 'plan') {
+        return { sessionIds: [], error: 'Invalid collaborationMode' }
+    }
 
     // 中文注释：前端允许多选，这里按 Codex thread 去重，避免重复导入同一条本地 transcript。
     return {
@@ -1706,6 +1901,8 @@ function parseSyncSessionRequest(body: unknown): SyncSessionRequestParseResult {
         machineId: typeof bodyRecord.machineId === 'string' && bodyRecord.machineId.trim() ? bodyRecord.machineId.trim() : null,
         model: hasModel ? (typeof bodyRecord.model === 'string' && bodyRecord.model.trim() ? bodyRecord.model.trim() : null) : undefined,
         modelReasoningEffort: hasModelReasoningEffort ? (typeof bodyRecord.modelReasoningEffort === 'string' && bodyRecord.modelReasoningEffort.trim() ? bodyRecord.modelReasoningEffort.trim() : null) : undefined,
+        serviceTier: hasServiceTier ? bodyRecord.serviceTier as 'fast' | 'standard' | null : undefined,
+        collaborationMode: hasCollaborationMode ? bodyRecord.collaborationMode as CodexCollaborationMode : undefined,
         yolo: bodyRecord.yolo === true
     }
 }
@@ -1930,6 +2127,8 @@ export async function importSelectedCodexSessions(options: {
     localSessions?: RemoteCodexSession[]
     model?: string | null
     modelReasoningEffort?: string | null
+    serviceTier?: string | null
+    collaborationMode?: CodexCollaborationMode
     yolo?: boolean
     machineId?: string | null
 }): Promise<ScriptLaunchResponse> {
@@ -1953,6 +2152,23 @@ export async function importSelectedCodexSessions(options: {
             machineId: options.machineId
         })
         results.push(result)
+
+        if (result.success && (options.serviceTier !== undefined || options.collaborationMode !== undefined)) {
+            const importedSessionId = result.hapiSessionIds?.[0]
+            const engine = options.getSyncEngine?.() ?? null
+            if (!importedSessionId || !engine) {
+                return createImportErrorResponse(codexSessionIds, 'Imported session config could not be applied before resume')
+            }
+            try {
+                await engine.applySessionConfig(importedSessionId, {
+                    ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+                    ...(options.collaborationMode !== undefined ? { collaborationMode: options.collaborationMode } : {})
+                })
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                return createImportErrorResponse(codexSessionIds, `Failed to apply imported session config: ${message}`)
+            }
+        }
 
         if (!result.success) {
             return {
@@ -2088,6 +2304,8 @@ export function createCodexDesktopRoutes(options: {
             machineId: remote.machineId ?? null,
             model: parsed.model,
             modelReasoningEffort: parsed.modelReasoningEffort,
+            serviceTier: parsed.serviceTier,
+            collaborationMode: parsed.collaborationMode,
             yolo: parsed.yolo
         })
         return c.json({

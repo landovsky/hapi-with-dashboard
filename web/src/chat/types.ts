@@ -29,6 +29,7 @@ export type AgentEvent =
     | { type: 'recap'; text: string }
     | { type: 'thread-goal-updated'; goal: ThreadGoal; threadId?: string; turnId?: string }
     | { type: 'thread-goal-cleared'; threadId?: string }
+    | { type: 'abort-restore'; text: string }
     | ({ type: string } & Record<string, unknown>)
 
 export type ToolResultPermission = {
@@ -45,6 +46,9 @@ export type ToolUse = {
     name: string
     input: unknown
     description: string | null
+    nativeTitle?: string | null
+    nativeKind?: string | null
+    progress?: unknown
     uuid: string
     parentUUID: string | null
 }
@@ -90,6 +94,7 @@ export type NormalizedAgentContent =
         type: 'text'
         text: string
         uuid: string
+        streamId?: string
         parentUUID: string | null
     }
     | {
@@ -125,6 +130,12 @@ export type NormalizedMessage = ({
     localId: string | null
     createdAt: number
     isSidechain: boolean
+    // The tool_use id of the Agent/Task tool_use that spawned this sidechain
+    // message (SDK's parent_tool_use_id, preserved end-to-end). The tracer
+    // groups sidechain messages under their parent Agent card by this id
+    // directly, falling back to prompt exact-match only for older stored
+    // messages that predate this field.
+    parentToolUseId?: string | null
     meta?: unknown
     usage?: UsageData
     status?: MessageStatus
@@ -175,6 +186,8 @@ export type ChatToolCall = {
     execStartedAt: number | null
     execCompletedAt: number | null
     description: string | null
+    nativeTitle?: string | null
+    nativeKind?: string | null
     result?: unknown
     permission?: ToolPermission
 }

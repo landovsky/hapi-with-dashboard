@@ -9,14 +9,21 @@ import {
 } from 'react'
 import { useTranslation } from '@/lib/use-translation'
 import { HoverTooltip } from '@/components/HoverTooltip'
+import { safeCopyToClipboard } from '@/lib/clipboard'
+import { buildSessionReferenceText } from '@/lib/sessionReference'
+import { usePlatform } from '@/hooks/usePlatform'
+import { CopyIcon } from '@/components/icons'
 
 type SessionActionMenuProps = {
     isOpen: boolean
     onClose: () => void
+    sessionId: string
+    sessionTitle: string
     sessionActive: boolean
     onRename: () => void
     onExport?: () => void
     onSyncCodex?: () => void
+    onSyncPi?: () => void
     onArchive: () => void
     onReopen?: () => void
     reopenDisabledReason?: string
@@ -101,8 +108,8 @@ function ReopenIcon(props: { className?: string }) {
             strokeLinejoin="round"
             className={props.className}
         >
-            <path d="M3 12a9 9 0 1 0 3-6.7" />
-            <polyline points="3 4 3 10 9 10" />
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+            <path d="M3 3v5h5" />
         </svg>
     )
 }
@@ -121,10 +128,10 @@ function SyncIcon(props: { className?: string }) {
             strokeLinejoin="round"
             className={props.className}
         >
-            <path d="M3 12a9 9 0 0 1 15.5-6.2" />
-            <path d="M18 3v6h-6" />
-            <path d="M21 12a9 9 0 0 1-15.5 6.2" />
-            <path d="M6 21v-6h6" />
+            <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+            <path d="M21 3v5h-5" />
+            <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+            <path d="M3 21v-5h5" />
         </svg>
     )
 }
@@ -160,13 +167,17 @@ type MenuPosition = {
 
 export function SessionActionMenu(props: SessionActionMenuProps) {
     const { t } = useTranslation()
+    const { haptic } = usePlatform()
     const {
         isOpen,
         onClose,
+        sessionId,
+        sessionTitle,
         sessionActive,
         onRename,
         onExport,
         onSyncCodex,
+        onSyncPi,
         onArchive,
         onReopen,
         reopenDisabledReason,
@@ -183,6 +194,16 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleRename = () => {
         onClose()
         onRename()
+    }
+
+    const handleCopyReference = async () => {
+        onClose()
+        try {
+            await safeCopyToClipboard(buildSessionReferenceText(sessionTitle, sessionId))
+            haptic.notification('success')
+        } catch {
+            haptic.notification('error')
+        }
     }
 
     const handleArchive = () => {
@@ -203,6 +224,11 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
     const handleSyncCodex = () => {
         onClose()
         onSyncCodex?.()
+    }
+
+    const handleSyncPi = () => {
+        onClose()
+        onSyncPi?.()
     }
 
     const handleDelete = () => {
@@ -289,7 +315,7 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
 
     const menuStyle: CSSProperties | undefined = menuPosition
         ? {
-            top: menuPosition.top,
+            top: `max(${menuPosition.top}px, calc(env(safe-area-inset-top) + 8px))`,
             left: menuPosition.left,
             transformOrigin: menuPosition.transformOrigin
         }
@@ -326,6 +352,16 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     {t('session.action.rename')}
                 </button>
 
+                <button
+                    type="button"
+                    role="menuitem"
+                    className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                    onClick={() => void handleCopyReference()}
+                >
+                    <CopyIcon className="h-[18px] w-[18px] text-[var(--app-hint)]" />
+                    {t('session.action.copyReference')}
+                </button>
+
                 {onExport ? (
                     <button
                         type="button"
@@ -347,6 +383,18 @@ export function SessionActionMenu(props: SessionActionMenuProps) {
                     >
                         <SyncIcon className="text-[var(--app-hint)]" />
                         {t('session.action.syncCodex')}
+                    </button>
+                ) : null}
+
+                {onSyncPi ? (
+                    <button
+                        type="button"
+                        role="menuitem"
+                        className={`${baseItemClassName} hover:bg-[var(--app-subtle-bg)]`}
+                        onClick={handleSyncPi}
+                    >
+                        <SyncIcon className="text-[var(--app-hint)]" />
+                        {t('session.action.syncPi')}
                     </button>
                 ) : null}
 

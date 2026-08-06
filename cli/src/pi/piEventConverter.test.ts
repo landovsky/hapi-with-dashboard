@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { convertPiEvent } from './piEventConverter';
+import { convertPiEvent, convertPiTurnUsage } from './piEventConverter';
 import type { PiAgentEvent } from './types';
 
 describe('convertPiEvent', () => {
@@ -73,6 +73,18 @@ describe('convertPiEvent', () => {
         }]);
     });
 
+    it('maps tool execution progress onto the running tool call id', () => {
+        expect(convertPiEvent({
+            type: 'tool_execution_update',
+            toolCallId: 'tc-1',
+            toolName: 'read_file',
+            args: { path: '/foo.ts' },
+            partialResult: { linesRead: 10 },
+        })).toEqual([{
+            type: 'tool_call', id: 'tc-1', name: 'read_file', input: { path: '/foo.ts' }, status: 'in_progress', progress: { linesRead: 10 },
+        }]);
+    });
+
     it('should convert tool_execution_end (success) to tool_result AgentMessage', () => {
         const result = convertPiEvent({
             type: 'tool_execution_end',
@@ -105,34 +117,16 @@ describe('convertPiEvent', () => {
         }]);
     });
 
-    it('should handle tool_execution_end with missing result', () => {
-        const result = convertPiEvent({
-            type: 'tool_execution_end',
-            toolCallId: 'tc-1',
-            toolName: 'read_file',
-            isError: false
-        } as any);
-        expect(result).toEqual([{
-            type: 'tool_result',
-            id: 'tc-1',
-            output: undefined,
-            status: 'completed'
-        }]);
+    it('drops malformed tool completion events instead of emitting an uncorrelated result', () => {
+        expect(convertPiEvent({
+            type: 'tool_execution_end', toolCallId: 'tc-1', toolName: 'read_file', isError: false,
+        } as never)).toEqual([]);
+        expect(convertPiEvent({
+            type: 'tool_execution_end', toolName: 'read_file', result: 'ok', isError: false,
+        } as never)).toEqual([]);
     });
 
-    it('should handle tool_execution_end with missing toolCallId', () => {
-        const result = convertPiEvent({
-            type: 'tool_execution_end',
-            toolName: 'read_file',
-            result: 'ok',
-            isError: false
-        } as any);
-        expect(result).toHaveLength(1);
-        expect(result[0].type).toBe('tool_result');
-        expect((result[0] as any).id).toBeUndefined();
-    });
-
-    it('should convert turn_end to usage + turn_complete (2 messages)', () => {
+    it('should defer turn usage and convert only turn completion', () => {
         const result = convertPiEvent({
             type: 'turn_end',
             message: {
@@ -148,18 +142,67 @@ describe('convertPiEvent', () => {
             toolResults: []
         });
 
-        expect(result).toHaveLength(2);
-        expect(result[0]).toEqual({
+        expect(result).toEqual([{
+            type: 'turn_complete',
+            stopReason: 'stop'
+        }]);
+    });
+
+    it('should build usage from Pi authoritative context stats', () => {
+        const result = convertPiTurnUsage({
+            type: 'turn_end',
+            message: {
+                usage: { input: 100, output: 200, cacheRead: 10, cacheWrite: 5, totalTokens: 315 }
+            }
+        }, { tokens: 342, contextWindow: 200_000 });
+
+        expect(result).toEqual({
             type: 'usage',
             inputTokens: 100,
             outputTokens: 200,
             totalTokens: 315,
-            cacheReadTokens: 10
+            cacheReadTokens: 10,
+            cacheCreationTokens: 5,
+            contextTokens: 342,
+            contextWindow: 200_000
         });
-        expect(result[1]).toEqual({
-            type: 'turn_complete',
-            stopReason: 'stop'
+    });
+
+    it('should fall back to positive totalTokens when stats are unavailable', () => {
+        const result = convertPiTurnUsage({
+            type: 'turn_end',
+            message: {
+                usage: { input: 100, output: 200, cacheRead: 10, cacheWrite: 5, totalTokens: 315 }
+            }
+        }, undefined);
+
+        expect(result).toMatchObject({
+            type: 'usage',
+            totalTokens: 315,
+            contextTokens: 315
         });
+    });
+
+    it('should preserve prior usage when Pi explicitly reports unknown context', () => {
+        const result = convertPiTurnUsage({
+            type: 'turn_end',
+            message: {
+                usage: { input: 100, output: 200, cacheRead: 10, cacheWrite: 5, totalTokens: 315 }
+            }
+        }, null);
+
+        expect(result).toBeNull();
+    });
+
+    it('should skip all-zero error or aborted usage', () => {
+        const result = convertPiTurnUsage({
+            type: 'turn_end',
+            message: {
+                usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 }
+            }
+        }, { tokens: 342, contextWindow: 200_000 });
+
+        expect(result).toBeNull();
     });
 
     it('should convert turn_end with toolUse stopReason', () => {
@@ -172,8 +215,8 @@ describe('convertPiEvent', () => {
             toolResults: []
         });
 
-        expect(result).toHaveLength(2);
-        expect(result[1]).toEqual({
+        expect(result).toHaveLength(1);
+        expect(result[0]).toEqual({
             type: 'turn_complete',
             stopReason: 'toolUse'
         });

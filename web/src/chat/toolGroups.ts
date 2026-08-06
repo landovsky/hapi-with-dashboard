@@ -1,4 +1,5 @@
 import type { ChatBlock, ToolCallBlock } from '@/chat/types'
+import { getCodexCommandActions, isCodexExplorationTool } from '@/chat/codexCommandPresentation'
 import { isSubagentToolName } from '@/chat/subagentTool'
 import { isAskUserQuestionToolName } from '@/components/ToolCard/askUserQuestion'
 import { isRequestUserInputToolName } from '@/components/ToolCard/requestUserInput'
@@ -30,14 +31,31 @@ export type ToolGroupBlock = {
     defaultOpen: boolean
     historyState: 'complete' | 'needs-older-history'
     needsOlderHistory: boolean
+    activityTitle?: string | null
+    presentationMode?: 'default' | 'codex-exploration'
     summary: ToolGroupSummary
 }
 
 export type VisibleChatBlock = ChatBlock | ToolGroupBlock
 
+export type VisibleChatBlockRole = 'user' | 'assistant' | 'system'
+
+/**
+ * The role a block renders under in the thread. `@assistant-ui/react` joins
+ * adjacent assistant-role blocks into a single card, so this also determines
+ * how many rows a run of blocks actually produces on screen.
+ */
+export function visibleBlockRole(block: VisibleChatBlock): VisibleChatBlockRole {
+    if (block.kind === 'user-text') return 'user'
+    if (block.kind === 'agent-event') return 'system'
+    if (block.kind === 'cli-output') return block.source === 'user' ? 'user' : 'assistant'
+    return 'assistant'
+}
+
 type ToolGroupingOptions = {
     hasMoreMessages: boolean
     previousGroups?: ToolGroupBlock[]
+    codexExplorationCollapsed?: boolean
 }
 
 const PLAN_TOOL_NAMES = new Set([
@@ -55,12 +73,19 @@ const MILESTONE_TOOL_NAMES = new Set([
     'TeamCreate',
     'TeamDelete',
     'SendMessage',
+    // agy's transitional task-log chip — keep it standalone (like SendMessage)
+    // so it reads as a thin marker instead of being folded into a tool group.
+    'AgyTaskLog',
     'Skill',
     'spawn_agent',
     'send_input',
+    'send_message',
     'resume_agent',
+    'followup_task',
     'wait_agent',
-    'close_agent'
+    'close_agent',
+    'interrupt_agent',
+    'list_agents'
 ])
 
 const INTERACTIVE_TOOL_NAMES = new Set([
@@ -90,7 +115,7 @@ export function getToolGroupActionKind(block: ToolCallBlock): ToolGroupActionKin
 
     if (name === 'Read' || name === 'NotebookRead') return 'read'
     if (name === 'Grep' || name === 'Glob' || name === 'LS') return 'search'
-    if (name === 'Bash' || name === 'CodexBash' || name === 'shell_command') return 'command'
+    if (name === 'Bash' || name === 'CodexBash' || name === 'shell_command' || name === 'run_shell_command') return 'command'
     if (name === 'Edit' || name === 'MultiEdit' || name === 'Write' || name === 'NotebookEdit' || name === 'CodexPatch' || name === 'CodexDiff') {
         return 'mutation'
     }
@@ -201,7 +226,15 @@ export function isEligibleForToolGrouping(block: ToolCallBlock): boolean {
     if (PLAN_TOOL_NAMES.has(block.tool.name)) return false
     if (MILESTONE_TOOL_NAMES.has(block.tool.name)) return false
     if (isInteractiveToolBlock(block)) return false
+    if (block.tool.name === 'CodexBash' && getCodexCommandActions(block).length > 0) {
+        return isCodexExplorationTool(block)
+    }
     return true
+}
+
+function getGroupingFamily(block: ToolCallBlock): 'default' | 'codex-exploration' | null {
+    if (!isEligibleForToolGrouping(block)) return null
+    return isCodexExplorationTool(block) ? 'codex-exploration' : 'default'
 }
 
 function createToolGroupId(
@@ -235,7 +268,12 @@ export function buildVisibleChatBlocks(
 
     for (let index = 0; index < blocks.length; index += 1) {
         const block = blocks[index]
-        if (block.kind !== 'tool-call' || !isEligibleForToolGrouping(block)) {
+        if (block.kind !== 'tool-call') {
+            visibleBlocks.push(block)
+            continue
+        }
+        const groupingFamily = getGroupingFamily(block)
+        if (!groupingFamily) {
             visibleBlocks.push(block)
             continue
         }
@@ -244,20 +282,25 @@ export function buildVisibleChatBlocks(
         let cursor = index + 1
         while (cursor < blocks.length) {
             const candidate = blocks[cursor]
-            if (candidate.kind !== 'tool-call' || !isEligibleForToolGrouping(candidate)) {
+            if (candidate.kind !== 'tool-call' || getGroupingFamily(candidate) !== groupingFamily) {
                 break
             }
             tools.push(candidate)
             cursor += 1
         }
 
-        if (tools.length < 2) {
+        if (tools.length < 2 && groupingFamily !== 'codex-exploration') {
             visibleBlocks.push(block)
             continue
         }
 
         const startsAtOldestVisibleBoundary = visibleBlocks.length === 0
         const needsOlderHistory = options.hasMoreMessages && startsAtOldestVisibleBoundary
+        const previousBlock = visibleBlocks.at(-1)
+        const activityTitle = previousBlock?.kind === 'tool-call'
+            && previousBlock.tool.name === 'CodexReasoning'
+            ? getInputStringAny(previousBlock.tool.input, ['title'])
+            : null
         visibleBlocks.push({
             kind: 'tool-group',
             id: createToolGroupId(tools, needsOlderHistory, previousGroups),
@@ -266,9 +309,11 @@ export function buildVisibleChatBlocks(
             firstToolId: tools[0].id,
             lastToolId: tools[tools.length - 1].id,
             tools,
-            defaultOpen: false,
+            defaultOpen: groupingFamily === 'codex-exploration' && options.codexExplorationCollapsed === false,
             historyState: needsOlderHistory ? 'needs-older-history' : 'complete',
             needsOlderHistory,
+            activityTitle,
+            presentationMode: groupingFamily,
             summary: summarizeToolGroup(tools)
         })
         index = cursor - 1

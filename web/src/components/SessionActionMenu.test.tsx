@@ -2,6 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { I18nProvider } from '@/lib/i18n-context'
 import { SessionActionMenu } from '@/components/SessionActionMenu'
+import { SESSION_REFERENCE_STEER_SUFFIX } from '@hapi/protocol/sessionCitation'
+
+vi.mock('@/hooks/usePlatform', () => ({
+    usePlatform: () => ({
+        haptic: { notification: vi.fn(), impact: vi.fn() },
+    }),
+}))
 
 afterEach(() => cleanup())
 
@@ -9,6 +16,8 @@ function renderMenu(overrides: Partial<React.ComponentProps<typeof SessionAction
     const defaults: React.ComponentProps<typeof SessionActionMenu> = {
         isOpen: true,
         onClose: vi.fn(),
+        sessionId: 'sess-123',
+        sessionTitle: 'Test session',
         sessionActive: false,
         onRename: vi.fn(),
         onArchive: vi.fn(),
@@ -101,6 +110,8 @@ describe('SessionActionMenu - Codex sync action', () => {
                 <SessionActionMenu
                     isOpen={true}
                     onClose={vi.fn()}
+                    sessionId="sess-123"
+                    sessionTitle="Test session"
                     sessionActive={false}
                     onRename={vi.fn()}
                     onExport={vi.fn()}
@@ -125,5 +136,55 @@ describe('SessionActionMenu - Codex sync action', () => {
 
         expect(onSyncCodex).toHaveBeenCalledTimes(1)
         expect(onClose).toHaveBeenCalledTimes(1)
+    })
+})
+
+describe('SessionActionMenu - Pi sync action', () => {
+    it('renders, fires, and closes Sync Pi history when a handler is provided', () => {
+        const onSyncPi = vi.fn()
+        const onClose = vi.fn()
+        renderMenu({ onSyncPi, onClose })
+
+        fireEvent.click(screen.getByRole('menuitem', { name: /Sync Pi history/ }))
+
+        expect(onSyncPi).toHaveBeenCalledOnce()
+        expect(onClose).toHaveBeenCalledOnce()
+    })
+
+    it('hides Sync Pi history when no handler is provided', () => {
+        renderMenu({ onSyncPi: undefined })
+        expect(screen.queryByRole('menuitem', { name: /Sync Pi history/ })).toBeNull()
+    })
+})
+
+describe('SessionActionMenu - Copy reference action', () => {
+    it('renders the Copy reference item', () => {
+        renderMenu()
+
+        expect(screen.getByRole('menuitem', { name: /Copy reference/ })).toBeInTheDocument()
+    })
+
+    it('copies a session citation and closes the menu when Copy reference is clicked', async () => {
+        const writeText = vi.fn().mockResolvedValue(undefined)
+        Object.defineProperty(navigator, 'clipboard', {
+            value: { writeText },
+            configurable: true,
+        })
+
+        const onClose = vi.fn()
+        renderMenu({
+            sessionId: 'abc-def',
+            sessionTitle: 'upstream issue/pr discovery',
+            onClose,
+        })
+
+        fireEvent.click(screen.getByRole('menuitem', { name: /Copy reference/ }))
+
+        expect(onClose).toHaveBeenCalledTimes(1)
+        await vi.waitFor(() => {
+            expect(writeText).toHaveBeenCalledWith(
+                `See session "upstream issue/pr discovery" (/sessions/abc-def) for context.${SESSION_REFERENCE_STEER_SUFFIX}`
+            )
+        })
     })
 })

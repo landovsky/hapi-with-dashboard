@@ -12,7 +12,10 @@ import { logger } from '@/ui/logger'
 import { runtimePath } from '@/projectPath'
 import { getInvokedCwd } from '@/utils/invokedCwd'
 import { readWorktreeEnv } from '@/utils/worktreeEnv'
+import { exportHapiSessionEnv } from '@/agent/hapiSessionEnv'
 import packageJson from '../../package.json'
+
+export { HAPI_SESSION_ID_ENV, exportHapiSessionEnv, exportHapiHubAuthEnv } from '@/agent/hapiSessionEnv'
 
 export type SessionStartedBy = 'runner' | 'terminal'
 
@@ -99,10 +102,14 @@ function pickExistingSessionMetadata(metadata: Metadata | null | undefined): Par
     if (metadata.geminiSessionId !== undefined) preserved.geminiSessionId = metadata.geminiSessionId
     if (metadata.opencodeSessionId !== undefined) preserved.opencodeSessionId = metadata.opencodeSessionId
     if (metadata.grokSessionId !== undefined) preserved.grokSessionId = metadata.grokSessionId
+    if (metadata.agySessionId !== undefined) preserved.agySessionId = metadata.agySessionId
     if (metadata.cursorSessionId !== undefined) preserved.cursorSessionId = metadata.cursorSessionId
     if (metadata.cursorSessionProtocol !== undefined) preserved.cursorSessionProtocol = metadata.cursorSessionProtocol
     if (metadata.kimiSessionId !== undefined) preserved.kimiSessionId = metadata.kimiSessionId
+    if (metadata.copilotSessionId !== undefined) preserved.copilotSessionId = metadata.copilotSessionId
     if (metadata.piSessionId !== undefined) preserved.piSessionId = metadata.piSessionId
+    if (metadata.piResumeAttempt !== undefined) preserved.piResumeAttempt = metadata.piResumeAttempt
+    if (metadata.ptyResumeAttempt !== undefined) preserved.ptyResumeAttempt = metadata.ptyResumeAttempt
     if (metadata.preferredPermissionMode !== undefined) preserved.preferredPermissionMode = metadata.preferredPermissionMode
     if (metadata.tools !== undefined) preserved.tools = metadata.tools
     if (metadata.slashCommands !== undefined) preserved.slashCommands = metadata.slashCommands
@@ -112,6 +119,30 @@ function pickExistingSessionMetadata(metadata: Metadata | null | undefined): Par
     if (metadata.piAvailableModels !== undefined) preserved.piAvailableModels = metadata.piAvailableModels
     // Preserve provider-qualified Pi model selection (disambiguates duplicate modelIds).
     if (metadata.piSelectedModel !== undefined) preserved.piSelectedModel = metadata.piSelectedModel
+    if (metadata.conversationHistoryPoints !== undefined) {
+        preserved.conversationHistoryPoints = metadata.conversationHistoryPoints
+    }
+    if (metadata.conversationHistoryIndexes !== undefined) {
+        preserved.conversationHistoryIndexes = metadata.conversationHistoryIndexes
+    }
+    if (metadata.conversationHistoryTurns !== undefined) {
+        preserved.conversationHistoryTurns = metadata.conversationHistoryTurns
+    }
+    if (metadata.conversationHistoryEntryIds !== undefined) {
+        preserved.conversationHistoryEntryIds = metadata.conversationHistoryEntryIds
+    }
+    if (metadata.conversationHistoryDiverged !== undefined) {
+        preserved.conversationHistoryDiverged = metadata.conversationHistoryDiverged
+    }
+    if (metadata.forkedFrom !== undefined) {
+        preserved.forkedFrom = metadata.forkedFrom
+    }
+    if (metadata.capabilities?.conversationHistory !== undefined) {
+        preserved.capabilities = {
+            ...preserved.capabilities,
+            conversationHistory: metadata.capabilities.conversationHistory
+        }
+    }
 
     return preserved
 }
@@ -173,6 +204,8 @@ export async function bootstrapSession(options: SessionBootstrapOptions): Promis
     })
 
     const session = api.sessionSyncClient(sessionInfo)
+
+    exportHapiSessionEnv(sessionInfo.id)
 
     await reportSessionStarted(sessionInfo.id, metadata)
 
@@ -254,6 +287,10 @@ export async function bootstrapLazySession(options: SessionBootstrapOptions): Pr
             return materialized
         },
         onMaterialized: (materialized, snapshot) => {
+            // Export only after the hub row exists. Exporting the provisional id at
+            // bootstrap lets agents inherit HAPI_SESSION_ID before GET /api/sessions/:id
+            // can resolve (and before hapiMcpUrl is persisted) — #1119 / PR #1121 Major.
+            exportHapiSessionEnv(materialized.id)
             void reportSessionStarted(materialized.id, snapshot.metadata ?? metadata)
         }
     })
@@ -292,20 +329,26 @@ export async function bootstrapExistingSession(options: {
         workingDirectory: options.workingDirectory,
         machineId
     })
-    const metadata = {
-        ...baseMetadata,
-        ...pickExistingSessionMetadata(sessionInfo.metadata),
-        ...options.metadataOverrides
+    const buildUpdatedMetadata = (current: Metadata | null | undefined): Metadata => {
+        const preserved = pickExistingSessionMetadata(current)
+        return {
+            ...baseMetadata,
+            ...preserved,
+            ...options.metadataOverrides,
+            capabilities: {
+                ...baseMetadata.capabilities,
+                ...preserved.capabilities,
+                ...options.metadataOverrides?.capabilities
+            }
+        }
     }
-
-    const buildUpdatedMetadata = (current: Metadata): Metadata => ({
-        ...baseMetadata,
-        ...pickExistingSessionMetadata(current),
-        ...options.metadataOverrides
-    })
+    const metadata = buildUpdatedMetadata(sessionInfo.metadata)
 
     const session = api.sessionSyncClient(sessionInfo)
     session.updateMetadata(buildUpdatedMetadata)
+
+    exportHapiSessionEnv(sessionInfo.id)
+
     await reportSessionStarted(sessionInfo.id, metadata)
 
     return {

@@ -44,7 +44,9 @@ export default function VoicePage() {
     const { sessionId } = useParams({ from: '/voice/$sessionId' })
     const { mic: micRequested } = useSearch({ from: '/voice/$sessionId' })
     const { sessions } = useSessions(api)
-    const { messages, isLoading, refetch } = useMessages(api, sessionId)
+    // Upstream renamed the initial-load flag: `isLoading` → `isSyncingTail`
+    // (true while the message tail is being fetched/synced).
+    const { messages, isSyncingTail, refetch } = useMessages(api, sessionId)
     const recorder = useAudioRecorder()
 
     const [bubbles, setBubbles] = useState<Bubble[]>([])
@@ -316,7 +318,7 @@ export default function VoicePage() {
             </div>
 
             <div className="vv-convo">
-                {isLoading && bubbles.length === 0 ? (
+                {isSyncingTail && bubbles.length === 0 ? (
                     <LoadingState label="Loading conversation…" className="text-sm" />
                 ) : null}
                 {bubbles.map((b, i) => {

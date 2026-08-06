@@ -1,4 +1,4 @@
-import { MessagePrimitive, useAssistantState } from '@assistant-ui/react'
+import { MessagePrimitive, useAuiState, type TextMessagePart } from '@assistant-ui/react'
 import { useHappyChatContext } from '@/components/AssistantChat/context'
 import type { HappyChatMessageMetadata } from '@/lib/assistant-runtime'
 import { MessageStatusIndicator } from '@/components/AssistantChat/messages/MessageStatusIndicator'
@@ -10,50 +10,78 @@ import { MessageActions } from '@/components/AssistantChat/messages/MessageActio
 
 export function HappyUserMessage() {
     const ctx = useHappyChatContext()
-    const role = useAssistantState(({ message }) => message.role)
-    const messageId = useAssistantState(({ message }) => message.id)
-    const text = useAssistantState(({ message }) => {
-        if (message.role !== 'user') return ''
-        return message.content.find((part) => part.type === 'text')?.text ?? ''
+    const role = useAuiState((s) => s.message.role)
+    const messageId = useAuiState((s) => s.message.id)
+    const elementId = getConversationMessageAnchorId(messageId)
+    const text = useAuiState((s) => {
+        if (s.message.role !== 'user') return ''
+        return s.message.content.find((part): part is TextMessagePart => part.type === 'text')?.text ?? ''
     })
-    const status = useAssistantState(({ message }) => {
-        if (message.role !== 'user') return undefined
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const status = useAuiState((s) => {
+        if (s.message.role !== 'user') return undefined
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.status
     })
-    const localId = useAssistantState(({ message }) => {
-        if (message.role !== 'user') return null
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const localId = useAuiState((s) => {
+        if (s.message.role !== 'user') return null
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.localId ?? null
     })
-    const attachments = useAssistantState(({ message }) => {
-        if (message.role !== 'user') return undefined
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const attachments = useAuiState((s) => {
+        if (s.message.role !== 'user') return undefined
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.attachments
     })
-    const isCliOutput = useAssistantState(({ message }) => {
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const isCliOutput = useAuiState((s) => {
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         return custom?.kind === 'cli-output'
     })
-    const cliText = useAssistantState(({ message }) => {
-        const custom = message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
+    const cliText = useAuiState((s) => {
+        const custom = s.message.metadata.custom as Partial<HappyChatMessageMetadata> | undefined
         if (custom?.kind !== 'cli-output') return ''
-        return message.content.find((part) => part.type === 'text')?.text ?? ''
+        return s.message.content.find((part): part is TextMessagePart => part.type === 'text')?.text ?? ''
     })
     if (role !== 'user') return null
     const canRetry = status === 'failed' && typeof localId === 'string' && Boolean(ctx.onRetryMessage)
     const onRetry = canRetry ? () => ctx.onRetryMessage!(localId) : undefined
     const showStatus = shouldShowMessageStatus(status)
 
+    const history = ctx.metadata?.capabilities?.conversationHistory
+    const hasNativePoint = typeof localId === 'string'
+        && localId.length > 0
+        && ctx.metadata?.conversationHistoryPoints?.[localId] === true
+    const isLatestBoundary = ctx.isLatestCompletedBoundary?.(messageId) === true
+    const showCurrentFork = Boolean(
+        history?.forkCurrent
+        && isLatestBoundary
+        && !ctx.disabled
+        && ctx.onForkConversation
+    )
+    const showHistoricalFork = Boolean(
+        history?.forkAtMessage
+        && hasNativePoint
+        && !isLatestBoundary
+        && !ctx.disabled
+        && ctx.onForkConversation
+    )
+    const showFork = showCurrentFork || showHistoricalFork
+    const showRewind = Boolean(
+        history?.rewindToMessage
+        && hasNativePoint
+        && !ctx.disabled
+        && ctx.onRewindConversation
+    )
+
     if (isCliOutput) {
         return (
             <MessagePrimitive.Root
-                id={getConversationMessageAnchorId(messageId)}
+                id={elementId}
+                data-hapi-message-role="user"
                 className="happy-message scroll-mt-4 px-1 min-w-0 max-w-full overflow-x-hidden"
             >
                 <div className="ml-auto w-full max-w-[92%]">
                     <CliOutputBlock text={cliText} />
-                    <MessageActions align="end" copyText={cliText} />
+                    <MessageActions align="end" copyText={cliText} messageElementId={elementId} />
                 </div>
             </MessagePrimitive.Root>
         )
@@ -64,7 +92,8 @@ export function HappyUserMessage() {
 
     return (
         <MessagePrimitive.Root
-            id={getConversationMessageAnchorId(messageId)}
+            id={elementId}
+            data-hapi-message-role="user"
             className="happy-message flex flex-col items-end scroll-mt-4"
         >
             <div className={getUserBubbleClassName(status)}>
@@ -80,7 +109,22 @@ export function HappyUserMessage() {
                     )}
                 </div>
             </div>
-            <MessageActions align="end" copyText={hasText ? text : undefined} />
+            <MessageActions
+                align="end"
+                copyText={hasText ? text : undefined}
+                messageElementId={elementId}
+                showFork={showFork}
+                showRewind={showRewind}
+                historyActionPending={ctx.historyActionPending}
+                onFork={showCurrentFork
+                    ? () => ctx.onForkConversation!()
+                    : showHistoricalFork && localId
+                        ? () => ctx.onForkConversation!(localId)
+                        : undefined}
+                onRewind={showRewind && localId
+                    ? () => ctx.onRewindConversation!(localId)
+                    : undefined}
+            />
         </MessagePrimitive.Root>
     )
 }
