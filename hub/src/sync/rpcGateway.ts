@@ -2,12 +2,14 @@ import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionM
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
 import {
     ArchiveCodexSessionRpcResponseSchema,
+    AgentAvailabilityResponseSchema,
     CursorChatStoreStatusSchema,
     ListCodexSessionsRpcResponseSchema,
     ListPiSessionsRpcResponseSchema
 } from '@hapi/protocol/apiTypes'
 import type {
     AgyModelsResponse,
+    AgentAvailabilityResponse,
     CodexModelSummary,
     CodexModelsResponse,
     CommandResponse,
@@ -29,6 +31,7 @@ import type {
     OpencodeModelSummary,
     OpencodeReasoningEffortResponse,
     PathExistsResponse,
+    PiModelsResponse,
     SlashCommandsResponse,
     StatFilesResponse,
     UploadFileResponse
@@ -61,6 +64,10 @@ export class RpcTargetMissingError extends Error {
 }
 
 export type RpcCommandResponse = CommandResponse
+export type FileSearchOptions = {
+    query: string
+    limit: number
+}
 export type RpcReadFileResponse = FileReadResponse
 export type RpcGeneratedImageResponse = GeneratedImageResponse
 export type RpcUploadFileResponse = UploadFileResponse
@@ -84,6 +91,7 @@ export type RpcListCopilotModelsResponse = CopilotModelsResponse
 export type RpcListGrokReasoningEffortOptionsResponse = GrokReasoningEffortResponse
 export type RpcListOpencodeReasoningEffortOptionsResponse = OpencodeReasoningEffortResponse
 export type RpcListAgyModelsResponse = AgyModelsResponse
+export type RpcListPiModelsResponse = PiModelsResponse
 
 export class RpcGateway {
     constructor(
@@ -180,7 +188,15 @@ export class RpcGateway {
         // CLI with `--hapi-session-id`, so the child reuses the existing hub
         // session row (same id) instead of minting a new one.
         forkSession?: boolean
-    ): Promise<{ type: 'success'; sessionId: string } | { type: 'error'; message: string }> {
+    ): Promise<
+        | { type: 'success'; sessionId: string }
+        | {
+            type: 'error'
+            message: string
+            code?: 'agent_unavailable' | 'outside_workspace_roots'
+            agent?: AgentFlavor
+        }
+    > {
         try {
             const result = await this.machineRpc(
                 machineId,
@@ -212,7 +228,16 @@ export class RpcGateway {
                     return { type: 'success', sessionId: obj.sessionId }
                 }
                 if (obj.type === 'error' && typeof obj.errorMessage === 'string') {
-                    return { type: 'error', message: obj.errorMessage }
+                    const code = obj.code === 'agent_unavailable' || obj.code === 'outside_workspace_roots'
+                        ? obj.code
+                        : undefined
+                    const unavailableAgent = typeof obj.agent === 'string' ? obj.agent as AgentFlavor : undefined
+                    return {
+                        type: 'error',
+                        message: obj.errorMessage,
+                        ...(code ? { code } : {}),
+                        ...(unavailableAgent ? { agent: unavailableAgent } : {}),
+                    }
                 }
                 if (obj.type === 'requestToApproveDirectoryCreation' && typeof obj.directory === 'string') {
                     return { type: 'error', message: `Directory creation requires approval: ${obj.directory}` }
@@ -247,7 +272,12 @@ export class RpcGateway {
         return result as RpcListDirectoryResponse
     }
 
-    async checkPathsExist(machineId: string, paths: string[]): Promise<Record<string, boolean>> {
+    async getAgentAvailability(machineId: string): Promise<AgentAvailabilityResponse> {
+        const result = await this.machineRpc(machineId, RPC_METHODS.AgentAvailability, {})
+        return AgentAvailabilityResponseSchema.parse(result)
+    }
+
+    async checkPathsExist(machineId: string, paths: string[]): Promise<PathExistsResponse> {
         const result = await this.machineRpc(machineId, RPC_METHODS.PathExists, { paths }) as RpcPathExistsResponse | unknown
         if (!result || typeof result !== 'object') {
             throw new Error('Unexpected path-exists result')
@@ -262,7 +292,13 @@ export class RpcGateway {
         for (const [key, value] of Object.entries(existsValue)) {
             exists[key] = value === true
         }
-        return exists
+        const outsideWorkspaceRoots = Array.isArray((result as RpcPathExistsResponse).outsideWorkspaceRoots)
+            ? (result as RpcPathExistsResponse).outsideWorkspaceRoots?.filter((path): path is string => typeof path === 'string')
+            : undefined
+        return {
+            exists,
+            ...(outsideWorkspaceRoots?.length ? { outsideWorkspaceRoots } : {}),
+        }
     }
 
     async getCursorChatStoreStatus(
@@ -277,6 +313,10 @@ export class RpcGateway {
             { workspacePath, cursorSessionId, homeDir }
         )
         return CursorChatStoreStatusSchema.parse(result)
+    }
+
+    async stopRunner(machineId: string): Promise<void> {
+        await this.machineRpc(machineId, RPC_METHODS.StopRunner, {})
     }
 
     async getGitStatus(sessionId: string, cwd?: string): Promise<RpcCommandResponse> {
@@ -315,8 +355,8 @@ export class RpcGateway {
         return await this.sessionRpc(sessionId, RPC_METHODS.DeleteUpload, { sessionId, path }) as RpcDeleteUploadResponse
     }
 
-    async runRipgrep(sessionId: string, args: string[], cwd?: string): Promise<RpcCommandResponse> {
-        return await this.sessionRpc(sessionId, RPC_METHODS.Ripgrep, { args, cwd }) as RpcCommandResponse
+    async runRipgrep(sessionId: string, args: string[], cwd?: string, fileSearch?: FileSearchOptions): Promise<RpcCommandResponse> {
+        return await this.sessionRpc(sessionId, RPC_METHODS.Ripgrep, { args, cwd, fileSearch }) as RpcCommandResponse
     }
 
     async listSlashCommands(sessionId: string, agent: string): Promise<SlashCommandsResponse> {
@@ -337,6 +377,15 @@ export class RpcGateway {
 
     async listCodexModelsForMachine(machineId: string): Promise<RpcListCodexModelsResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.ListCodexModels, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListCodexModelsResponse
+    }
+
+    async listCodexModelsForSession(sessionId: string): Promise<RpcListCodexModelsResponse> {
+        return await this.sessionRpc(
+            sessionId,
+            RPC_METHODS.ListCodexModels,
+            {},
+            MODEL_LIST_RPC_TIMEOUT_MS
+        ) as RpcListCodexModelsResponse
     }
 
     async listCodexSessionsForMachine(machineId: string, cwd?: string | null, sessionIds?: string[]): Promise<RpcListCodexSessionsResponse> {
@@ -406,6 +455,20 @@ export class RpcGateway {
         return await this.sessionRpc(sessionId, method, params ?? {}, timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS) as T
     }
 
+    /**
+     * Ask the CLI to deliver one queued message into the active Pi turn
+     * (Pi native steer). Only the pi flavor registers this handler.
+     */
+    async steerQueuedMessage(
+        sessionId: string,
+        localId: string
+    ): Promise<{ steered: boolean; error?: string }> {
+        return await this.sessionRpc(sessionId, RPC_METHODS.SteerQueuedMessage, { localId }) as {
+            steered: boolean
+            error?: string
+        }
+    }
+
     async forkConversation(
         sessionId: string,
         params: { messageLocalId?: string }
@@ -436,6 +499,10 @@ export class RpcGateway {
 
     async listAgyModelsForMachine(machineId: string): Promise<RpcListAgyModelsResponse> {
         return await this.machineRpc(machineId, RPC_METHODS.ListAgyModels, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListAgyModelsResponse
+    }
+
+    async listPiModelsForMachine(machineId: string): Promise<RpcListPiModelsResponse> {
+        return await this.machineRpc(machineId, RPC_METHODS.ListPiModelsForMachine, {}, MODEL_LIST_RPC_TIMEOUT_MS) as RpcListPiModelsResponse
     }
 
     private async sessionRpc(

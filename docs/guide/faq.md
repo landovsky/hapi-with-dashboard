@@ -33,6 +33,10 @@ For local network access:
 http://<your-computer-ip>:3006
 ```
 
+That cleartext URL is for a browser/PWA on your trusted LAN. The native
+Android companion requires an HTTPS hub URL; use `hapi hub --relay` or place
+an HTTPS reverse proxy/tunnel in front of the hub.
+
 If your phone cannot connect, make sure the hub is not only listening on `127.0.0.1`. For LAN access, set `listenHost` to `0.0.0.0` in `~/.hapi/settings.json` or set `HAPI_LISTEN_HOST=0.0.0.0`, then restart `hapi hub`.
 
 For internet access:
@@ -93,6 +97,10 @@ In the session view, tap the "Files" tab to:
 
 Yes. Open any session and use the chat interface to send messages directly to the AI agent.
 
+### Why did my session look idle when the agent woke itself?
+
+Some agents (especially Cursor) can resume after idle from harness signals such as background Shell `notify_on_output` or `/loop`, without you sending a new HAPI message. HAPI treats real ACP agent activity (and permission requests) as thinking again so the session list matches the agent - same keepalive path as a normal turn. This is different from session-attached jobs (`hapi job`), which show progress while the agent stays idle on purpose.
+
 ### Can I access a terminal remotely?
 
 Yes. Open a session in the web app and tap the Terminal tab for a remote shell.
@@ -152,6 +160,9 @@ Then restart `hapi hub` and open:
 ```bash
 http://<your-computer-ip>:3006
 ```
+
+This direct LAN URL is for browser/PWA access. The native Android companion
+requires HTTPS (`hapi hub --relay`, or your own HTTPS reverse proxy/tunnel).
 
 Also verify your OS firewall allows inbound connections on port `3006`.
 

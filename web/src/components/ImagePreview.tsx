@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type SyntheticEvent, type WheelEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent, type ReactNode, type SyntheticEvent, type WheelEvent } from 'react'
 import { CloseIcon } from '@/components/icons'
 
 const MIN_IMAGE_SCALE = 0.25
@@ -35,8 +35,12 @@ export function ImagePreview(props: {
     label: string
     buttonClassName?: string
     imageClassName?: string
+    imageStyle?: CSSProperties
     caption?: ReactNode
     galleryId?: string
+    onTriggerPointerDown?: (event: PointerEvent<HTMLButtonElement>) => void
+    onTriggerContextMenu?: (event: MouseEvent<HTMLButtonElement>) => void
+    onTriggerClick?: (event: MouseEvent<HTMLButtonElement>) => void
 }) {
     const [viewerOpen, setViewerOpen] = useState(false)
     const [previewImages, setPreviewImages] = useState<PreviewImage[]>([])
@@ -74,6 +78,17 @@ export function ImagePreview(props: {
         setPreviewIndex(index >= 0 ? index : 0)
         setViewerOpen(true)
     }, [props.galleryId])
+
+    const handleTriggerPointerDown = useCallback((event: PointerEvent<HTMLButtonElement>) => {
+        props.onTriggerPointerDown?.(event)
+        stopEvent(event)
+    }, [props.onTriggerPointerDown, stopEvent])
+
+    const handleTriggerClick = useCallback((event: MouseEvent<HTMLButtonElement>) => {
+        props.onTriggerClick?.(event)
+        if (event.defaultPrevented) return
+        openViewer(event)
+    }, [openViewer, props.onTriggerClick])
 
     const updateScale = useCallback((next: number | ((current: number) => number)) => {
         setScale((current) => {
@@ -258,10 +273,11 @@ export function ImagePreview(props: {
         <>
             <button
                 type="button"
-                onPointerDown={stopEvent}
+                onPointerDown={handleTriggerPointerDown}
                 onMouseDown={stopEvent}
                 onTouchStart={stopEvent}
-                onClick={openViewer}
+                onContextMenu={props.onTriggerContextMenu}
+                onClick={handleTriggerClick}
                 data-image-preview-trigger=""
                 data-image-preview-file-name={props.fileName}
                 data-image-preview-label={props.label}
@@ -273,6 +289,7 @@ export function ImagePreview(props: {
                     src={props.src}
                     alt={props.label}
                     className={props.imageClassName ?? 'max-h-[calc(100vh-14rem)] max-w-full object-contain transition-transform group-hover:scale-[1.01]'}
+                    style={props.imageStyle}
                     draggable={false}
                 />
                 {props.caption}

@@ -19,6 +19,7 @@ import {
     useRef,
     useState
 } from 'react'
+import { useNarrowViewport } from '@/hooks/useNarrowViewport'
 import { isRichComposerMentionsEnabled, resolveComposerPlaceholderKey } from '@/lib/composerSegments'
 import type { SessionMentionResolveResult } from '@/components/AssistantChat/RichComposerInput'
 import {
@@ -39,13 +40,15 @@ import { supportsEffort, supportsModelChange, PI_THINKING_LEVEL_LABELS } from '@
 import type { PiThinkingLevel } from '@hapi/protocol'
 import { markSkillUsed } from '@/lib/recent-skills'
 import { useComposerDraft } from '@/hooks/useComposerDraft'
+import type { AttachmentDraftInput } from '@/lib/composer-attachment-drafts'
+import { persistInactiveComposerAttachments, setComposerDraftSnapshot, updateComposerDraftTextSnapshot, attachmentDraftRevision, resetInactiveComposerAttachmentVisibility } from '@/lib/composer-draft-transfer'
 import { useComposerEnterBehavior } from '@/hooks/useComposerEnterBehavior'
 import { FloatingOverlay } from '@/components/ChatInput/FloatingOverlay'
 import { Autocomplete } from '@/components/ChatInput/Autocomplete'
 import { StatusBar } from '@/components/AssistantChat/StatusBar'
 import { ComposerButtons } from '@/components/AssistantChat/ComposerButtons'
 import type { PendingSchedule } from '@/components/AssistantChat/ScheduleTimePicker'
-import { AttachmentItem } from '@/components/AssistantChat/AttachmentItem'
+import { SortableComposerAttachments } from '@/components/AssistantChat/SortableComposerAttachments'
 import { ComposerParkingContext } from '@/components/AssistantChat/composerParkingContext'
 import type { ScratchlistParkResult } from '@/lib/scratchlistAttachmentFlow'
 import { useTranslation } from '@/lib/use-translation'
@@ -55,13 +58,12 @@ import { getCodexComposerReasoningEffortOptions } from './codexReasoningEffortOp
 import { getDisplayedCodexServiceTier } from './codexFastMode'
 import { getPiThinkingLevelOptions, getHighestThinkingLevel, isThinkingLevelSupported } from './piThinkingLevelOptions'
 import { groupModelsByProvider } from './piModelGroups'
-import { PiModelPanel } from './PiModelPanel'
-import { PiThinkingLevelPanel } from './PiThinkingLevelPanel'
 import type { ApiClient } from '@/api/client'
 import { useVoiceInputPreferences } from '@/hooks/useVoiceInputPreferences'
 import { useDictation } from '@/hooks/useDictation'
 import type { ComposerSendIntent } from '@/lib/messageDelivery'
 import type { MessageDeliveryMode } from '@hapi/protocol'
+import { moveAttachmentId, orderItemsById, reconcileAttachmentOrder, type AttachmentDropPosition } from '@/lib/attachmentOrder'
 
 export interface TextInputState {
     text: string
@@ -279,6 +281,8 @@ export function ModelEffortSettingsSection(props: {
 
 export function HappyComposer(props: {
     sessionId?: string
+    onUploadDraftSnapshot?: (text: string, attachments: AttachmentDraftInput[]) => void
+    canRestoreAttachments?: boolean
     disabled?: boolean
     permissionMode?: PermissionMode
     collaborationMode?: CodexCollaborationMode
@@ -363,12 +367,23 @@ export function HappyComposer(props: {
     sendError?: ComposerSendError | null
     onClearSendError?: () => void
     onSuppressSendErrorRestore?: (id: number) => void
+    /** Emitted by SessionChat after a send is accepted. Null attempt ids are settled scratchlist sends. */
+    sendAcceptance?: { attemptId: string | null } | null
+    /** Terminal result for a chat mutation, including attachment-bearing failures. */
+    sendSettlement?: { attemptId: string; status: 'success' | 'error' } | null
+    /**
+     * Resume/handoff path for inactive drafts that only exist in IndexedDB
+     * (no visible text/attachments for assistant-ui to append).
+     */
+    onResumeStoredDraft?: () => void | Promise<void>
     /**
      * One-shot intent bridge consumed by useHappyRuntime's onNew callback.
      * SessionChat owns this ref so the composer never retains an explicit
      * queue request after a scratchlist/scheduled/failed early path.
      */
     pendingSendIntentRef?: MutableRefObject<ComposerSendIntent>
+    /** Shared order ref consumed by useHappyRuntime when the message is sent. */
+    attachmentOrderRef?: MutableRefObject<string[]>
     /** Chip hover / aria-label resolver (SessionChat → useSessions). */
     resolveSessionMentionTooltip?: (id: string, title: string) => SessionMentionResolveResult
 }) {
@@ -427,6 +442,7 @@ export function HappyComposer(props: {
         onClearSendError,
         onSuppressSendErrorRestore,
         pendingSendIntentRef,
+        attachmentOrderRef: externalAttachmentOrderRef,
         resolveSessionMentionTooltip,
     } = props
 
@@ -444,6 +460,23 @@ export function HappyComposer(props: {
     const { composerEnterBehavior } = useComposerEnterBehavior()
     const composerText = useAuiState((s) => s.composer.text)
     const attachments = useAuiState((s) => s.composer.attachments)
+    const localAttachmentOrderRef = useRef<string[]>([])
+    const attachmentOrderRef = externalAttachmentOrderRef ?? localAttachmentOrderRef
+    const attachmentIds = useMemo(
+        () => attachments.map((attachment) => attachment.id),
+        [attachments],
+    )
+    const orderedAttachmentIds = reconcileAttachmentOrder(attachmentOrderRef.current, attachmentIds)
+    attachmentOrderRef.current = orderedAttachmentIds
+    const [, setAttachmentOrderRevision] = useState(0)
+    const handleAttachmentReorder = useCallback((activeId: string, targetId: string, position: AttachmentDropPosition) => {
+        const currentOrder = reconcileAttachmentOrder(attachmentOrderRef.current, attachmentIds)
+        const nextOrder = moveAttachmentId(currentOrder, activeId, targetId, position)
+        if (nextOrder.every((id, index) => id === currentOrder[index])) return
+        attachmentOrderRef.current = nextOrder
+        setAttachmentOrderRevision((revision) => revision + 1)
+    }, [attachmentIds, attachmentOrderRef])
+    const orderedAttachments = orderItemsById(attachments, orderedAttachmentIds)
     const threadIsRunning = useAuiState((s) => s.thread.isRunning)
     const threadIsDisabled = useAuiState((s) => s.thread.isDisabled)
     const composerTextRef = useRef(composerText)
@@ -489,7 +522,8 @@ export function HappyComposer(props: {
         onScratchlistParkingChange?.(isParkingScratchlist)
     }, [isParkingScratchlist, onScratchlistParkingChange])
 
-    const controlsDisabled = disabled || (!active && !allowSendWhenInactive) || threadIsDisabled || isParkingScratchlist
+    const configurationControlsDisabled = (!active && !allowSendWhenInactive) || isParkingScratchlist
+    const controlsDisabled = disabled || threadIsDisabled || configurationControlsDisabled
     const trimmed = composerText.trim()
     const hasText = trimmed.length > 0
     const hasAttachments = attachments.length > 0
@@ -503,16 +537,18 @@ export function HappyComposer(props: {
         const path = (attachment as { path?: string }).path
         return typeof path === 'string' && path.length > 0
     })
-    const canSend = (hasText || hasAttachments) && attachmentsReady && !controlsDisabled
 
     const [inputState, setInputState] = useState<TextInputState>({
         text: '',
         selection: { start: 0, end: 0 }
     })
     const [isExpanded, setIsExpanded] = useState(false)
+    const lastSendAcceptanceRef = useRef(props.sendAcceptance)
+    const pendingSendAttemptIdRef = useRef<string | null>(null)
     const [showSettings, setShowSettings] = useState(false)
-    const [showPiModelPanel, setShowPiModelPanel] = useState(false)
-    const [showPiThinkingPanel, setShowPiThinkingPanel] = useState(false)
+    // Anchored settings sheet: the model/effort value buttons open only their
+    // own section; the gear (null) opens the full sheet.
+    const [settingsSection, setSettingsSection] = useState<'model' | 'effort' | null>(null)
     const [isAborting, setIsAborting] = useState(false)
     const [isSwitching, setIsSwitching] = useState(false)
     const [showContinueHint, setShowContinueHint] = useState(false)
@@ -522,9 +558,39 @@ export function HappyComposer(props: {
     const pendingSchedule = isControlled ? (pendingScheduleProp ?? null) : pendingScheduleLocal
     const setPendingSchedule = isControlled ? onScheduleProp : setPendingScheduleLocal
 
+    useEffect(() => {
+        const acceptance = props.sendAcceptance
+        if (!acceptance || acceptance === lastSendAcceptanceRef.current) return
+        lastSendAcceptanceRef.current = acceptance
+        if (acceptance.attemptId === null) {
+            pendingSendAttemptIdRef.current = null
+            setIsExpanded(false)
+            return
+        }
+        pendingSendAttemptIdRef.current = acceptance.attemptId
+        const settlement = props.sendSettlement
+        if (!settlement || settlement.attemptId !== acceptance.attemptId) return
+        pendingSendAttemptIdRef.current = null
+        if (settlement.status === 'success') setIsExpanded(false)
+    }, [props.sendAcceptance, props.sendSettlement])
+
+    // Match the terminal mutation result to the exact accepted attempt. Text
+    // failures also expose sendError for draft restoration, while attachment
+    // failures intentionally do not, so settlement must be the outcome source.
+    useEffect(() => {
+        const settlement = props.sendSettlement
+        if (!settlement || settlement.attemptId !== pendingSendAttemptIdRef.current) return
+        pendingSendAttemptIdRef.current = null
+        if (settlement.status === 'success') setIsExpanded(false)
+    }, [props.sendSettlement])
+
     const textareaRef = useRef<HTMLTextAreaElement>(null)
     const richInputRef = useRef<RichComposerInputHandle>(null)
     const richComposerFueAnchorRef = useRef<HTMLDivElement>(null)
+    const settingsButtonRef = useRef<HTMLButtonElement>(null)
+    const modelValueButtonRef = useRef<HTMLButtonElement>(null)
+    const effortValueButtonRef = useRef<HTMLButtonElement>(null)
+    const settingsOverlayRef = useRef<HTMLDivElement>(null)
     // `composer.text === ''` alone is not enough to identify the empty state
     // created by a send. A user can type and delete a fresh draft before the
     // failed mutation reports back. Keep monotonic interaction generations so
@@ -576,24 +642,78 @@ export function HappyComposer(props: {
         onEdit: handleRichEdit,
     } = useRichComposerBridge(api, setInputState, sendError, onClearSendError, recordUserEdit)
 
-    const attachmentDrafts = attachments.flatMap((attachment) => {
+    const attachmentDrafts = orderedAttachments.flatMap((attachment) => {
         if (!attachment.file) return []
-        const upload = attachment as typeof attachment & { path?: string; previewUrl?: string }
+        const upload = attachment as typeof attachment & { path?: string; previewUrl?: string; uploadSessionId?: string }
         return [{
             id: attachment.id,
             file: attachment.file,
             path: upload.path,
             previewUrl: upload.previewUrl,
+            uploadSessionId: upload.uploadSessionId,
         }]
     })
+    const attachmentRevision = attachmentDraftRevision(attachmentDrafts)
+    const latestComposerTextRef = useRef(composerText)
+    latestComposerTextRef.current = composerText
+    const attachmentDraftsRef = useRef(attachmentDrafts)
+    attachmentDraftsRef.current = attachmentDrafts
     const draftHydration = useComposerDraft(
         sessionId,
         composerText,
         attachmentDrafts,
-        active,
+        props.canRestoreAttachments ?? active,
         (text) => api.composer().setText(text),
         (file) => api.composer().addAttachment(file),
     )
+    const canHydrateAttachments = props.canRestoreAttachments ?? active
+    const hiddenAttachmentStatePending =
+        !canHydrateAttachments
+        && (draftHydration.sessionId !== sessionId || !draftHydration.complete)
+    const hasHiddenAttachments =
+        !canHydrateAttachments && draftHydration.hasStoredAttachments
+    const hasAnyAttachments = hasAttachments || hasHiddenAttachments
+    const blocksScheduling =
+        hasAttachments || hasHiddenAttachments || hiddenAttachmentStatePending
+    const canSend = (hasText || hasAnyAttachments) && attachmentsReady && !controlsDisabled
+
+    useEffect(() => {
+        if (!sessionId) return
+        const canHydrateAttachments = props.canRestoreAttachments ?? active
+        if (canHydrateAttachments) return
+        // A remount starts with an empty visible list by design; do not treat
+        // previously persisted failed-resume picks as operator removals.
+        resetInactiveComposerAttachmentVisibility(sessionId)
+    }, [active, props.canRestoreAttachments, sessionId])
+
+    useEffect(() => {
+        if (draftHydration.sessionId !== sessionId || !draftHydration.complete || !sessionId) return
+        // Inactive sessions do not restore stored attachments into the adapter.
+        // Keep IndexedDB intact when nothing new is visible; when the user did
+        // pick files (even if resume failed), merge them into storage so reopen
+        // does not drop them.
+        const canHydrateAttachments = props.canRestoreAttachments ?? active
+        if (canHydrateAttachments) {
+            setComposerDraftSnapshot(sessionId, composerText, attachmentDraftsRef.current)
+            props.onUploadDraftSnapshot?.(composerText, attachmentDraftsRef.current)
+            return
+        }
+        // Text is cheap (sessionStorage); do not queue a blob merge per keystroke.
+        updateComposerDraftTextSnapshot(sessionId, composerText)
+    }, [active, attachmentRevision, composerText, draftHydration.complete, draftHydration.sessionId, props.canRestoreAttachments, props.onUploadDraftSnapshot, sessionId])
+
+    useEffect(() => {
+        if (draftHydration.sessionId !== sessionId || !draftHydration.complete || !sessionId) return
+        const canHydrateAttachments = props.canRestoreAttachments ?? active
+        if (canHydrateAttachments) return
+        void persistInactiveComposerAttachments(
+            sessionId,
+            latestComposerTextRef.current,
+            attachmentDraftsRef.current,
+        ).catch((error) => {
+            console.warn('[composer-draft] inactive persistence failed', error)
+        })
+    }, [active, attachmentRevision, draftHydration.complete, draftHydration.sessionId, props.canRestoreAttachments, sessionId])
 
     // assistant-ui clears `composer.text` synchronously the moment a send is
     // invoked AND `SessionChat.handleSend` clears `pendingSchedule` after the
@@ -1040,7 +1160,7 @@ export function HappyComposer(props: {
                 const snapshot = api.composer().getState()
                 const prepared = await props.onParkScratchlist(
                     snapshot.text,
-                    snapshot.attachments,
+                    orderItemsById(snapshot.attachments, attachmentOrderRef.current),
                 )
                 if (!prepared) return
                 // Validate before irreversible add — otherwise a mid-flight
@@ -1055,6 +1175,7 @@ export function HappyComposer(props: {
                 await prepared.beforeClear()
                 api.composer().setText('')
                 await api.composer().clearAttachments()
+                setIsExpanded(false)
             } finally {
                 parkInFlightRef.current = false
                 setIsParkingScratchlist(false)
@@ -1077,6 +1198,10 @@ export function HappyComposer(props: {
         // explicit queue intent to SessionChat.
         const effectiveIntent = pendingSchedule == null ? restoredIntent : 'default'
         try {
+            if (!hasText && !hasAttachments && draftHydration.hasStoredAttachments) {
+                await props.onResumeStoredDraft?.()
+                return
+            }
             // Must be adjacent to send(): useHappyRuntime consumes and resets
             // this ref synchronously from assistant-ui's onNew callback.
             if (pendingSendIntentRef) pendingSendIntentRef.current = effectiveIntent
@@ -1099,12 +1224,17 @@ export function HappyComposer(props: {
         api,
         attachments,
         canSend,
+        draftHydration.hasStoredAttachments,
+        hasAttachments,
+        hasText,
         onSuppressSendErrorRestore,
         pendingSchedule,
         props.onParkScratchlist,
+        props.onResumeStoredDraft,
         props.scratchlistMode,
         richMentionsEnabled,
         sendError,
+        attachmentOrderRef,
         pendingSendIntentRef,
         resetPendingSendIntent,
     ])
@@ -1112,12 +1242,6 @@ export function HappyComposer(props: {
     const flushAndSend = useCallback((intent: ComposerSendIntent = 'default') => {
         void handleSend(intent)
     }, [handleSend])
-
-    const canQueueSend = agentFlavor === 'pi'
-        && thinking
-        && threadIsRunning
-        && pendingSchedule == null
-        && !props.scratchlistMode
 
     const handleKeyDown = useCallback((e: ReactKeyboardEvent<HTMLTextAreaElement | HTMLDivElement>) => {
         const key = e.key
@@ -1137,22 +1261,6 @@ export function HappyComposer(props: {
             e.preventDefault()
             const indexToSelect = selectedIndex >= 0 ? selectedIndex : 0
             handleSuggestionSelect(indexToSelect)
-            return
-        }
-
-        // Alt/Option+Enter is an explicit Pi follow-up request. It is
-        // orthogonal to the normal Enter preference but never overrides IME,
-        // Shift+Enter, autocomplete, scheduling, or scratchlist routing.
-        if (
-            key === 'Enter'
-            && e.altKey
-            && !e.ctrlKey
-            && !e.metaKey
-            && canQueueSend
-        ) {
-            e.preventDefault()
-            flushAndSend('queue')
-            setShowContinueHint(false)
             return
         }
 
@@ -1244,7 +1352,6 @@ export function HappyComposer(props: {
         richComposerFueStatus,
         dismissRichComposerFue,
         flushAndSend,
-        canQueueSend,
         isExpanded,
         handleExpandedToggle,
     ])
@@ -1254,7 +1361,8 @@ export function HappyComposer(props: {
             // Pi needs { provider, modelId } to disambiguate duplicate model IDs,
             // but this generic cycler only emits a bare modelId (or null), which
             // would lose the provider and can pick the wrong cached match or clear
-            // the model. Pi model changes go only through the dedicated PiModelPanel.
+            // the model. Pi model changes go through the settings sheet's
+            // provider-qualified picker (piModelGroups) only.
             if (agentFlavor === 'pi') return
             if (e.key === 'm' && (e.metaKey || e.ctrlKey) && onModelChange && supportsModelChange(agentFlavor)) {
                 e.preventDefault()
@@ -1311,16 +1419,27 @@ export function HappyComposer(props: {
         }
     }, [api, pendingSchedule])
 
-    const handleSettingsToggle = useCallback(() => {
+    // Opens (or closes) the settings sheet. `section` anchors the sheet to a
+    // single section ('model' / 'effort'); the gear passes nothing = full sheet.
+    // Re-clicking with a different anchor while open switches the anchor
+    // instead of closing, so model->effort moves between sections directly.
+    const handleSettingsToggle = useCallback((section: 'model' | 'effort' | null = null) => {
         haptic('light')
-        setShowSettings((prev) => {
-            if (prev) {
-                setCursorDrillDownBase(null)
-                setCursorDrillDownDefaultVariant(null)
-            }
-            return !prev
-        })
-    }, [haptic])
+        if (showSettings && section !== settingsSection) {
+            // Open with a different anchor: switch sections, keep the sheet up.
+            setSettingsSection(section)
+            return
+        }
+        if (showSettings) {
+            setCursorDrillDownBase(null)
+            setCursorDrillDownDefaultVariant(null)
+            setShowSettings(false)
+            setSettingsSection(null)
+            return
+        }
+        setSettingsSection(section)
+        setShowSettings(true)
+    }, [haptic, showSettings, settingsSection])
 
     const clearCursorDrillDown = useCallback(() => {
         setCursorDrillDownBase(null)
@@ -1330,14 +1449,15 @@ export function HappyComposer(props: {
     const dismissSettings = useCallback(() => {
         clearCursorDrillDown()
         setShowSettings(false)
+        setSettingsSection(null)
     }, [clearCursorDrillDown])
 
     const handleModelChange = useCallback((nextModel: { provider: string; modelId: string } | string | null) => {
-        if (!onModelChange || controlsDisabled) return
+        if (!onModelChange || configurationControlsDisabled) return
         onModelChange(nextModel)
         dismissSettings()
         haptic('light')
-    }, [onModelChange, controlsDisabled, haptic, dismissSettings])
+    }, [onModelChange, configurationControlsDisabled, haptic, dismissSettings])
 
     const handleCursorModelRowClick = useCallback((nextModel: string | null) => {
         if (!onModelChange || controlsDisabled) return
@@ -1380,6 +1500,23 @@ export function HappyComposer(props: {
         haptic('light')
     }, [onModelEffortChange, onModelChange, controlsDisabled, haptic, dismissSettings])
 
+    useEffect(() => {
+        if (!showSettings) return
+
+        const handlePointerDown = (event: PointerEvent) => {
+            const target = event.target
+            if (!(target instanceof Node)) return
+            if (settingsOverlayRef.current?.contains(target)) return
+            if (settingsButtonRef.current?.contains(target)) return
+            if (modelValueButtonRef.current?.contains(target)) return
+            if (effortValueButtonRef.current?.contains(target)) return
+            dismissSettings()
+        }
+
+        document.addEventListener('pointerdown', handlePointerDown, true)
+        return () => document.removeEventListener('pointerdown', handlePointerDown, true)
+    }, [dismissSettings, showSettings])
+
     const handleSubmit = useCallback((event?: ReactFormEvent<HTMLFormElement>) => {
         event?.preventDefault()
         if (!attachmentsReady) {
@@ -1417,11 +1554,11 @@ export function HappyComposer(props: {
     }, [onModelReasoningEffortChange, controlsDisabled, haptic, dismissSettings])
 
     const handleEffortChange = useCallback((nextEffort: string | null) => {
-        if (!onEffortChange || controlsDisabled) return
+        if (!onEffortChange || configurationControlsDisabled) return
         onEffortChange(nextEffort)
         dismissSettings()
         haptic('light')
-    }, [onEffortChange, controlsDisabled, haptic, dismissSettings])
+    }, [onEffortChange, configurationControlsDisabled, haptic, dismissSettings])
 
     const handleServiceTierChange = useCallback((nextServiceTier: string | null) => {
         if (!onServiceTierChange || controlsDisabled) return
@@ -1440,7 +1577,12 @@ export function HappyComposer(props: {
     const showCollaborationSettings = Boolean(onCollaborationModeChange && collaborationModeOptions.length > 0)
     const showCopilotAgentModeSettings = Boolean(onCopilotAgentModeChange && copilotAgentModeOptions.length > 0)
     const showPermissionSettings = Boolean(onPermissionModeChange && permissionModeOptions.length > 0)
-    const showModelSettings = Boolean(onModelChange && supportsModelChange(agentFlavor) && (piModels && piModels.length > 0 || modelOptions.length > 0))
+    const showModelSettings = agentFlavor === 'pi'
+        // Pi models only come from the dynamic piModels catalog; never fall
+        // back to the generic synthesized modelOptions rows (they would post a
+        // bare model id the Pi runner cannot resolve to a provider).
+        ? Boolean(onModelChange && piModelGroups)
+        : Boolean(onModelChange && supportsModelChange(agentFlavor) && modelOptions.length > 0)
         && !cursorVariantDrillDownActive
     const showModelEffortSettings = cursorVariantDrillDownActive
         ? Boolean((onModelEffortChange ?? onModelChange) && visibleModelEffortOptions && visibleModelEffortOptions.length > 0)
@@ -1450,10 +1592,15 @@ export function HappyComposer(props: {
             && modelEffortOptions.length > 1
         )
     const showModelReasoningEffortSettings = Boolean(onModelReasoningEffortChange && codexReasoningEffortOptions.length > 0)
-    // For Pi: hide effort when selected model explicitly has reasoning: false
-    const piEffortHidden = piModels && selectedPiModel && selectedPiModel.reasoning === false
-    const showEffortSettings = Boolean(onEffortChange && supportsEffort(agentFlavor) && !piEffortHidden)
+    // For Pi: hide effort while the selected model is unresolved (catalog
+    // still loading/failed) or explicitly has reasoning: false — the generic
+    // fallback levels would mutate a set_thinking_level the model may reject.
+    const piEffortUnavailable = agentFlavor === 'pi'
+        && (!selectedPiModel || selectedPiModel.reasoning === false)
+    const showEffortSettings = Boolean(onEffortChange && supportsEffort(agentFlavor) && !piEffortUnavailable)
     const showFastModeSettings = Boolean(onServiceTierChange)
+    const showModelAreaSettings = showModelSettings || showModelEffortSettings || showModelReasoningEffortSettings || showEffortSettings
+    const showOtherSettings = showFastModeSettings || showCollaborationSettings || showCopilotAgentModeSettings
     const showSettingsButton = Boolean(
         showCollaborationSettings
         || showCopilotAgentModeSettings
@@ -1467,235 +1614,116 @@ export function HappyComposer(props: {
     const showAbortButton = true
     const voiceEnabled = Boolean(effectiveVoiceToggle)
 
-    // Pi: selected model info for UI labels and thinking level filtering
-    const piModelLabel = agentFlavor === 'pi'
-        ? (selectedPiModel?.name ?? selectedPiModel?.modelId ?? 'Model')
-        : undefined
-    const piThinkingLabel = agentFlavor === 'pi'
-        ? (() => {
-            if (!selectedPiModel) return 'Thinking'
-            const effectiveLevel = effort && isThinkingLevelSupported(effort, selectedPiModel.thinkingLevelMap)
+    // Generic model/effort value buttons. The current value label doubles as
+    // the button caption; clicking opens the settings sheet. Hidden on narrow
+    // viewports where only the settings button remains.
+    const isNarrowViewport = useNarrowViewport()
+    // Pi turns run for minutes with thread.isDisabled set the whole time, so
+    // Pi keeps its model/effort controls live mid-turn (#1442) — the generic
+    // disable rule (controlsDisabled) would lock them for the entire turn.
+    const modelEffortControlsDisabled = agentFlavor === 'pi' ? configurationControlsDisabled : controlsDisabled
+    const modelValueLabel = useMemo(() => {
+        if (isNarrowViewport) return undefined
+        if (!onModelChange || !supportsModelChange(agentFlavor)) return undefined
+        // Pi models come from the dynamic piModels catalog; show the
+        // provider-qualified selection name. No button until the catalog
+        // resolves: a bare session model id has no provider and the sheet
+        // would have no Model section to open anyway.
+        if (agentFlavor === 'pi') {
+            if (!selectedPiModel) return undefined
+            return selectedPiModel.name ?? selectedPiModel.modelId
+        }
+        if (modelOptions.length === 0) return undefined
+        const rawKey = selectedModelBase !== undefined ? selectedModelBase : model
+        // `null` (default selection) and the `auto`/`default` wire values all
+        // mean "let the agent pick" — normalize them onto the `value: null`
+        // option so the localized option label is always found.
+        const normalizedKey = !rawKey || rawKey === 'auto' || rawKey === 'default' ? null : rawKey
+        const option = modelOptions.find((candidate) => candidate.value === normalizedKey)
+        return option?.label ?? rawKey ?? undefined
+    }, [isNarrowViewport, onModelChange, agentFlavor, selectedPiModel, model, modelOptions, selectedModelBase])
+    const effortValueLabel = useMemo(() => {
+        if (isNarrowViewport) return undefined
+        if (!onEffortChange || !supportsEffort(agentFlavor)) return undefined
+        // Pi: without a resolved catalog entry there is no capability map to
+        // derive levels from; hide the button until the selected model is known.
+        if (agentFlavor === 'pi') {
+            if (!selectedPiModel || selectedPiModel.reasoning === false) return undefined
+            const effectiveLevel = effort && isThinkingLevelSupported(effort, selectedPiModel?.thinkingLevelMap)
                 ? effort
-                : getHighestThinkingLevel(selectedPiModel.thinkingLevelMap)
+                : getHighestThinkingLevel(selectedPiModel?.thinkingLevelMap)
             return effectiveLevel
                 ? (PI_THINKING_LEVEL_LABELS[effectiveLevel as PiThinkingLevel] ?? effectiveLevel)
-                : 'Thinking'
-        })()
-        : undefined
-    const piHasModels = piModels && piModels.length > 0
+                : undefined
+        }
+        const option = claudeEffortOptions.find((candidate) => candidate.value === effort)
+        return option?.label ?? (effort ? effort : undefined)
+    }, [isNarrowViewport, onEffortChange, agentFlavor, selectedPiModel, effort, claudeEffortOptions])
 
-    const closeAllPanels = useCallback(() => {
-        clearCursorDrillDown()
-        setShowSettings(false)
-        setShowPiModelPanel(false)
-        setShowPiThinkingPanel(false)
-    }, [clearCursorDrillDown])
+    // Wrapper for DOM onClick consumers: never leak the MouseEvent into the
+    // `section` parameter (the gear must always open the full sheet).
+    const handleGearToggle = useCallback(() => {
+        handleSettingsToggle(null)
+    }, [handleSettingsToggle])
 
-    const handlePiModelToggle = useCallback(() => {
-        if (controlsDisabled) return
-        setShowPiModelPanel((v) => !v)
-        setShowSettings(false)
-        setShowPiThinkingPanel(false)
-        haptic('light')
-    }, [controlsDisabled, haptic])
+    const handleModelValueToggle = useCallback(() => {
+        if (modelEffortControlsDisabled) return
+        handleSettingsToggle('model')
+    }, [modelEffortControlsDisabled, handleSettingsToggle])
 
-    const handlePiThinkingToggle = useCallback(() => {
-        if (controlsDisabled) return
-        setShowPiThinkingPanel((v) => !v)
-        setShowSettings(false)
-        setShowPiModelPanel(false)
-        haptic('light')
-    }, [controlsDisabled, haptic])
+    const handleEffortValueToggle = useCallback(() => {
+        if (modelEffortControlsDisabled) return
+        handleSettingsToggle('effort')
+    }, [modelEffortControlsDisabled, handleSettingsToggle])
 
     const overlayPositionClass = isExpanded
         ? 'absolute z-10 bottom-12 mb-2'
         : 'absolute z-10 bottom-[100%] mb-2'
 
     const overlays = useMemo(() => {
-        // Pi flavor: separate floating panels for model and thinking level.
-        // (Pi RPC mode has no runtime permission switching → no permission panel.)
-        if (agentFlavor === 'pi') {
-            const panels: React.ReactNode[] = []
-
-            // Model selection panel
-            if (showPiModelPanel && piModels && piModels.length > 0) {
-                const currentPiModel = selectedPiModel ?? null
-                panels.push(
-                    <div key="model" className={`${overlayPositionClass} left-2 w-64`}>
-                        <PiModelPanel
-                            models={piModels}
-                            currentModel={currentPiModel ? { provider: currentPiModel.provider, modelId: currentPiModel.modelId } : null}
-                            controlsDisabled={controlsDisabled}
-                            onSelect={(piModel) => {
-                                handleModelChange({ provider: piModel.provider, modelId: piModel.modelId })
-                            }}
-                            onClose={closeAllPanels}
-                        />
-                    </div>
-                )
-            }
-
-            // Thinking level panel
-            if (showPiThinkingPanel && selectedPiModel?.reasoning !== false) {
-                panels.push(
-                    <div key="thinking" className={`${overlayPositionClass} left-2 w-48`}>
-                        <PiThinkingLevelPanel
-                            currentLevel={effort}
-                            reasoning={selectedPiModel?.reasoning}
-                            thinkingLevelMap={selectedPiModel?.thinkingLevelMap}
-                            controlsDisabled={controlsDisabled}
-                            onSelect={(level) => handleEffortChange(level)}
-                            onClose={closeAllPanels}
-                        />
-                    </div>
-                )
-            }
-
-            if (panels.length > 0) return <>{panels}</>
-        }
-
-        // Non-Pi flavors: original unified gear menu
-        if (showSettings && (showCollaborationSettings || showCopilotAgentModeSettings || showPermissionSettings || showModelSettings || showModelEffortSettings || showModelReasoningEffortSettings || showEffortSettings || showFastModeSettings)) {
+        // Unified settings sheet for every flavor (Pi included).
+        // Anchored open (settingsSection): a model/effort value button expands
+        // only its own area; the gear (null) expands the full sheet.
+        const sheetModelAreaOn = settingsSection !== 'effort'
+        const sheetEffortAreaOn = settingsSection !== 'model'
+        const sheetOthersOn = settingsSection === null
+        const sheetModelSettings = showModelSettings && sheetModelAreaOn
+        const sheetModelEffortSettings = showModelEffortSettings && sheetModelAreaOn
+        const sheetModelReasoningEffortSettings = showModelReasoningEffortSettings && sheetEffortAreaOn
+        const sheetEffortSettings = showEffortSettings && sheetEffortAreaOn
+        const sheetPermissionSettings = showPermissionSettings && sheetOthersOn
+        const sheetFastModeSettings = showFastModeSettings && sheetOthersOn
+        const sheetCollaborationSettings = showCollaborationSettings && sheetOthersOn
+        const sheetCopilotAgentModeSettings = showCopilotAgentModeSettings && sheetOthersOn
+        const sheetModelAreaSettings = sheetModelSettings || sheetModelEffortSettings || sheetModelReasoningEffortSettings || sheetEffortSettings
+        const sheetOtherSettings = sheetFastModeSettings || sheetCollaborationSettings || sheetCopilotAgentModeSettings
+        if (showSettings && (sheetCollaborationSettings || sheetCopilotAgentModeSettings || sheetPermissionSettings || sheetModelSettings || sheetModelEffortSettings || sheetModelReasoningEffortSettings || sheetEffortSettings || sheetFastModeSettings)) {
             return (
-                <div className={`${overlayPositionClass} w-full`}>
+                <div ref={settingsOverlayRef} className={`${overlayPositionClass} w-full`}>
                     <FloatingOverlay maxHeight={320}>
-                        {showCollaborationSettings ? (
-                            <div className="py-2">
-                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
-                                    {t('misc.collaborationMode')}
-                                </div>
-                                {collaborationModeOptions.map((option) => (
-                                    <button
-                                        key={option.mode}
-                                        type="button"
-                                        disabled={controlsDisabled}
-                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                            controlsDisabled
-                                                ? 'cursor-not-allowed opacity-50'
-                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
-                                        }`}
-                                        onClick={() => handleCollaborationChange(option.mode)}
-                                        onMouseDown={(e) => e.preventDefault()}
-                                    >
-                                        <div
-                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
-                                                collaborationMode === option.mode
-                                                    ? 'border-[var(--app-link)]'
-                                                    : 'border-[var(--app-hint)]'
-                                            }`}
-                                        >
-                                            {collaborationMode === option.mode && (
-                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
-                                            )}
-                                        </div>
-                                        <span className={collaborationMode === option.mode ? 'text-[var(--app-link)]' : ''}>
-                                            {option.label}
-                                        </span>
-                                    </button>
-                                ))}
-                            </div>
-                        ) : null}
-
-                        {showCopilotAgentModeSettings ? (
-                            <div className="py-2">
-                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
-                                    {t('misc.copilotAgentMode')}
-                                </div>
-                                {copilotAgentModeOptions.map((option) => (
-                                    <button
-                                        key={option.mode}
-                                        type="button"
-                                        disabled={controlsDisabled}
-                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                            controlsDisabled
-                                                ? 'cursor-not-allowed opacity-50'
-                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
-                                        }`}
-                                        onClick={() => handleCopilotAgentModeChange(option.mode)}
-                                        onMouseDown={(e) => e.preventDefault()}
-                                    >
-                                        <div
-                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
-                                                copilotAgentMode === option.mode
-                                                    ? 'border-[var(--app-link)]'
-                                                    : 'border-[var(--app-hint)]'
-                                            }`}
-                                        >
-                                            {copilotAgentMode === option.mode && (
-                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
-                                            )}
-                                        </div>
-                                        <span className={copilotAgentMode === option.mode ? 'text-[var(--app-link)]' : ''}>
-                                            {option.label}
-                                        </span>
-                                    </button>
-                                ))}
-                            </div>
-                        ) : null}
-
-                        {(showCollaborationSettings || showCopilotAgentModeSettings) && (showPermissionSettings || showModelSettings || showModelReasoningEffortSettings || showEffortSettings) ? (
-                            <div className="mx-3 h-px bg-[var(--app-divider)]" />
-                        ) : null}
-
-                        {showPermissionSettings ? (
-                            <div className="py-2">
-                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
-                                    {t('misc.permissionMode')}
-                                </div>
-                                {permissionModeOptions.map((option) => (
-                                    <button
-                                        key={option.mode}
-                                        type="button"
-                                        disabled={controlsDisabled}
-                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                            controlsDisabled
-                                                ? 'cursor-not-allowed opacity-50'
-                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
-                                        }`}
-                                        onClick={() => handlePermissionChange(option.mode)}
-                                        onMouseDown={(e) => e.preventDefault()}
-                                    >
-                                        <div
-                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
-                                                permissionMode === option.mode
-                                                    ? 'border-[var(--app-link)]'
-                                                    : 'border-[var(--app-hint)]'
-                                            }`}
-                                        >
-                                            {permissionMode === option.mode && (
-                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
-                                            )}
-                                        </div>
-                                        <span className={permissionMode === option.mode ? 'text-[var(--app-link)]' : ''}>
-                                            {option.label}
-                                        </span>
-                                    </button>
-                                ))}
-                            </div>
-                        ) : null}
-
-                        {(showCollaborationSettings || showCopilotAgentModeSettings || showPermissionSettings) && (showModelSettings || showModelEffortSettings || showModelReasoningEffortSettings || showEffortSettings) ? (
-                            <div className="mx-3 h-px bg-[var(--app-divider)]" />
-                        ) : null}
-
-                        {showModelSettings ? (
+                        {sheetModelSettings ? (
                             <div className="py-2">
                                 <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
                                     {t('misc.model')}
                                 </div>
-                                {piModelGroups ? (
-                                    piModelGroups.map((group) => (
+                                {agentFlavor === 'pi'
+                                    ? piModelGroups?.map((group) => (
                                         <div key={group.provider}>
                                             <div className="px-3 pt-2 pb-0.5 text-xs font-medium text-[var(--app-hint)]">
                                                 {group.label}
                                             </div>
-                                            {group.models.map((piModel) => (
+                                            {group.models.map((piModel) => {
+                                                const piRowSelected = piSelectedModel
+                                                    ? piSelectedModel.provider === piModel.provider
+                                                        && piSelectedModel.modelId === piModel.modelId
+                                                    : model === piModel.modelId
+                                                return (
                                                 <button
-                                                    key={piModel.modelId}
+                                                    key={`${piModel.provider}:${piModel.modelId}`}
                                                     type="button"
-                                                    disabled={controlsDisabled}
+                                                    disabled={modelEffortControlsDisabled}
                                                     className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                                        controlsDisabled
+                                                        modelEffortControlsDisabled
                                                             ? 'cursor-not-allowed opacity-50'
                                                             : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
                                                     }`}
@@ -1704,24 +1732,24 @@ export function HappyComposer(props: {
                                                 >
                                                     <div
                                                         className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
-                                                            model === piModel.modelId
+                                                            piRowSelected
                                                                 ? 'border-[var(--app-link)]'
                                                                 : 'border-[var(--app-hint)]'
                                                     }`}
                                                     >
-                                                        {model === piModel.modelId && (
+                                                        {piRowSelected && (
                                                             <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
                                                         )}
                                                     </div>
-                                                    <span className={model === piModel.modelId ? 'text-[var(--app-link)]' : ''}>
+                                                    <span className={piRowSelected ? 'text-[var(--app-link)]' : ''}>
                                                         {piModel.name ?? piModel.modelId}
                                                     </span>
                                                 </button>
-                                            ))}
+                                                )
+                                            })}
                                         </div>
                                     ))
-                                ) : (
-                                    modelOptions.map((option) => {
+                                    : modelOptions.map((option) => {
                                         const isSelected = selectedModelBase !== undefined
                                             ? selectedModelBase === option.value
                                             : model === option.value
@@ -1729,9 +1757,9 @@ export function HappyComposer(props: {
                                         <button
                                             key={option.value ?? 'auto'}
                                             type="button"
-                                            disabled={controlsDisabled}
+                                            disabled={modelEffortControlsDisabled}
                                             className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                                controlsDisabled
+                                                modelEffortControlsDisabled
                                                     ? 'cursor-not-allowed opacity-50'
                                                     : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
                                             }`}
@@ -1760,16 +1788,15 @@ export function HappyComposer(props: {
                                             </span>
                                         </button>
                                         )
-                                    })
-                                )}
+                                    })}
                             </div>
                         ) : null}
 
-                        {showModelSettings && showModelEffortSettings ? (
+                        {sheetModelSettings && sheetModelEffortSettings ? (
                             <div className="mx-3 h-px bg-[var(--app-divider)]" />
                         ) : null}
 
-                        {showModelEffortSettings ? (
+                        {sheetModelEffortSettings ? (
                             <ModelEffortSettingsSection
                                 agentFlavor={agentFlavor}
                                 options={[...(visibleModelEffortOptions ?? [])]}
@@ -1788,11 +1815,11 @@ export function HappyComposer(props: {
                             />
                         ) : null}
 
-                        {(showModelSettings || showModelEffortSettings) && showModelReasoningEffortSettings ? (
+                        {(sheetModelSettings || sheetModelEffortSettings) && sheetModelReasoningEffortSettings ? (
                             <div className="mx-3 h-px bg-[var(--app-divider)]" />
                         ) : null}
 
-                        {showModelReasoningEffortSettings ? (
+                        {sheetModelReasoningEffortSettings ? (
                             <div className="py-2">
                                 <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
                                     {t('misc.reasoningEffort')}
@@ -1829,11 +1856,11 @@ export function HappyComposer(props: {
                             </div>
                         ) : null}
 
-                        {showModelReasoningEffortSettings && showEffortSettings ? (
+                        {sheetModelReasoningEffortSettings && sheetEffortSettings ? (
                             <div className="mx-3 h-px bg-[var(--app-divider)]" />
                         ) : null}
 
-                        {showEffortSettings ? (
+                        {sheetEffortSettings ? (
                             <div className="py-2">
                                 <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
                                     {t('misc.effort')}
@@ -1842,13 +1869,15 @@ export function HappyComposer(props: {
                                     <button
                                         key={option.value ?? 'auto'}
                                         type="button"
-                                        disabled={controlsDisabled}
+                                        disabled={modelEffortControlsDisabled}
                                         className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
-                                            controlsDisabled
+                                            modelEffortControlsDisabled
                                                 ? 'cursor-not-allowed opacity-50'
                                                 : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
                                         }`}
-                                        onClick={() => handleEffortChange(option.value)}
+                                        onClick={() => handleEffortChange(
+                                            agentFlavor === 'pi' && effort === option.value ? null : option.value
+                                        )}
                                         onMouseDown={(e) => e.preventDefault()}
                                     >
                                         <div
@@ -1870,11 +1899,52 @@ export function HappyComposer(props: {
                             </div>
                         ) : null}
 
-                        {(showModelReasoningEffortSettings || showEffortSettings) && showFastModeSettings ? (
+                        {sheetModelAreaSettings && sheetPermissionSettings ? (
                             <div className="mx-3 h-px bg-[var(--app-divider)]" />
                         ) : null}
 
-                        {showFastModeSettings ? (
+                        {sheetPermissionSettings ? (
+                            <div className="py-2">
+                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
+                                    {t('misc.permissionMode')}
+                                </div>
+                                {permissionModeOptions.map((option) => (
+                                    <button
+                                        key={option.mode}
+                                        type="button"
+                                        disabled={controlsDisabled}
+                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                                            controlsDisabled
+                                                ? 'cursor-not-allowed opacity-50'
+                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
+                                        }`}
+                                        onClick={() => handlePermissionChange(option.mode)}
+                                        onMouseDown={(e) => e.preventDefault()}
+                                    >
+                                        <div
+                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
+                                                permissionMode === option.mode
+                                                    ? 'border-[var(--app-link)]'
+                                                    : 'border-[var(--app-hint)]'
+                                            }`}
+                                        >
+                                            {permissionMode === option.mode && (
+                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
+                                            )}
+                                        </div>
+                                        <span className={permissionMode === option.mode ? 'text-[var(--app-link)]' : ''}>
+                                            {option.label}
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        ) : null}
+
+                        {(sheetPermissionSettings || sheetModelAreaSettings) && sheetOtherSettings ? (
+                            <div className="mx-3 h-px bg-[var(--app-divider)]" />
+                        ) : null}
+
+                        {sheetFastModeSettings ? (
                             <div className="py-2">
                                 <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
                                     {t('misc.fastMode')}
@@ -1910,6 +1980,86 @@ export function HappyComposer(props: {
                                 ))}
                             </div>
                         ) : null}
+
+                        {sheetFastModeSettings && (sheetCollaborationSettings || sheetCopilotAgentModeSettings) ? (
+                            <div className="mx-3 h-px bg-[var(--app-divider)]" />
+                        ) : null}
+
+                        {sheetCollaborationSettings ? (
+                            <div className="py-2">
+                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
+                                    {t('misc.collaborationMode')}
+                                </div>
+                                {collaborationModeOptions.map((option) => (
+                                    <button
+                                        key={option.mode}
+                                        type="button"
+                                        disabled={controlsDisabled}
+                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                                            controlsDisabled
+                                                ? 'cursor-not-allowed opacity-50'
+                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
+                                        }`}
+                                        onClick={() => handleCollaborationChange(option.mode)}
+                                        onMouseDown={(e) => e.preventDefault()}
+                                    >
+                                        <div
+                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
+                                                collaborationMode === option.mode
+                                                    ? 'border-[var(--app-link)]'
+                                                    : 'border-[var(--app-hint)]'
+                                            }`}
+                                        >
+                                            {collaborationMode === option.mode && (
+                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
+                                            )}
+                                        </div>
+                                        <span className={collaborationMode === option.mode ? 'text-[var(--app-link)]' : ''}>
+                                            {option.label}
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        ) : null}
+
+                        {sheetCopilotAgentModeSettings ? (
+                            <div className="py-2">
+                                <div className="px-3 pb-1 text-xs font-semibold text-[var(--app-hint)]">
+                                    {t('misc.copilotAgentMode')}
+                                </div>
+                                {copilotAgentModeOptions.map((option) => (
+                                    <button
+                                        key={option.mode}
+                                        type="button"
+                                        disabled={controlsDisabled}
+                                        className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                                            controlsDisabled
+                                                ? 'cursor-not-allowed opacity-50'
+                                                : 'cursor-pointer hover:bg-[var(--app-secondary-bg)]'
+                                        }`}
+                                        onClick={() => handleCopilotAgentModeChange(option.mode)}
+                                        onMouseDown={(e) => e.preventDefault()}
+                                    >
+                                        <div
+                                            className={`flex h-4 w-4 items-center justify-center rounded-full border-2 ${
+                                                copilotAgentMode === option.mode
+                                                    ? 'border-[var(--app-link)]'
+                                                    : 'border-[var(--app-hint)]'
+                                            }`}
+                                        >
+                                            {copilotAgentMode === option.mode && (
+                                                <div className="h-2 w-2 rounded-full bg-[var(--app-link)]" />
+                                            )}
+                                        </div>
+                                        <span className={copilotAgentMode === option.mode ? 'text-[var(--app-link)]' : ''}>
+                                            {option.label}
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        ) : null}
+
+                        
                     </FloatingOverlay>
                 </div>
             )
@@ -1932,12 +2082,11 @@ export function HappyComposer(props: {
         return null
     }, [
         showSettings,
-        showPiModelPanel,
-        showPiThinkingPanel,
+        settingsSection,
         agentFlavor,
         piModels,
+        piSelectedModel,
         selectedPiModel,
-        closeAllPanels,
         showCollaborationSettings,
         showCopilotAgentModeSettings,
         showPermissionSettings,
@@ -1953,6 +2102,7 @@ export function HappyComposer(props: {
         selectedModelVariant,
         showModelReasoningEffortSettings,
         showEffortSettings,
+        modelEffortControlsDisabled,
         showFastModeSettings,
         agentFlavor,
         modelOptions,
@@ -2076,7 +2226,12 @@ export function HappyComposer(props: {
                             <div className={`flex flex-wrap gap-2 px-4 pt-3 ${
                                 isExpanded ? 'max-h-[35%] shrink-0 overflow-y-auto' : ''
                             }`}>
-                                <ComposerPrimitive.Attachments components={{ Attachment: AttachmentItem }} />
+                                <SortableComposerAttachments
+                                    attachments={attachments}
+                                    orderedAttachmentIds={orderedAttachmentIds}
+                                    disabled={controlsDisabled}
+                                    onReorder={handleAttachmentReorder}
+                                />
                             </div>
                         ) : null}
 
@@ -2171,7 +2326,11 @@ export function HappyComposer(props: {
                             canSend={canSend}
                             controlsDisabled={controlsDisabled}
                             showSettingsButton={showSettingsButton}
-                            onSettingsToggle={handleSettingsToggle}
+                            settingsButtonRef={settingsButtonRef}
+                            settingsDisabled={modelEffortControlsDisabled}
+                            modelValueButtonRef={modelValueButtonRef}
+                            effortValueButtonRef={effortValueButtonRef}
+                            onSettingsToggle={handleGearToggle}
                             expanded={isExpanded}
                             onExpandedToggle={handleExpandedToggle}
                             showTerminalButton={showTerminalButton}
@@ -2193,19 +2352,18 @@ export function HappyComposer(props: {
                             onVoiceToggle={effectiveVoiceToggle ?? (() => {})}
                             onVoiceMicToggle={dictationActive ? undefined : onVoiceMicToggle}
                             onSend={handleSend}
-                            allowQueueGesture={canQueueSend}
                             pendingSchedule={pendingSchedule}
                             onSchedule={handleUserSchedule}
                             onClearSchedule={onUserClearSchedule}
-                            hasAttachments={hasAttachments}
-                            piModelLabel={piModelLabel}
-                            piModelDisabled={controlsDisabled || !piHasModels}
-                            piModelOpen={showPiModelPanel}
-                            onPiModelToggle={handlePiModelToggle}
-                            piThinkingLabel={piThinkingLabel}
-                            piThinkingDisabled={controlsDisabled || !piHasModels || !selectedPiModel || selectedPiModel.reasoning === false}
-                            piThinkingOpen={showPiThinkingPanel}
-                            onPiThinkingToggle={handlePiThinkingToggle}
+                            hasAttachments={blocksScheduling}
+                            modelValueLabel={modelValueLabel}
+                            modelValueDisabled={modelEffortControlsDisabled}
+                            modelValueOpen={showSettings && settingsSection !== 'effort'}
+                            onModelValueToggle={handleModelValueToggle}
+                            effortValueLabel={effortValueLabel}
+                            effortValueDisabled={modelEffortControlsDisabled}
+                            effortValueOpen={showSettings && settingsSection !== 'model'}
+                            onEffortValueToggle={handleEffortValueToggle}
                             scratchlistMode={props.scratchlistMode}
                             scratchlistCount={props.scratchlistCount}
                             onScratchlistToggle={props.onScratchlistToggle}

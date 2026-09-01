@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionSummary } from '@/types/api'
-import { classifySessionAttention } from './sessionAttention'
+import {
+    classifySessionAttention,
+    sessionIsUnread,
+} from './sessionAttention'
 
 function makeSummary(overrides: Partial<SessionSummary> & { id: string }): SessionSummary {
     return {
@@ -30,6 +33,38 @@ describe('classifySessionAttention', () => {
         const attention = classifySessionAttention(
             makeSummary({ id: 'a', pendingRequestKinds: ['permission'] }),
             { selected: true, lastSeenAt: 0 }
+        )
+        expect(attention).toBeNull()
+    })
+
+    it('shows an explicitly marked unread dot for the selected session', () => {
+        const attention = classifySessionAttention(
+            makeSummary({ id: 'a', updatedAt: 5000 }),
+            { selected: true, lastSeenAt: 5000, manualUnreadAt: 5000 }
+        )
+        expect(attention).toEqual({ kind: 'unread' })
+    })
+
+    it('keeps an explicitly marked unread dot while the selected session is thinking', () => {
+        const attention = classifySessionAttention(
+            makeSummary({ id: 'a', thinking: true, updatedAt: 5000 }),
+            { selected: true, lastSeenAt: 5000, manualUnreadAt: 5000 }
+        )
+        expect(attention).toEqual({ kind: 'unread' })
+    })
+
+    it('does not show selected-session attention for ordinary new activity', () => {
+        const attention = classifySessionAttention(
+            makeSummary({ id: 'a', updatedAt: 5000 }),
+            { selected: true, lastSeenAt: 1000 }
+        )
+        expect(attention).toBeNull()
+    })
+
+    it('does not carry an explicit unread dot across newer activity', () => {
+        const attention = classifySessionAttention(
+            makeSummary({ id: 'a', updatedAt: 6000 }),
+            { selected: true, lastSeenAt: 5000, manualUnreadAt: 5000 }
         )
         expect(attention).toBeNull()
     })
@@ -94,5 +129,42 @@ describe('classifySessionAttention', () => {
             { selected: false, lastSeenAt: 1000 }
         )
         expect(attention).toEqual({ kind: 'unread' })
+    })
+})
+
+describe('sessionIsUnread', () => {
+    it('is true when updatedAt is newer than lastSeenAt', () => {
+        expect(sessionIsUnread(
+            makeSummary({ id: 'u', updatedAt: 5000 }),
+            { lastSeenAt: 1000 }
+        )).toBe(true)
+    })
+
+    it('is false when the operator has already seen this update', () => {
+        expect(sessionIsUnread(
+            makeSummary({ id: 'seen', updatedAt: 1000 }),
+            { lastSeenAt: 5000 }
+        )).toBe(false)
+    })
+
+    it('does not care about permission / background fields — only the watermark', () => {
+        expect(sessionIsUnread(
+            makeSummary({
+                id: 'p',
+                pendingRequestKinds: ['permission'],
+                pendingRequestsCount: 1,
+                updatedAt: 1000,
+            }),
+            { lastSeenAt: 1000 }
+        )).toBe(false)
+
+        expect(sessionIsUnread(
+            makeSummary({
+                id: 'bg',
+                backgroundTaskCount: 3,
+                updatedAt: 9000,
+            }),
+            { lastSeenAt: 1000 }
+        )).toBe(true)
     })
 })

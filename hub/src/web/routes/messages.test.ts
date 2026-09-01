@@ -26,8 +26,10 @@ function createApp(opts: {
     getMessagesPage?: GetMessagesPage
     getQueuedState?: (sessionId: string, localIds: string[]) => {
         queuedLocalIds: string[]
+        indeterminateLocalIds: string[]
         invokedLocalMessages: Array<{ localId: string; invokedAt: number }>
     }
+    steerQueuedMessage?: (sessionId: string, messageId: string) => Promise<unknown>
 }) {
     const sentMessages: Array<{ sessionId: string; payload: unknown }> = []
     const queuedStateCalls: Array<{ sessionId: string; localIds: string[] }> = []
@@ -38,6 +40,7 @@ function createApp(opts: {
         queuedStateCalls.push({ sessionId, localIds })
         return {
             queuedLocalIds: localIds.filter((localId) => localId.startsWith('queued-')),
+            indeterminateLocalIds: [],
             invokedLocalMessages: localIds
                 .filter((localId) => localId.startsWith('invoked-'))
                 .map((localId) => ({ localId, invokedAt: 1_000 }))
@@ -69,6 +72,7 @@ function createApp(opts: {
         sendMessage,
         getQueuedState,
         cancelQueuedMessage: async () => ({ status: 'cancelled' }),
+        steerQueuedMessage: opts.steerQueuedMessage ?? (async () => ({ status: 'failed', error: 'Steer failed', localId: null })),
         getMessagesPage,
     } as unknown as SyncEngine
 
@@ -445,6 +449,7 @@ describe('POST /api/sessions/:id/messages/queued-state', () => {
         expect(response.status).toBe(200)
         expect(await response.json()).toEqual({
             queuedLocalIds: ['queued-2', 'queued-1'],
+            indeterminateLocalIds: [],
             invokedLocalMessages: [{ localId: 'invoked-1', invokedAt: 1_000 }]
         })
         expect(queuedStateCalls).toEqual([{
@@ -463,7 +468,7 @@ describe('POST /api/sessions/:id/messages/queued-state', () => {
         })
 
         expect(response.status).toBe(200)
-        expect(await response.json()).toEqual({ queuedLocalIds: [], invokedLocalMessages: [] })
+        expect(await response.json()).toEqual({ queuedLocalIds: [], indeterminateLocalIds: [], invokedLocalMessages: [] })
         expect(queuedStateCalls).toHaveLength(0)
     })
 
@@ -483,5 +488,34 @@ describe('POST /api/sessions/:id/messages/queued-state', () => {
         expect(response.status).toBe(400)
         expect(await response.json()).toMatchObject({ error: 'Invalid body' })
         expect(queuedStateCalls).toHaveLength(0)
+    })
+})
+
+describe('POST /api/sessions/:id/messages/:messageId/steer', () => {
+    it('forwards the steer request to the engine and returns its result', async () => {
+        const calls: Array<{ sessionId: string; messageId: string }> = []
+        const { app } = createApp({
+            steerQueuedMessage: async (sessionId: string, messageId: string) => {
+                calls.push({ sessionId, messageId })
+                return { status: 'steered', localId: 'local-1' }
+            }
+        })
+
+        const response = await app.request('/api/sessions/session-1/messages/msg-1/steer', { method: 'POST' })
+
+        expect(response.status).toBe(200)
+        expect(calls).toEqual([{ sessionId: 'session-1', messageId: 'msg-1' }])
+        expect(await response.json()).toEqual({ status: 'steered', localId: 'local-1' })
+    })
+
+    it('rejects inactive sessions', async () => {
+        const { app } = createApp({ active: false })
+
+        const response = await app.request('/api/sessions/session-1/messages/msg-1/steer', { method: 'POST' })
+
+        expect(response.status).toBe(409)
+        const body = await response.json() as { error: string; code: string }
+        expect(body.error).toBe('Session is inactive')
+        expect(body.code).toBe('session_inactive')
     })
 })

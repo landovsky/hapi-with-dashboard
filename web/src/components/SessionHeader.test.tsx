@@ -2,14 +2,20 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Session } from '@/types/api'
+import type { ApiClient } from '@/api/client'
 import { I18nProvider } from '@/lib/i18n-context'
-import { ToastProvider } from '@/lib/toast-context'
+import { ToastProvider, useToast } from '@/lib/toast-context'
 import { resolveSessionHeaderMachineLabel, SessionHeader } from './SessionHeader'
 
 afterEach(() => {
     cleanup()
     localStorage.clear()
 })
+
+function ToastMessages() {
+    const { toasts } = useToast()
+    return <>{toasts.map((toast) => <div key={toast.id}>{toast.title}: {toast.body}</div>)}</>
+}
 
 function baseSession(overrides: Partial<Session> = {}): Session {
     return {
@@ -34,7 +40,7 @@ function baseSession(overrides: Partial<Session> = {}): Session {
     }
 }
 
-function renderHeader(session: Session, extra?: { serviceTier?: string | null }) {
+function renderHeader(session: Session, extra?: { serviceTier?: string | null; titleSuggestionAvailable?: boolean }) {
     return render(
         <QueryClientProvider client={new QueryClient()}>
             <ToastProvider>
@@ -42,6 +48,7 @@ function renderHeader(session: Session, extra?: { serviceTier?: string | null })
                     <SessionHeader
                         session={session}
                         serviceTier={extra?.serviceTier}
+                        titleSuggestionAvailable={extra?.titleSuggestionAvailable}
                         onBack={vi.fn()}
                         api={null}
                     />
@@ -76,6 +83,33 @@ describe('resolveSessionHeaderMachineLabel', () => {
 })
 
 describe('SessionHeader', () => {
+    it('hides title generation when the Hub does not advertise the capability', () => {
+        const api = {
+            getMachines: vi.fn().mockResolvedValue({ machines: [] }),
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] })
+        } as unknown as ApiClient
+
+        render(
+            <QueryClientProvider client={new QueryClient()}>
+                <ToastProvider>
+                    <I18nProvider>
+                        <SessionHeader
+                            session={baseSession()}
+                            onBack={vi.fn()}
+                            api={api}
+                            titleSuggestionAvailable={false}
+                        />
+                    </I18nProvider>
+                </ToastProvider>
+            </QueryClientProvider>
+        )
+
+        fireEvent.click(screen.getByTitle('More actions'))
+        fireEvent.click(screen.getByRole('menuitem', { name: /Rename/ }))
+
+        expect(screen.queryByRole('button', { name: 'Generate' })).not.toBeInTheDocument()
+    })
+
     it('manually syncs an inactive Pi session through its owning machine', async () => {
         const importPiSessions = vi.fn().mockResolvedValue({
             success: true,
@@ -265,5 +299,97 @@ describe('SessionHeader', () => {
         } finally {
             vi.useRealTimers()
         }
+    })
+
+    it('anchors the action menu to the center of the More actions trigger', () => {
+        renderHeader(baseSession())
+
+        const moreButton = screen.getByTitle('More actions')
+        const getBoundingClientRect = vi.spyOn(moreButton, 'getBoundingClientRect').mockReturnValue({
+            bottom: 64,
+            height: 32,
+            left: 100,
+            right: 132,
+            top: 32,
+            width: 32,
+            x: 100,
+            y: 32,
+            toJSON: () => ({})
+        } as DOMRect)
+
+        try {
+            fireEvent.click(moreButton)
+
+            expect(screen.getByRole('menu').parentElement).toHaveStyle({ left: '116px' })
+        } finally {
+            getBoundingClientRect.mockRestore()
+        }
+    })
+
+    it('toggles pin state from the header action menu', async () => {
+        const setSessionPinMode = vi.fn().mockResolvedValue(undefined)
+        const api = {
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] }),
+            setSessionPinMode
+        } as unknown as ApiClient
+        const session: Session = {
+            id: 'session-pin',
+            namespace: 'default',
+            seq: 0,
+            createdAt: 0,
+            updatedAt: 0,
+            active: false,
+            activeAt: 0,
+            metadata: { flavor: 'codex', path: '/repo', host: 'machine' },
+            metadataVersion: 0,
+            agentState: null,
+            agentStateVersion: 0,
+            thinking: false,
+            thinkingAt: 0,
+            model: null,
+            modelReasoningEffort: null,
+            effort: null,
+            serviceTier: null,
+            pinned: false,
+            globalPinned: false
+        }
+
+        render(
+            <QueryClientProvider client={new QueryClient()}>
+                <ToastProvider>
+                    <I18nProvider>
+                        <SessionHeader session={session} onBack={vi.fn()} api={api} />
+                    </I18nProvider>
+                </ToastProvider>
+            </QueryClientProvider>
+        )
+
+        fireEvent.click(screen.getByTitle('More actions'))
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Pin globally' }))
+
+        await waitFor(() => expect(setSessionPinMode).toHaveBeenCalledWith('session-pin', 'global'))
+    })
+
+    it('shows an error toast when toggling the pin fails', async () => {
+        const api = {
+            getScratchlist: vi.fn().mockResolvedValue({ entries: [] }),
+            setSessionPinMode: vi.fn().mockRejectedValue(new Error('Network unavailable'))
+        } as unknown as ApiClient
+
+        render(
+            <QueryClientProvider client={new QueryClient()}>
+                <ToastProvider>
+                    <I18nProvider>
+                        <SessionHeader session={baseSession({ pinned: false })} onBack={vi.fn()} api={api} />
+                        <ToastMessages />
+                    </I18nProvider>
+                </ToastProvider>
+            </QueryClientProvider>
+        )
+
+        fireEvent.click(screen.getByTitle('More actions'))
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Pin in project' }))
+
+        expect(await screen.findByText('Could not update pin: Network unavailable')).toBeInTheDocument()
     })
 })

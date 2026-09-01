@@ -7,6 +7,7 @@ import type { NotificationChannel } from './notifications/notificationTypes'
 import { HappyBot } from './telegram/bot'
 import { startWebServer } from './web/server'
 import { getOrCreateJwtSecret } from './config/jwtSecret'
+import { getOrCreateOwnerId } from './config/ownerId'
 import { createSocketServer } from './socket/server'
 import { SSEManager } from './sse/sseManager'
 import { getOrCreateVapidKeys } from './config/vapidKeys'
@@ -15,6 +16,11 @@ import { PushNotificationChannel } from './push/pushNotificationChannel'
 import { FcmService } from './fcm/fcmService'
 import { FcmNotificationChannel } from './fcm/fcmNotificationChannel'
 import { resolveFcmConfig } from './fcm/fcmConfig'
+import { ApnsClient } from './push-ios/apnsClient'
+import { RelayClient } from './push-ios/relayClient'
+import { IosPushService } from './push-ios/iosPushService'
+import { IosPushNotificationChannel } from './push-ios/iosPushChannel'
+import { resolveIosPushConfig } from './push-ios/iosPushConfig'
 import { VisibilityTracker } from './visibility/visibilityTracker'
 import { TunnelManager } from './tunnel'
 import { refreshRejectedRelayAuthKey, resolveRelayAuthKey } from './tunnel/relayAuth'
@@ -156,8 +162,10 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     if (config.serverChanSendKey) {
         const source = formatSource(config.sources.serverChanSendKey)
         const notificationSource = formatSource(config.sources.serverChanNotification)
+        const backgroundOnlySource = formatSource(config.sources.serverChanBackgroundOnly)
         console.log(`[Hub] ServerChan: enabled (${source})`)
         console.log(`[Hub] ServerChan notifications: ${config.serverChanNotification ? 'enabled' : 'disabled'} (${notificationSource})`)
+        console.log(`[Hub] ServerChan background-only: ${config.serverChanBackgroundOnly ? 'enabled' : 'disabled'} (${backgroundOnlySource})`)
     } else {
         console.log('[Hub] ServerChan: disabled (no SERVERCHAN_SENDKEY)')
     }
@@ -202,8 +210,10 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     })
 
     syncEngine = new SyncEngine(store, socketServer.io, socketServer.rpcRegistry, sseManager)
+    // Accountable principal for A2A work-graph notify ingest (P3).
+    syncEngine.setHubOwnerUserId(await getOrCreateOwnerId())
 
-    const fcmConfig = resolveFcmConfig()
+    const fcmConfig = resolveFcmConfig(config)
 
     // Build the optional FCM service early so the native-fallback probe
     // can consult its health gate. When FCM is configured, `fcmService` is
@@ -222,6 +232,22 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
         console.log('[Fcm] Native companion push enabled (project:', fcmConfig.projectId + ')')
     }
 
+    // iOS push (P1): encrypt-then-route sibling of the FCM channel. Ordering
+    // matters - both native channels run before PushNotificationChannel so a
+    // successful native send sets the nativeGate and suppresses web-push.
+    const iosPushConfig = resolveIosPushConfig(config)
+    if (iosPushConfig.mode === 'relay') {
+        const iosPushService = new IosPushService(new RelayClient(iosPushConfig.relayUrl), store)
+        notificationChannels.push(new IosPushNotificationChannel(iosPushService, store))
+        console.log(`[Hub] iOS push: relay (${iosPushConfig.source}, url: ${iosPushConfig.relayUrl})`)
+    } else if (iosPushConfig.mode === 'apns') {
+        const iosPushService = new IosPushService(new ApnsClient(iosPushConfig), store)
+        notificationChannels.push(new IosPushNotificationChannel(iosPushService, store))
+        console.log(`[Hub] iOS push: apns (${iosPushConfig.env}, topic: ${iosPushConfig.bundleId})`)
+    } else {
+        console.log(`[Hub] iOS push: off (${iosPushConfig.reason})`)
+    }
+
     notificationChannels.push(
         new PushNotificationChannel(
             pushService,
@@ -232,7 +258,12 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
     )
 
     if (config.serverChanSendKey && config.serverChanNotification) {
-        notificationChannels.push(new ServerChanChannel(config.serverChanSendKey, config.publicUrl))
+        notificationChannels.push(new ServerChanChannel(
+            config.serverChanSendKey,
+            config.publicUrl,
+            visibilityTracker,
+            config.serverChanBackgroundOnly
+        ))
     }
 
     // Initialize Telegram bot (optional)
@@ -343,7 +374,7 @@ export async function startHub(options: StartHubOptions = {}): Promise<HubInstan
             })
             const companionDeeplink = `hapicompanion://bind?${companionParams.toString()}`
             console.log('')
-            console.log('Or pair the HAPI companion app (Android phone / Wear OS):')
+            console.log('Or pair the HAPI companion app (iOS / Android / Wear OS):')
             console.log(`  ${companionDeeplink}`)
             try {
                 const companionQrString = await QRCode.toString(companionDeeplink, {

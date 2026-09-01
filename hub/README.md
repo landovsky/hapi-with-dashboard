@@ -26,8 +26,12 @@ See `src/configuration.ts` for all options.
 
 ### Optional (Voice)
 
-- `ELEVENLABS_API_KEY` - ElevenLabs API key for voice assistant.
+Dictation and voice-assistant provider keys can also be added from **Settings → Voice** (stored in `settings.json` under `providerCredentials`; env vars still win when set at process start).
+
+- `ELEVENLABS_API_KEY` - ElevenLabs API key for voice assistant + dictation.
 - `ELEVENLABS_AGENT_ID` - Custom ElevenLabs agent ID (auto-created if not set).
+- `GEMINI_API_KEY` / `GOOGLE_API_KEY` - Gemini Live voice assistant.
+- `DASHSCOPE_API_KEY` / `QWEN_API_KEY` - Qwen Realtime voice assistant.
 - `OPENAI_API_KEY` - OpenAI dictation (`gpt-transcribe` / `gpt-live-transcribe`).
 - `DEEPGRAM_API_KEY` - Deepgram dictation (`nova-3`, standard and realtime).
 - `GROQ_API_KEY` - Groq dictation (`whisper-large-v3`).
@@ -112,7 +116,9 @@ See `src/web/routes/` for all endpoints.
 ### Machines (`src/web/routes/machines.ts`)
 
 - `GET /api/machines` - List online machines.
+- `GET /api/machines/:id/agent-availability` - List installed/configured Agents.
 - `POST /api/machines/:id/spawn` - Spawn new session on machine.
+- `POST /api/machines/:id/list-directory` - Browse runner-scoped directories.
 - `POST /api/machines/:id/paths/exists` - Check if path exists.
 
 ### Usage (`src/web/routes/usage.ts`)

@@ -5,6 +5,7 @@ import {
     getPermissionModesForFlavor,
     isPermissionModeAllowedForFlavor,
     RenameSessionRequestSchema,
+    SetSessionPinnedRequestSchema,
     ResumeSessionRequestSchema,
     RewindConversationRequestSchema,
     SCRATCHLIST_MAX_ENTRIES,
@@ -17,6 +18,7 @@ import {
     SessionServiceTierRequestSchema,
     SessionModelRequestSchema,
     SessionPermissionModeRequestSchema,
+    UpdateSessionSummaryRequestSchema,
     supportsModelChange,
     supportsEffort,
     toSessionSummary,
@@ -29,6 +31,7 @@ import type { SyncEngine, Session } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
 import { loadScratchlistAttachmentLimitsFromEnv } from '../../config/scratchlistAttachmentLimits'
 import { validateScratchlistAttachmentsForWrite, scratchlistSessionBytesBeforeForPut } from '../../scratchlistAttachments/validate'
+import { TitleSuggestionError } from '../../sync/titleSuggestion'
 import { requireSessionFromParam, requireSyncEngine } from './guards'
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -89,6 +92,12 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 if (order === 'updatedAt') {
                     return b.updatedAt - a.updatedAt
                 }
+                if (Boolean(a.globalPinned) !== Boolean(b.globalPinned)) {
+                    return a.globalPinned ? -1 : 1
+                }
+                if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+                    return a.pinned ? -1 : 1
+                }
                 // Active sessions first (web session list)
                 if (a.active !== b.active) {
                     return a.active ? -1 : 1
@@ -130,13 +139,24 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
             return sessionResult
         }
 
-        const result = engine.getSessionExport(sessionResult.sessionId, sessionResult.session)
+        const force = c.req.query('force') === 'true'
+        const result = engine.getSessionExport(
+            sessionResult.sessionId,
+            sessionResult.session,
+            { force }
+        )
         if (result.type === 'too-large') {
             return c.json({
-                error: 'Session export too large',
+                type: 'too-large',
+                error: 'Session export exceeds the resource limit',
+                code: 'session_export_too_large',
                 count: result.count,
-                limit: result.limit
+                estimatedBytes: result.estimatedBytes,
+                maxBytes: result.maxBytes
             }, 413)
+        }
+        if (result.type === 'warning') {
+            return c.json(result)
         }
 
         return c.json(result.payload)
@@ -790,6 +810,74 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
         }
     })
 
+    app.post('/sessions/:id/title-suggestion', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        try {
+            const title = await engine.suggestSessionTitle(sessionResult.sessionId)
+            return c.json({ title })
+        } catch (error) {
+            if (error instanceof TitleSuggestionError) {
+                return c.json({ error: error.message }, error.status)
+            }
+            return c.json({ error: 'Failed to generate a session title' }, 502)
+        }
+    })
+
+    app.patch('/sessions/:id/summary', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = UpdateSessionSummaryRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body: text is required' }, 400)
+        }
+
+        try {
+            await engine.updateSessionSummary(sessionResult.sessionId, parsed.data.text)
+            return c.json({ ok: true })
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to update session summary'
+            if (message.includes('concurrently') || message.includes('version')) {
+                return c.json({ error: message }, 409)
+            }
+            return c.json({ error: message }, 500)
+        }
+    })
+
+    app.put('/sessions/:id/pin', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) return engine
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) return sessionResult
+
+        const body = await c.req.json().catch(() => null)
+        const parsed = SetSessionPinnedRequestSchema.safeParse(body)
+        if (!parsed.success) {
+            return c.json({ error: 'Invalid body: mode must be none, project, or global' }, 400)
+        }
+
+        engine.setSessionPinMode(sessionResult.sessionId, parsed.data.mode)
+        return c.json({ ok: true })
+    })
+
     app.delete('/sessions/:id', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {
@@ -1226,6 +1314,36 @@ export function createSessionsRoutes(getSyncEngine: () => SyncEngine | null): Ho
                 success: false,
                 error: error instanceof Error ? error.message : 'Failed to list skills'
             })
+        }
+    })
+
+    app.get('/sessions/:id/codex-models', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+
+        const flavor = sessionResult.session.metadata?.flavor ?? 'claude'
+        if (flavor !== 'codex') {
+            return c.json({
+                success: false,
+                error: 'Codex models are only available for Codex sessions'
+            }, 400)
+        }
+
+        try {
+            const result = await engine.listCodexModelsForSession(sessionResult.sessionId)
+            return c.json(result)
+        } catch (error) {
+            return c.json({
+                success: false,
+                error: error instanceof Error ? error.message : 'Failed to list Codex models'
+            }, 500)
         }
     })
 

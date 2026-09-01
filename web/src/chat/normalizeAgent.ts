@@ -1,4 +1,5 @@
-import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, ToolResultPermission } from '@/chat/types'
+import type { AgentEvent, CodexReview, CodexReviewFinding, NormalizedAgentContent, NormalizedMessage, RoundModelUsage, RoundSummary, ToolResultPermission, UsageData } from '@/chat/types'
+import { inlineMediaSourceFromWire } from '@/chat/inlineMediaSource'
 import { AGENT_MESSAGE_PAYLOAD_TYPE, asNumber, asString, isObject } from '@hapi/protocol'
 import { isClaudeChatVisibleMessage } from '@hapi/protocol/messages'
 import { parseAgentTimestampMs } from '@/chat/agentTimestamp'
@@ -33,13 +34,80 @@ function normalizeAgentEvent(value: unknown): AgentEvent | null {
     return value as AgentEvent
 }
 
+function nonNegativeNumber(value: unknown): number | undefined {
+    const number = asNumber(value)
+    return number !== null && Number.isFinite(number) && number >= 0 ? number : undefined
+}
+
+function nonNegativeSafeInteger(value: unknown): number | undefined {
+    const number = asNumber(value)
+    return number !== null && Number.isSafeInteger(number) && number >= 0 ? number : undefined
+}
+
+function normalizeResultUsage(value: unknown): UsageData | undefined {
+    if (!isObject(value)) return undefined
+    const inputTokens = nonNegativeSafeInteger(value.input_tokens)
+    const outputTokens = nonNegativeSafeInteger(value.output_tokens)
+    if (inputTokens === undefined || outputTokens === undefined) return undefined
+    return {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_creation_input_tokens: nonNegativeSafeInteger(value.cache_creation_input_tokens),
+        cache_read_input_tokens: nonNegativeSafeInteger(value.cache_read_input_tokens)
+    }
+}
+
+function normalizeRoundSummary(value: unknown): RoundSummary | undefined {
+    if (!isObject(value)) return undefined
+
+    const parsedModelUsage: Array<[string, RoundModelUsage]> = []
+    if (isObject(value.modelUsage)) {
+        for (const [model, rawUsage] of Object.entries(value.modelUsage)) {
+            if (!isObject(rawUsage)) continue
+            const usage: RoundModelUsage = {
+                inputTokens: nonNegativeSafeInteger(rawUsage.inputTokens),
+                outputTokens: nonNegativeSafeInteger(rawUsage.outputTokens),
+                cacheReadInputTokens: nonNegativeSafeInteger(rawUsage.cacheReadInputTokens),
+                cacheCreationInputTokens: nonNegativeSafeInteger(rawUsage.cacheCreationInputTokens)
+            }
+            parsedModelUsage.push([model, usage])
+        }
+    }
+
+    const hasModelTokens = parsedModelUsage.some(([, usage]) => Object.values(usage).some(token => token !== undefined))
+    const modelUsage = hasModelTokens ? Object.fromEntries(parsedModelUsage) : {}
+
+    const usage = normalizeResultUsage(value.usage)
+    const totalCostUsd = nonNegativeNumber(value.total_cost_usd)
+    const numTurns = nonNegativeSafeInteger(value.num_turns)
+    const durationMs = nonNegativeNumber(value.duration_ms)
+    if (!usage && Object.keys(modelUsage).length === 0 && totalCostUsd === undefined && numTurns === undefined && durationMs === undefined) {
+        return undefined
+    }
+
+    return {
+        usage,
+        modelUsage,
+        totalCostUsd: totalCostUsd && totalCostUsd > 0 ? totalCostUsd : undefined,
+        numTurns: numTurns && numTurns > 0 ? numTurns : undefined,
+        durationMs
+    }
+}
+
 function normalizeThreadGoal(value: unknown) {
     if (!isObject(value)) return null
     const threadId = asString(value.threadId ?? value.thread_id)
     const objective = asString(value.objective)
     const status = asString(value.status)
     if (!threadId || !objective || !status) return null
-    if (status !== 'active' && status !== 'paused' && status !== 'budgetLimited' && status !== 'complete') return null
+    if (
+        status !== 'active'
+        && status !== 'paused'
+        && status !== 'budgetLimited'
+        && status !== 'usageLimited'
+        && status !== 'blocked'
+        && status !== 'complete'
+    ) return null
     return {
         threadId,
         objective,
@@ -699,6 +767,21 @@ export function normalizeAgentRecord(
             }
         }
         if (data.type === 'system' && data.subtype === 'turn_duration') {
+            const summary = normalizeRoundSummary(data.resultSummary)
+            const isSidechain = Boolean(data.isSidechain)
+            const parentToolUseId = asString(data.parentToolUseId) ?? null
+            if (summary) {
+                return {
+                    id: messageId,
+                    localId,
+                    createdAt,
+                    role: 'event',
+                    content: { type: 'turn-summary', summary },
+                    isSidechain,
+                    parentToolUseId,
+                    meta
+                }
+            }
             return {
                 id: messageId,
                 localId,
@@ -709,7 +792,8 @@ export function normalizeAgentRecord(
                     durationMs: asNumber(data.durationMs) ?? 0,
                     targetMessageId: asString(data.messageId) ?? undefined
                 },
-                isSidechain: false,
+                isSidechain,
+                parentToolUseId,
                 meta
             }
         }
@@ -936,6 +1020,7 @@ export function normalizeAgentRecord(
             const imageId = asString(data.imageId ?? data.image_id)
             if (!imageId) return null
             const uuid = asString(data.id) ?? messageId
+            const source = inlineMediaSourceFromWire(data.source)
             return {
                 id: messageId,
                 localId,
@@ -948,7 +1033,8 @@ export function normalizeAgentRecord(
                     fileName: asString(data.fileName ?? data.file_name) ?? 'generated-image',
                     mimeType: asString(data.mimeType ?? data.mime_type),
                     uuid,
-                    parentUUID: null
+                    parentUUID: null,
+                    source,
                 }],
                 meta
             }
@@ -1025,6 +1111,28 @@ export function normalizeAgentRecord(
                     type: 'compact',
                     trigger: asString(data.trigger) ?? 'auto',
                     preTokens: asNumber(data.preTokens ?? data.pre_tokens) ?? 0
+                },
+                isSidechain: false,
+                meta
+            }
+        }
+
+        // Defensive parity with context_compacted above: a compact-summary
+        // arriving in the codex envelope (e.g. from an older import path or a
+        // future producer) must not be silently dropped by the codex-content
+        // filter — map it to the same agent-event the live pi wrapper emits
+        // so it renders as the dedicated chat block.
+        if (data.type === 'compact-summary' && typeof data.summary === 'string') {
+            return {
+                id: messageId,
+                localId,
+                createdAt,
+                role: 'event',
+                content: {
+                    type: 'compact-summary',
+                    summary: data.summary,
+                    tokensBefore: asNumber(data.tokensBefore) ?? undefined,
+                    estimatedTokensAfter: asNumber(data.estimatedTokensAfter) ?? undefined
                 },
                 isSidechain: false,
                 meta

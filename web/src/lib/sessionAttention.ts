@@ -6,11 +6,25 @@ export type SessionAttention =
     | { kind: 'background' }
     | { kind: 'unread' }
 
+/** True when the session has activity newer than the operator's last-seen watermark. */
+export function sessionIsUnread(
+    summary: SessionSummary,
+    options: { lastSeenAt: number }
+): boolean {
+    return summary.updatedAt > options.lastSeenAt
+}
+
 export function classifySessionAttention(
     summary: SessionSummary,
-    options: { selected: boolean; lastSeenAt: number }
+    options: { selected: boolean; lastSeenAt: number; manualUnreadAt?: number | null }
 ): SessionAttention | null {
-    if (options.selected || summary.thinking) {
+    if (options.selected) {
+        return options.manualUnreadAt === summary.updatedAt
+            ? { kind: 'unread' }
+            : null
+    }
+
+    if (summary.thinking) {
         return null
     }
 
@@ -30,7 +44,7 @@ export function classifySessionAttention(
         return { kind: 'background' }
     }
 
-    if (summary.updatedAt > options.lastSeenAt) {
+    if (sessionIsUnread(summary, { lastSeenAt: options.lastSeenAt })) {
         return { kind: 'unread' }
     }
 

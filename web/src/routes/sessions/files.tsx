@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearch } from '@tanstack/react-router'
+import { PRESERVE_SESSION_SIDEBAR_SCROLL } from '@/lib/sessionNavigation'
 import type { FileSearchItem, GitFileStatus } from '@/types/api'
 import { FileIcon } from '@/components/FileIcon'
 import { DirectoryTree } from '@/components/SessionFiles/DirectoryTree'
@@ -18,6 +19,7 @@ import {
 } from '@/lib/files-i18n'
 import { encodeBase64 } from '@/lib/utils'
 import { queryKeys } from '@/lib/query-keys'
+import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { formatFileMetadata } from '@/lib/file-metadata'
 import { useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from '@/lib/use-translation'
@@ -306,7 +308,7 @@ function FileListSkeleton(props: { label: string; rows?: number }) {
 const SCROLL_KEY_PREFIX = 'hapi-dir-scroll-'
 
 export default function FilesPage() {
-    const { api } = useAppContext()
+    const { api, titleSuggestionAvailable = false } = useAppContext()
     const { t, locale } = useTranslation()
     const navigate = useNavigate()
     const queryClient = useQueryClient()
@@ -330,6 +332,7 @@ export default function FilesPage() {
                 ...(query ? { query } : {}),
             },
             replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [activeTab, navigate, sessionId])
 
@@ -344,7 +347,7 @@ export default function FilesPage() {
     useEffect(() => {
         const el = scrollRef.current
         if (!el) return
-        const key = SCROLL_KEY_PREFIX + sessionId
+        const key = `${SCROLL_KEY_PREFIX}${sessionId}:${activeTab}`
         try {
             const saved = sessionStorage.getItem(key)
             if (saved !== null) el.scrollTop = Number(saved)
@@ -359,7 +362,7 @@ export default function FilesPage() {
             }
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [sessionId])
+    }, [activeTab, sessionId])
 
     const {
         status: gitStatus,
@@ -388,7 +391,8 @@ export default function FilesPage() {
         navigate({
             to: '/sessions/$sessionId/file',
             params: { sessionId },
-            search: fileSearch
+            search: fileSearch,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [activeTab, navigate, searchQuery, sessionId])
 
@@ -436,6 +440,7 @@ export default function FilesPage() {
                 ...(searchQuery ? { query: searchQuery } : {}),
             },
             replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, searchQuery, sessionId])
 
@@ -443,6 +448,7 @@ export default function FilesPage() {
         navigate({
             to: '/sessions/$sessionId',
             params: { sessionId },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, sessionId])
 
@@ -451,6 +457,7 @@ export default function FilesPage() {
             to: '/sessions/$sessionId',
             params: { sessionId },
             search: { outline: true },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, sessionId])
 
@@ -472,13 +479,19 @@ export default function FilesPage() {
                 onToggleOutline={handleToggleOutline}
                 outlineActive={false}
                 api={api}
+                titleSuggestionAvailable={titleSuggestionAvailable}
                 onSessionDeleted={goBack}
-                onSessionReopened={(newSessionId) => {
-                    navigate({
-                        to: '/sessions/$sessionId/files',
-                        params: { sessionId: newSessionId },
-                        replace: true,
-                    })
+                onSessionReopened={async (newSessionId) => {
+                    await transferComposerDraftThenNavigate(
+                        session.id,
+                        newSessionId,
+                        () => navigate({
+                            to: '/sessions/$sessionId/files',
+                            params: { sessionId: newSessionId },
+                            replace: true,
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+                        }),
+                    )
                 }}
             />
 
@@ -570,7 +583,11 @@ export default function FilesPage() {
                 </div>
             ) : null}
 
-            <div ref={scrollRef} className="app-scroll-y flex-1 min-h-0">
+            <div
+                ref={scrollRef}
+                data-hapi-session-files-scroll="true"
+                className="app-scroll-y flex-1 min-h-0"
+            >
                 <div className="mx-auto w-full max-w-content">
                     {showGitErrorBanner && activeTab === 'changes' ? (
                         <div className="border-b border-[var(--app-divider)] bg-amber-500/10 px-3 py-2 text-xs text-[var(--app-hint)]">

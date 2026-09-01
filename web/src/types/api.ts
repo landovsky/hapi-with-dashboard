@@ -12,6 +12,8 @@ import type {
 
 export type {
     AgyModelsResponse,
+    AgentAvailabilityResponse,
+    AgentAvailabilityEntry,
     AgyModelSummary,
     CodexModelsResponse,
     CodexModelSummary,
@@ -45,6 +47,7 @@ export type {
     SlashCommand,
     SlashCommandsResponse,
     SessionResponse,
+    SessionTitleSuggestionResponse,
     SessionsResponse,
     SpawnResponse,
     UploadFileResponse
@@ -76,7 +79,11 @@ export type {
     WorktreeMetadata
 } from '@hapi/protocol/types'
 
-export type { HapiSessionExport } from '@hapi/protocol/sessionExport'
+export type {
+    HapiSessionExport,
+    HapiSessionExportResponse,
+    HapiSessionExportWarning
+} from '@hapi/protocol/sessionExport'
 
 export type SessionMetadataSummary = {
     path: string
@@ -103,6 +110,15 @@ export type SessionMetadataSummary = {
     conversationHistoryEntryIds?: Record<string, string>
     conversationHistoryDiverged?: boolean
     worktree?: WorktreeMetadata
+}
+
+export type HubHealthResponse = {
+    status: string
+    protocolVersion: number
+    capabilities?: {
+        workGraph?: boolean
+        titleSuggestion?: boolean
+    }
 }
 
 export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'

@@ -8,6 +8,7 @@ import type {
     CodexDesktopSyncRequest,
     CodexDesktopStatusResponse,
     CodexArchiveSessionResponse,
+    DecryptedMessage,
     CodexCollaborationMode,
     CopilotAgentMode,
     FileSearchResponse,
@@ -23,8 +24,10 @@ import type {
     SkillsResponse,
     SpawnResponse,
     VisibilityPayload,
-    HapiSessionExport,
+    HapiSessionExportResponse,
+    HubHealthResponse,
     SessionResponse,
+    SessionTitleSuggestionResponse,
     SessionsResponse
 } from '@/types/api'
 import type {
@@ -39,6 +42,7 @@ import type {
 } from '@/types/dashboard'
 import type {
     AgyModelsResponse,
+    AgentAvailabilityResponse,
     CodexModelsResponse,
     CursorMigrateOutcome,
     CursorMigrateToAcpRequest,
@@ -55,15 +59,67 @@ import type {
     MachinePathsExistsResponse,
     OpencodeModelsResponse,
     OpencodeReasoningEffortResponse,
+    PiModelsResponse,
     QueuedStateResponse,
     ReopenSessionResponse,
     SqliteStorageUsageResponse,
+    HubSettingsResponse,
+    UpdateHubSettingsRequest,
     UsageSummaryResponse,
     UploadFileResponse
 } from '@hapi/protocol/apiTypes'
 import type { AgentFlavor, MessageDeliveryMode } from '@hapi/protocol'
-import type { CancelMessageResponse } from '@hapi/protocol/schemas'
+import type { CancelMessageResponse, SteerQueuedMessageResponse } from '@hapi/protocol/schemas'
 import type { TranscriptionMode, TranscriptionProvider, TranscriptionProviderInfo } from '@hapi/protocol/voice'
+
+export type RetryIndeterminateMessageResponse =
+    | { status: 'retried' | 'already-queued' | 'retry-unavailable'; localId: string | null }
+    | { status: 'invoked'; message: DecryptedMessage }
+    | { status: 'not-found' }
+
+export type ProviderCredentialSource = 'env' | 'settings' | 'none'
+
+export interface MaskedCredentialStatus {
+    configured: boolean
+    source: ProviderCredentialSource
+    hint: string | null
+    editable: boolean
+}
+
+export interface TranscriptionCredentialStatus {
+    openai: MaskedCredentialStatus
+    elevenlabs: MaskedCredentialStatus
+    deepgram: MaskedCredentialStatus
+    groq: MaskedCredentialStatus
+    openaiCompatible: {
+        configured: boolean
+        source: ProviderCredentialSource
+        baseUrl: string | null
+        model: string | null
+        baseUrlEditable: boolean
+        modelEditable: boolean
+        apiKey: MaskedCredentialStatus
+    }
+    voiceBackends: {
+        elevenlabs: MaskedCredentialStatus
+        geminiLive: MaskedCredentialStatus
+        qwenRealtime: MaskedCredentialStatus
+    }
+}
+
+export interface TranscriptionCredentialsUpdate {
+    openai?: string | null
+    elevenlabs?: string | null
+    deepgram?: string | null
+    groq?: string | null
+    openaiCompatible?: {
+        baseUrl?: string | null
+        model?: string | null
+        apiKey?: string | null
+    }
+    geminiLive?: string | null
+    qwenRealtime?: string | null
+}
 
 type ApiClientOptions = {
     baseUrl?: string
@@ -360,6 +416,10 @@ export class ApiClient {
         })
     }
 
+    async getHealth(): Promise<HubHealthResponse> {
+        return await this.request<HubHealthResponse>('/health')
+    }
+
     async getPushVapidPublicKey(): Promise<PushVapidPublicKeyResponse> {
         return await this.request<PushVapidPublicKeyResponse>('/api/push/vapid-public-key')
     }
@@ -453,9 +513,13 @@ export class ApiClient {
         return await this.request<SessionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}`)
     }
 
-    async getSessionExport(sessionId: string, options?: { signal?: AbortSignal }): Promise<HapiSessionExport> {
-        return await this.request<HapiSessionExport>(
-            `/api/sessions/${encodeURIComponent(sessionId)}/export`,
+    async getSessionExport(
+        sessionId: string,
+        options?: { force?: boolean; signal?: AbortSignal }
+    ): Promise<HapiSessionExportResponse> {
+        const query = options?.force ? '?force=true' : ''
+        return await this.request<HapiSessionExportResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/export${query}`,
             { signal: options?.signal }
         )
     }
@@ -544,9 +608,13 @@ export class ApiClient {
         if (authToken) {
             headers.set('authorization', `Bearer ${authToken}`)
         }
-        const res = await fetch(this.buildUrl(`/api/sessions/${encodeURIComponent(sessionId)}/generated-images/${encodeURIComponent(imageId)}`), {
-            headers
-        })
+        const url = this.buildUrl(`/api/sessions/${encodeURIComponent(sessionId)}/generated-images/${encodeURIComponent(imageId)}`)
+        let res = await fetch(url, { headers })
+        // Hub returns ETag + immutable Cache-Control (#927). Default fetch cache stores 200
+        // responses so remounts avoid RPC; on 304 the body is empty — read from cache.
+        if (res.status === 304) {
+            res = await fetch(url, { headers, cache: 'force-cache' })
+        }
         if (res.status === 401 && attempt === 0 && this.onUnauthorized) {
             const refreshed = await this.onUnauthorized()
             if (refreshed) {
@@ -647,6 +715,21 @@ export class ApiClient {
             { method: 'DELETE' }
         )
         return response as CancelMessageResponse
+    }
+
+    async steerMessage(sessionId: string, messageId: string): Promise<SteerQueuedMessageResponse> {
+        const response = await this.request(
+            `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/steer`,
+            { method: 'POST' }
+        )
+        return response as SteerQueuedMessageResponse
+    }
+
+    async retryIndeterminateMessage(sessionId: string, messageId: string): Promise<RetryIndeterminateMessageResponse> {
+        return await this.request<RetryIndeterminateMessageResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/retry`,
+            { method: 'POST' }
+        )
     }
 
     async abortSession(sessionId: string): Promise<void> {
@@ -835,6 +918,17 @@ export class ApiClient {
         return await this.request<SqliteStorageUsageResponse>('/api/storage/sqlite')
     }
 
+    async getHubSettings(): Promise<HubSettingsResponse> {
+        return await this.request<HubSettingsResponse>('/api/hub-settings')
+    }
+
+    async updateHubSettings(settings: UpdateHubSettingsRequest): Promise<HubSettingsResponse> {
+        return await this.request<HubSettingsResponse>('/api/hub-settings', {
+            method: 'PUT',
+            body: JSON.stringify(settings)
+        })
+    }
+
     async getUsageSummary(
         range: '7d' | '30d' | 'all' = '7d',
         timeZone: string = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
@@ -844,6 +938,13 @@ export class ApiClient {
             timeZone
         })
         return await this.request<UsageSummaryResponse>(`/api/usage/summary?${params.toString()}`)
+    }
+
+    async restartMachineRunner(machineId: string): Promise<{ message: string }> {
+        return await this.request<{ message: string }>(
+            `/api/machines/${encodeURIComponent(machineId)}/restart-runner`,
+            { method: 'POST', body: '{}' }
+        )
     }
 
     async listMachineDirectory(
@@ -857,6 +958,12 @@ export class ApiClient {
                 method: 'POST',
                 body: JSON.stringify({ path, includeHidden: options?.includeHidden === true })
             }
+        )
+    }
+
+    async getMachineAgentAvailability(machineId: string): Promise<AgentAvailabilityResponse> {
+        return await this.request<AgentAvailabilityResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/agent-availability`
         )
     }
 
@@ -915,9 +1022,21 @@ export class ApiClient {
         )
     }
 
+    async getMachinePiModels(machineId: string): Promise<PiModelsResponse> {
+        return await this.request<PiModelsResponse>(
+            `/api/machines/${encodeURIComponent(machineId)}/pi-models`
+        )
+    }
+
     async getMachineCodexModels(machineId: string): Promise<CodexModelsResponse> {
         return await this.request<CodexModelsResponse>(
             `/api/machines/${encodeURIComponent(machineId)}/codex-models`
+        )
+    }
+
+    async getSessionCodexModels(sessionId: string): Promise<CodexModelsResponse> {
+        return await this.request<CodexModelsResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/codex-models`
         )
     }
 
@@ -1012,6 +1131,27 @@ export class ApiClient {
         await this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
             method: 'PATCH',
             body: JSON.stringify({ name })
+        })
+    }
+
+    async suggestSessionTitle(sessionId: string): Promise<SessionTitleSuggestionResponse> {
+        return await this.request<SessionTitleSuggestionResponse>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/title-suggestion`,
+            { method: 'POST' }
+        )
+    }
+
+    async updateSessionSummary(sessionId: string, text: string): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/summary`, {
+            method: 'PATCH',
+            body: JSON.stringify({ text })
+        })
+    }
+
+    async setSessionPinMode(sessionId: string, mode: 'none' | 'project' | 'global'): Promise<void> {
+        await this.request(`/api/sessions/${encodeURIComponent(sessionId)}/pin`, {
+            method: 'PUT',
+            body: JSON.stringify({ mode })
         })
     }
 
@@ -1185,6 +1325,19 @@ export class ApiClient {
 
     async fetchTranscriptionProviders(): Promise<{ providers: TranscriptionProviderInfo[] }> {
         return await this.request('/api/voice/transcription/providers')
+    }
+
+    async fetchTranscriptionCredentials(): Promise<TranscriptionCredentialStatus> {
+        return await this.request('/api/voice/transcription/credentials')
+    }
+
+    async updateTranscriptionCredentials(
+        update: TranscriptionCredentialsUpdate
+    ): Promise<TranscriptionCredentialStatus> {
+        return await this.request('/api/voice/transcription/credentials', {
+            method: 'PUT',
+            body: JSON.stringify(update),
+        })
     }
 
     async transcribeVoice(options: {

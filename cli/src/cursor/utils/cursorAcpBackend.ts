@@ -1,6 +1,7 @@
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { AcpSdkBackend } from '@/agent/backends/acp';
+import { getAgentLaunchCommand } from '@/agent/agentLaunchCommand';
 
 function filterEnv(env: NodeJS.ProcessEnv): Record<string, string> {
     const result: Record<string, string> = {};
@@ -79,9 +80,10 @@ export function resolveCursorNativeWorktreePath(repoPath: string, worktreeName: 
 
 export function createCursorAcpBackend(opts: CursorAcpBackendOptions): AcpSdkBackend {
     return new AcpSdkBackend({
-        command: 'agent',
+        command: getAgentLaunchCommand('cursor'),
         args: buildCursorAcpArgs(opts),
-        env: filterEnv(process.env)
+        env: filterEnv(process.env),
+        flavor: 'cursor',
     });
 }
 

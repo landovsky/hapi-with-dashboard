@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { useNavigate } from '@tanstack/react-router'
+import { PRESERVE_SESSION_SIDEBAR_SCROLL } from '@/lib/sessionNavigation'
 import { AssistantRuntimeProvider, useAui, useAuiState } from '@assistant-ui/react'
 import { DragDropZone } from '@/components/AssistantChat/DragDropZone'
 import type { ApiClient } from '@/api/client'
@@ -20,7 +21,7 @@ import { normalizeDecryptedMessage } from '@/chat/normalize'
 import { reduceChatBlocks } from '@/chat/reducer'
 import { reconcileChatBlocks } from '@/chat/reconcile'
 import { buildConversationOutline } from '@/chat/outline'
-import { buildVisibleChatBlocks, isToolGroupBlock, visibleBlockRole, type ToolGroupBlock } from '@/chat/toolGroups'
+import { buildVisibleChatBlocks, isToolGroupBlock, type ToolGroupBlock } from '@/chat/toolGroups'
 import { useUnseenBlockCount } from '@/hooks/useUnseenBlockCount'
 import { useCodexExplorationCollapse } from '@/hooks/useCodexExplorationCollapse'
 import { isQueuedForInvocation } from '@/lib/messages'
@@ -45,15 +46,17 @@ import { classifySessionAttention, getSessionAttentionLabelKey } from '@/lib/ses
 import { getSessionLastSeenAt } from '@/lib/sessionLastSeen'
 import { formatRelativeTime } from '@/lib/relativeTime'
 import { ScratchlistMigrationBanner } from '@/components/AssistantChat/ScratchlistMigrationBanner'
-import { assignThreadMessageIds, useHappyRuntime } from '@/lib/assistant-runtime'
+import { findLatestCompletedBoundaryId, useHappyRuntime } from '@/lib/assistant-runtime'
 import {
     getRestoredComposerSendIntent,
     resolveMessageDeliveryMode,
     type ComposerSendIntent,
 } from '@/lib/messageDelivery'
 import type { MessageDeliveryMode } from '@hapi/protocol'
+import { isSteeringSupportedForSession } from '@hapi/protocol'
 import type { OlderLoadOutcome } from '@/lib/message-window-store'
 import { createAttachmentAdapter } from '@/lib/attachmentAdapter'
+import { ShareSeedConsumer } from '@/components/ShareSeedConsumer'
 import {
     createScratchlistAttachmentAdapter,
     type ScratchlistAttachmentAdapter,
@@ -69,10 +72,12 @@ import {
 } from '@/lib/scratchlistAttachmentFlow'
 import type { ScratchlistEntry } from '@/lib/scratchlist'
 import { isHubScratchlistAttachmentPath } from '@hapi/protocol'
-import { consumeSharePendingTransfer } from '@/lib/sharePendingState'
-import { deleteShareTransfer, getShareTransfer } from '@/lib/shareTransfer'
-import { getDraft } from '@/lib/composer-drafts'
+import {
+    type AttachmentDraftInput,
+} from '@/lib/composer-attachment-drafts'
 import { useTranslation } from '@/lib/use-translation'
+import type { SendMessageAcceptance, SendMessageSettlement } from '@/hooks/mutations/useSendMessage'
+import { handoffComposerDraft, transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
 import { SessionHeader } from '@/components/SessionHeader'
 import { CursorMigrationBanner } from '@/components/CursorMigrationBanner'
 import { TeamPanel } from '@/components/TeamPanel'
@@ -218,6 +223,72 @@ export function isScratchlistHotkeyBlockedTarget(target: EventTarget | null): bo
 }
 
 /**
+ * True when a global select-all shortcut (Ctrl/Cmd+A) should be left to
+ * the browser default: focus is inside the rich composer
+ * (contentEditable), a textarea (the fallback composer), a single-line
+ * input/select, or a modal dialog. In every other case the app takes
+ * over the shortcut because Chromium's SelectAll collapses to an empty
+ * caret when the page contains a contenteditable (the rich composer)
+ * but focus is outside it — plain Ctrl+A would select nothing and
+ * Ctrl+C would copy nothing (see applyGlobalSelectAll).
+ *
+ * Deliberately differs from isScratchlistHotkeyBlockedTarget: textareas
+ * are blocked here (textarea select-all works natively) while the
+ * scratchlist hotkey must keep firing from the composer textarea.
+ *
+ * Pure / exported for unit tests.
+ */
+export function isSelectAllTargetBlocked(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false
+    if (target.closest('[role="dialog"]') !== null) return true
+    if (target instanceof HTMLInputElement) return true
+    if (target instanceof HTMLTextAreaElement) return true
+    if (target instanceof HTMLSelectElement) return true
+    // isContentEditable is the authoritative check in real browsers but
+    // jsdom doesn't implement it; the attribute fallback also covers
+    // `plaintext-only` composers, which is what the rich composer uses
+    // on modern Chromium.
+    if (target.isContentEditable === true) return true
+    const contenteditable = target.getAttribute('contenteditable')
+    return contenteditable !== null && contenteditable !== 'false'
+}
+
+/**
+ * Chromium quirk: when a page contains a contenteditable element (the
+ * rich composer), Ctrl/Cmd+A with focus OUTSIDE the editable collapses
+ * to an empty caret instead of selecting the page — Ctrl+C then copies
+ * nothing. Reproduced in headless and headed Chrome with both
+ * `contenteditable="true"` and `"plaintext-only"`; the bare presence of
+ * the editable root is what breaks SelectAll, while focus inside it
+ * selects the composer text correctly.
+ *
+ * This takes over Ctrl/Cmd+A whenever focus is outside the composer
+ * (see isSelectAllTargetBlocked) and selects the message thread
+ * manually, so select-all + copy restores the expected
+ * "select the conversation" behavior.
+ *
+ * Returns true when the keystroke was handled (preventDefault + range
+ * selection). Pure / exported for unit tests and the Playwright fixture.
+ */
+export function applyGlobalSelectAll(e: KeyboardEvent): boolean {
+    if (e.defaultPrevented || e.repeat) return false
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false
+    if (e.key !== 'a' && e.key !== 'A') return false
+    if (isSelectAllTargetBlocked(e.target)) return false
+    // The thread container is rendered by HappyThread; its class is the
+    // stable handle between the page-level shortcut and the message DOM.
+    const thread = document.querySelector<HTMLElement>('.happy-thread-messages')
+    if (!thread || !thread.textContent) return false
+    e.preventDefault()
+    const range = document.createRange()
+    range.selectNodeContents(thread)
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    return true
+}
+
+/**
  * Decide whether a submit should be routed to the per-session scratchlist
  * or to the regular chat send. Scratchlist entries support text and hub-
  * stored attachments; scheduled sends still fall through to chat.
@@ -242,99 +313,16 @@ export function shouldRouteToScratchlist(
     return (attachments ?? []).every((att) => isHubScratchlistAttachmentPath(att.path))
 }
 
-function isUninvokedScheduledMessage(message: DecryptedMessage): boolean {
-    return message.invokedAt == null && message.scheduledAt != null
+export function mergeStagedAttachmentsInOrder(
+    attachments: readonly AttachmentMetadata[],
+    staged: readonly AttachmentMetadata[],
+): AttachmentMetadata[] {
+    const stagedById = new Map(staged.map((attachment) => [attachment.id, attachment]))
+    return attachments.map((attachment) => stagedById.get(attachment.id) ?? attachment)
 }
 
-/**
- * Consumes a pending Web Share Target transfer once the assistant runtime
- * is mounted and the session is active enough to accept attachments.
- *
- * Lifecycle:
- *  - A mount effect reads the transfer id out of sessionStorage *once*
- *    via consumeSharePendingTransfer() (not during render — StrictMode
- *    would consume on the discarded pass). The id is stashed in a ref.
- *  - The actual seed (composer.setText + composer.addAttachment per file)
- *    runs once `props.sessionActive` is true. Inactive sessions disable
- *    the attachmentAdapter, so writing attachments while inactive would
- *    no-op and leak Blobs in IDB. The seed waits in a re-renderable
- *    effect for the active flip.
- *  - `consumedRef` gates the effect to a single seed per component
- *    instance — refs survive a StrictMode mount/cleanup/remount pair, so
- *    the second invoke early-returns and the first invoke's async chain
- *    completes naturally (we deliberately don't cancel on cleanup; the
- *    upload is idempotent and the only side effects on the composer are
- *    no-ops once the runtime is unmounted).
- *  - The IDB row is deleted after the seed completes so a back-button
- *    refresh of /sessions/:id doesn't re-attach the same payload.
- */
-function ShareSeedConsumer(props: { sessionId: string; sessionActive: boolean }) {
-    const assistantApi = useAui()
-    const composerText = useAuiState((s) => s.composer.text)
-    const composerTextRef = useRef(composerText)
-    const initRef = useRef(false)
-    const transferIdRef = useRef<string | null>(null)
-    const consumedRef = useRef(false)
-    const [transferReady, setTransferReady] = useState(false)
-
-    useEffect(() => {
-        composerTextRef.current = composerText
-    }, [composerText])
-
-    // Consume in an effect, not during render — React.StrictMode double-
-    // invokes render functions in dev; a render-time consume deletes the
-    // sessionStorage key on the discarded pass and the committed render
-    // then sees no transfer.
-    useEffect(() => {
-        if (initRef.current) return
-        initRef.current = true
-        transferIdRef.current = consumeSharePendingTransfer()
-        setTransferReady(true)
-    }, [])
-
-    useEffect(() => {
-        if (!transferReady) return
-        if (consumedRef.current) return
-        const transferId = transferIdRef.current
-        if (!transferId) return
-        if (!props.sessionActive) return
-        consumedRef.current = true
-
-        void (async () => {
-            try {
-                const payload = await getShareTransfer(transferId)
-                if (!payload) return
-                const seedText = [payload.title, payload.text, payload.url]
-                    .filter((part) => typeof part === 'string' && part.length > 0)
-                    .join('\n')
-                    .trim()
-                if (seedText.length > 0) {
-                    const existingText = composerTextRef.current.trim().length > 0
-                        ? composerTextRef.current
-                        : getDraft(props.sessionId)
-                    const nextText = [existingText.trim(), seedText]
-                        .filter((part) => part.length > 0)
-                        .join('\n\n')
-                    if (nextText.length > 0) {
-                        assistantApi.composer().setText(nextText)
-                    }
-                }
-                for (const file of payload.files) {
-                    const reconstructed = new File([file.blob], file.name, { type: file.type })
-                    try {
-                        await assistantApi.composer().addAttachment(reconstructed)
-                    } catch (err) {
-                        console.error('share-seed addAttachment failed', err)
-                    }
-                }
-                await deleteShareTransfer(transferId).catch(() => {})
-            } catch (err) {
-                console.error('share-seed pull failed', err)
-            }
-        })()
-    }, [transferReady, props.sessionActive, props.sessionId, assistantApi])
-
-    return null
+function isUninvokedScheduledMessage(message: DecryptedMessage): boolean {
+    return message.invokedAt == null && message.scheduledAt != null
 }
 
 /**
@@ -405,7 +393,7 @@ export function ScratchlistDrawerHost(props: {
         attachments?: AttachmentMetadata[],
         scheduledAt?: number | null,
         deliveryMode?: MessageDeliveryMode,
-    ) => Promise<boolean>
+    ) => Promise<boolean | SendMessageAcceptance>
     onExitScratchlistMode: () => void
     disabled?: boolean
 }) {
@@ -443,7 +431,7 @@ export function ScratchlistDrawerHost(props: {
         if (accepted) {
             props.onExitScratchlistMode()
         }
-        return accepted
+        return Boolean(accepted)
     }, [props.api, props.disabled, props.onSend, props.onExitScratchlistMode, props.sessionId])
     return (
         <ScratchlistDrawer
@@ -465,6 +453,27 @@ export function buildGoalStateMessages(
     return messages.filter((message) => !isUninvokedScheduledMessage(message))
 }
 
+/**
+ * Keep the latest completed fork boundary available while reading history.
+ * The history window can no longer contain the tail after older pages are
+ * loaded, so recomputing a boundary from that window would either hide the
+ * current Fork action or incorrectly mark an older message as current.
+ * A live tail revision invalidates the remembered boundary until tail view
+ * observes the authoritative current boundary again.
+ */
+export function resolveLatestCompletedBoundaryIdForView(
+    viewMode: 'tail' | 'history',
+    currentTailBoundaryId: string | null,
+    rememberedTailBoundary: { id: string | null; tailRevision: number } | null,
+    currentTailRevision: number
+): string | null {
+    if (viewMode === 'tail') return currentTailBoundaryId
+    if (!rememberedTailBoundary || rememberedTailBoundary.tailRevision !== currentTailRevision) {
+        return null
+    }
+    return rememberedTailBoundary.id
+}
+
 function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
     for (const block of blocks) {
         if (block.kind === 'tool-call') {
@@ -484,23 +493,27 @@ function hasAbortableAgentRun(blocks: readonly ChatBlock[]): boolean {
 
 type SessionChatProps = {
     api: ApiClient
+    titleSuggestionAvailable?: boolean
     session: Session
     cursorChatOnDisk?: boolean
     reopenDisabledReason?: string
+    reopenHint?: string
     messages: DecryptedMessage[]
     messagesWarning: string | null
     hasMoreMessages: boolean
     isSyncingTail: boolean
     isLoadingMoreMessages: boolean
     isSending: boolean
+    sendSettlement: SendMessageSettlement | null
     viewMode: 'tail' | 'history'
     messagesVersion: number
     historyVersion: number
+    tailRevision: number
     onBack: () => void
     onRefresh: () => void
     onLoadMore: (onBeforeApply?: (historyVersion: number) => boolean) => Promise<OlderLoadOutcome>
     onCancelLoadMore: () => void
-    // Resolves true when the send was accepted by the underlying mutation, false when
+    // Returns the accepted mutation's attempt id, or false when
     // pre-mutation guards (no-api / no-session / pending) rejected the call OR async
     // inactive-session resume failed. Composer state that should only be cleared on
     // actual send (pendingSchedule) must await this — see handleSend below.
@@ -509,7 +522,9 @@ type SessionChatProps = {
         attachments?: AttachmentMetadata[],
         scheduledAt?: number | null,
         deliveryMode?: MessageDeliveryMode,
-    ) => Promise<boolean>
+    ) => Promise<SendMessageAcceptance | false>
+    resolveSessionIdForUpload?: (sessionId: string) => Promise<string>
+    onUploadSessionResolved?: (sessionId: string) => void
     onViewModeChange: (mode: 'tail' | 'history') => void
     onRetryMessage?: (localId: string) => void
     autocompleteSuggestions?: (query: string) => Promise<Suggestion[]>
@@ -559,7 +574,11 @@ function SessionChatInner(props: SessionChatProps) {
         setHistoryActionPending(true)
         try {
             const result = await props.api.forkConversation(props.session.id, messageLocalId)
-            await navigate({ to: '/sessions/$sessionId', params: { sessionId: result.sessionId } })
+            await navigate({
+                to: '/sessions/$sessionId',
+                params: { sessionId: result.sessionId },
+                ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+            })
         } finally {
             setHistoryActionPending(false)
         }
@@ -591,7 +610,15 @@ function SessionChatInner(props: SessionChatProps) {
     const normalizedCacheRef = useRef<Map<string, { source: DecryptedMessage; normalized: NormalizedMessage | null }>>(new Map())
     const blocksByIdRef = useRef<Map<string, ChatBlock>>(new Map())
     const visibleGroupsRef = useRef<ToolGroupBlock[]>([])
+    const [rememberedTailBoundary, setRememberedTailBoundary] = useState<{
+        id: string | null
+        tailRevision: number
+    } | null>(null)
     const [forceScrollToken, setForceScrollToken] = useState(0)
+    const uploadDraftSnapshotRef = useRef<{ text: string; attachments: AttachmentDraftInput[] }>({
+        text: '',
+        attachments: [],
+    })
     const [outlineOpen, setOutlineOpen] = useState(props.initialOutlineOpen ?? false)
     const [terminalVisible, setTerminalVisible] = useState(false)
     useEffect(() => {
@@ -687,6 +714,16 @@ function SessionChatInner(props: SessionChatProps) {
         return () => window.removeEventListener('keydown', onKeyDown)
     }, [isScratchlistParking])
     /**
+     * Global select-all takeover: see applyGlobalSelectAll. Bound at
+     * window scope because the broken case is focus on the page body /
+     * message thread, which never routes keydown through the composer or
+     * the thread viewport.
+     */
+    useEffect(() => {
+        window.addEventListener('keydown', applyGlobalSelectAll)
+        return () => window.removeEventListener('keydown', applyGlobalSelectAll)
+    }, [])
+    /**
      * onSend wrapper: when scratchlist mode is on AND the submission is
      * not scheduled, route to scratchlist (text and/or hub attachments).
      *
@@ -769,7 +806,7 @@ function SessionChatInner(props: SessionChatProps) {
             attachments?: AttachmentMetadata[],
             scheduledAt?: number | null,
             deliveryMode: MessageDeliveryMode = 'queue',
-        ): Promise<boolean> => {
+        ): Promise<{ attemptId: string | null } | false> => {
             if (
                 scratchlistMode
                 && scheduledAt == null
@@ -788,7 +825,7 @@ function SessionChatInner(props: SessionChatProps) {
                     attachments,
                     accepted,
                 )
-                return accepted
+                return accepted ? { attemptId: null } : false
             }
             // If the user uploaded while scratchlist mode was on, then toggled
             // it off before send, pending items still carry hub paths. Stage
@@ -796,15 +833,15 @@ function SessionChatInner(props: SessionChatProps) {
             const list = attachments ?? []
             const hubItems = list.filter((att) => isHubScratchlistAttachmentPath(att.path))
             if (hubItems.length > 0) {
-                const normalItems = list.filter((att) => !isHubScratchlistAttachmentPath(att.path))
                 const staged = await stageScratchlistAttachmentsForComposeSend(
                     props.api,
                     props.session.id,
                     hubItems,
                 )
+                const ordered = mergeStagedAttachmentsInOrder(list, staged)
                 const accepted = await props.onSend(
                     text,
-                    [...normalItems, ...staged],
+                    ordered,
                     scheduledAt,
                     deliveryMode,
                 )
@@ -826,6 +863,7 @@ function SessionChatInner(props: SessionChatProps) {
     const codexCollaborationModeSupported = agentFlavor === 'codex' && !controlledByUser
     const codexModelsState = useCodexModels({
         api: props.api,
+        sessionId: props.session.id,
         machineId: props.session.metadata?.machineId ?? null,
         enabled: agentFlavor === 'codex' && props.session.active && !controlledByUser
     })
@@ -1290,22 +1328,35 @@ function SessionChatInner(props: SessionChatProps) {
     // Fork-current must compare against assistant-ui message ids (`kind:id`),
     // not raw hub message ids — MessageActions receive the rendered card id,
     // and adjacent assistant blocks join under the first block's id.
-    const latestCompletedBoundaryId = useMemo(() => {
+    //
+    // Calculate the boundary from the tail window, then remember it while the
+    // operator reads history. Otherwise changing viewMode to `history` hides
+    // a valid current Fork action, and loading older pages can make the last
+    // visible historical message look like the current fork boundary.
+    const currentTailBoundaryId = useMemo(() => {
         if (props.viewMode !== 'tail') return null
-        let candidate: string | null = null
-        let previousRole: ReturnType<typeof visibleBlockRole> | null = null
-        for (const { block, threadMessageId } of assignThreadMessageIds(visibleBlocks)) {
-            const role = visibleBlockRole(block)
-            if (
-                (role === 'user' && block.invokedAt != null)
-                || (role === 'assistant' && previousRole !== 'assistant')
-            ) {
-                candidate = threadMessageId
-            }
-            previousRole = role
-        }
-        return candidate
-    }, [props.viewMode, visibleBlocks])
+        return findLatestCompletedBoundaryId(
+            visibleBlocks,
+            props.session.thinking,
+            props.session.activeTurnStartedAt ?? null
+        )
+    }, [props.viewMode, props.session.activeTurnStartedAt, props.session.thinking, visibleBlocks])
+
+    useEffect(() => {
+        if (props.viewMode !== 'tail') return
+        setRememberedTailBoundary((previous) => (
+            previous?.id === currentTailBoundaryId && previous.tailRevision === props.tailRevision
+                ? previous
+                : { id: currentTailBoundaryId, tailRevision: props.tailRevision }
+        ))
+    }, [currentTailBoundaryId, props.tailRevision, props.viewMode])
+
+    const latestCompletedBoundaryId = resolveLatestCompletedBoundaryIdForView(
+        props.viewMode,
+        currentTailBoundaryId,
+        rememberedTailBoundary,
+        props.tailRevision
+    )
 
     const isLatestCompletedBoundary = useCallback((messageId: string) => {
         return latestCompletedBoundaryId === messageId
@@ -1484,7 +1535,8 @@ function SessionChatInner(props: SessionChatProps) {
         setOutlineOpen(false)
         navigate({
             to: '/sessions/$sessionId/files',
-            params: { sessionId: props.session.id }
+            params: { sessionId: props.session.id },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, props.session.id])
 
@@ -1495,7 +1547,8 @@ function SessionChatInner(props: SessionChatProps) {
     const handleViewTerminal = useCallback(() => {
         navigate({
             to: '/sessions/$sessionId/terminal',
-            params: { sessionId: props.session.id }
+            params: { sessionId: props.session.id },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, props.session.id])
 
@@ -1506,6 +1559,7 @@ function SessionChatInner(props: SessionChatProps) {
     // absolute epoch-ms using Date.now() at that moment (send-time base for presets).
     const [pendingSchedule, setPendingSchedule] = useState<PendingSchedule | null>(null)
     const [pendingScheduleRevision, setPendingScheduleRevision] = useState(0)
+    const [sendAcceptance, setSendAcceptance] = useState<{ attemptId: string | null } | null>(null)
     const updatePendingSchedule = useCallback((next: PendingSchedule | null) => {
         setPendingSchedule(next)
         setPendingScheduleRevision((revision) => revision + 1)
@@ -1518,6 +1572,7 @@ function SessionChatInner(props: SessionChatProps) {
     // turn, so explicit or retry-safe queue intents never stick to later
     // ordinary sends.
     const pendingSendIntentRef = useRef<ComposerSendIntent>('default')
+    const attachmentOrderRef = useRef<string[]>([])
     const restoredSendErrorIdRef = useRef<number | null>(null)
 
     useEffect(() => {
@@ -1586,6 +1641,7 @@ function SessionChatInner(props: SessionChatProps) {
         })
         const accepted = await onSendForComposer(text, attachments, scheduledAt, deliveryMode)
         if (!accepted) return
+        setSendAcceptance({ attemptId: accepted.attemptId })
         if (!routedToScratchlist) {
             // Clear pendingSchedule only after the mutation is actually
             // accepted - covers both pre-mutation guards AND async
@@ -1600,27 +1656,66 @@ function SessionChatInner(props: SessionChatProps) {
     }, [agentFlavor, onSendForComposer, props.session.thinking, scratchlistMode, updatePendingSchedule])
 
     const attachmentAdapter = useMemo(() => {
-        if (!props.session.active) {
-            scratchlistAdapterRef.current = null
-            return undefined
-        }
-        if (scratchlistMode) {
+        if (props.session.active && scratchlistMode) {
             const adapter = createScratchlistAttachmentAdapter(props.api, props.session.id)
             scratchlistAdapterRef.current = adapter
             return adapter
         }
         scratchlistAdapterRef.current = null
-        return createAttachmentAdapter(props.api, props.session.id)
-    }, [props.api, props.session.id, props.session.active, scratchlistMode])
+        if (props.session.active) {
+            return createAttachmentAdapter(props.api, props.session.id)
+        }
+        // Only offer attachments on inactive sessions that can actually resume;
+        // otherwise file picks become stuck error attachments that cannot send.
+        if (!inactiveCanResume || !props.resolveSessionIdForUpload) {
+            return undefined
+        }
+        // Keep one resume promise for every generator created by this adapter
+        // instance. Preview generation can outlive navigation; a remount clears
+        // the router cache, so a second file must reuse this closure's promise
+        // instead of starting a fresh resume against the retired source id.
+        let uploadResolution: Promise<string> | undefined
+        const resolveUploadSession = () => {
+            uploadResolution ??= props.resolveSessionIdForUpload!(props.session.id).catch((error) => {
+                uploadResolution = undefined
+                throw error
+            })
+            return uploadResolution
+        }
+        return createAttachmentAdapter(
+            props.api,
+            props.session.id,
+            resolveUploadSession,
+            async (resolvedSessionId, pending) => {
+                // Include the in-flight file and coalesce multi-file drops into
+                // one transfer + navigation before the source composer unmounts.
+                // isCancelled is sampled at save time so a mid-handoff remove
+                // still drops the file (and any prior inactive persist of it).
+                await handoffComposerDraft(
+                    props.session.id,
+                    resolvedSessionId,
+                    pending,
+                    async (targetSessionId) => {
+                        props.onUploadSessionResolved?.(targetSessionId)
+                    },
+                )
+            },
+        )
+    }, [props.api, props.session.id, props.session.active, props.resolveSessionIdForUpload, scratchlistMode, inactiveCanResume])
+
 
     const runtime = useHappyRuntime({
         session: props.session,
         blocks: visibleBlocks,
         messagesVersion: props.messagesVersion,
         historyVersion: props.historyVersion,
+        viewMode: props.viewMode,
+        isSyncingTail: props.isSyncingTail,
+        isLoadingMore: props.isLoadingMoreMessages,
         isSending: props.isSending,
         isRunning: props.session.thinking || hasRunningChildAgent,
         onSendMessage: handleSend,
+        attachmentOrderRef,
         onAbort: handleAbort,
         attachmentAdapter,
         allowSendWhenInactive: true,
@@ -1641,15 +1736,22 @@ function SessionChatInner(props: SessionChatProps) {
                 onToggleTerminal={canViewAgentTerminal ? () => setTerminalVisible(v => !v) : undefined}
                 terminalActive={terminalVisible}
                 api={props.api}
+                titleSuggestionAvailable={props.titleSuggestionAvailable}
                 canReopen={inactiveCanResume}
                 reopenDisabledReason={props.reopenDisabledReason}
+                reopenHint={props.reopenHint}
                 onSessionDeleted={props.onBack}
-                onSessionReopened={(newSessionId) => {
-                    navigate({
-                        to: '/sessions/$sessionId',
-                        params: { sessionId: newSessionId },
-                        replace: true
-                    })
+                onSessionReopened={async (newSessionId) => {
+                    await transferComposerDraftThenNavigate(
+                        props.session.id,
+                        newSessionId,
+                        () => navigate({
+                            to: '/sessions/$sessionId',
+                            params: { sessionId: newSessionId },
+                            replace: true,
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+                        }),
+                    )
                 }}
             />
 
@@ -1673,7 +1775,7 @@ function SessionChatInner(props: SessionChatProps) {
             <AssistantRuntimeProvider runtime={runtime}>
                 <ShareSeedConsumer sessionId={props.session.id} sessionActive={props.session.active} />
                 <AbortRestoreConsumer messages={normalizedMessages} onAbortRestore={props.onAbortRestore ?? (() => {})} />
-                <DragDropZone disabled={sessionInactive || props.isSending || pendingSchedule != null || isScratchlistParking}>
+                <DragDropZone disabled={(!props.session.active && !inactiveCanResume) || props.isSending || pendingSchedule != null || isScratchlistParking}>
                     <div className="relative flex min-h-0 flex-1 flex-col">
                         {canViewAgentTerminal && (
                             // SessionChatInner is keyed by session.id, so switching sessions remounts this subtree.
@@ -1684,6 +1786,7 @@ function SessionChatInner(props: SessionChatProps) {
                             />
                         )}
                         <div className={(terminalVisible && canViewAgentTerminal) ? 'hidden' : 'flex min-h-0 flex-1 flex-col'}>
+
                     <HappyThread
                         // Key with prefix: different components under the same session
                         // (thread, scratchlist, composer) must have distinct keys to avoid
@@ -1772,15 +1875,27 @@ function SessionChatInner(props: SessionChatProps) {
                                     // Restore the schedule so the clock button re-activates
                                     updatePendingSchedule(restored)
                                 }}
+                                canSteer={isSteeringSupportedForSession(props.session.metadata)
+                                    && (agentFlavor === 'pi'
+                                        ? props.session.thinking
+                                        : props.session.agentState?.steeringActive === true)
+                                    && !controlledByUser}
                             />
                         </div>
 
                         <HappyComposer
                         key={`composer-${props.session.id}`}
                         sessionId={props.session.id}
+                        canRestoreAttachments={props.session.active}
+                        onUploadDraftSnapshot={(text, attachments) => {
+                            uploadDraftSnapshotRef.current = { text, attachments }
+                        }}
+                        attachmentOrderRef={attachmentOrderRef}
                         resolveSessionMentionTooltip={resolveSessionMentionTooltip}
                         disabled={props.isSending}
                         pendingSchedule={pendingSchedule}
+                        sendAcceptance={sendAcceptance}
+                        sendSettlement={props.sendSettlement}
                         onSchedule={updatePendingSchedule}
                         onClearSchedule={() => updatePendingSchedule(null)}
                         permissionMode={props.session.permissionMode}
@@ -1807,12 +1922,12 @@ function SessionChatInner(props: SessionChatProps) {
                                             ? grokModelOptions
                                         : agentFlavor === 'copilot'
                                             ? copilotModelOptions
-                                        // Pi uses its own provider-qualified picker (piModels prop).
-                                        // Feeding piModelOptions here would make the generic Ctrl/Cmd+M
+                                        // Pi gets its provider-qualified model list from the piModels prop;
+                                        // feeding piModelOptions here would make the generic Ctrl/Cmd+M
                                         // cycler (getNextModelForFlavor) post a bare modelId string,
                                         // which loses the provider and can pick the wrong cached
                                         // match or throw in runPi. undefined makes the shortcut a no-op
-                                        // so Pi model changes go through the dedicated picker only.
+                                        // so Pi model changes go through the settings sheet only.
                                         : undefined
                         }
                         piModels={piModels}
@@ -1831,6 +1946,7 @@ function SessionChatInner(props: SessionChatProps) {
                         }
                         active={props.session.active}
                         allowSendWhenInactive
+                        onResumeStoredDraft={() => handleSend('', undefined, null)}
                         thinking={props.session.thinking}
                         agentState={props.session.agentState}
                         backgroundTaskCount={props.session.backgroundTaskCount}

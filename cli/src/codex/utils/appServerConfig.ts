@@ -1,7 +1,7 @@
 import type { EnhancedMode } from '../loop';
 import type { CodexCliOverrides } from './codexCliOverrides';
 import type { McpServersConfig } from './buildHapiMcpBridge';
-import { codexSystemPrompt } from './systemPrompt';
+import { getCodexSystemPrompt } from './systemPrompt';
 import type {
     ApprovalPolicy,
     SandboxMode,
@@ -114,11 +114,12 @@ function buildMcpServerConfig(mcpServers: McpServersConfig): Record<string, unkn
 function resolveInstructions(args: {
     baseInstructions?: string;
     developerInstructions?: string;
-}): { baseInstructions: string; developerInstructions: string } {
-    const baseInstructions = args.baseInstructions ?? codexSystemPrompt;
+}): { baseInstructions: string | undefined; developerInstructions: string } {
+    const baseInstructions = args.baseInstructions;
+    const hapiDeveloperInstructions = getCodexSystemPrompt();
     const developerInstructions = args.developerInstructions
-        ? `${baseInstructions}\n\n${args.developerInstructions}`
-        : baseInstructions;
+        ? `${hapiDeveloperInstructions}\n\n${args.developerInstructions}`
+        : hapiDeveloperInstructions;
     return {
         baseInstructions,
         developerInstructions
@@ -218,7 +219,7 @@ export function buildThreadStartParams(args: {
         cwd: args.cwd,
         approvalPolicy: resolvedApprovalPolicy,
         sandbox: resolvedSandbox,
-        baseInstructions,
+        ...(baseInstructions !== undefined ? { baseInstructions } : {}),
         developerInstructions: resolvedDeveloperInstructions,
         ...(Object.keys(configWithInstructions).length > 0 ? { config: configWithInstructions } : {})
     };
@@ -298,13 +299,14 @@ export function buildTurnStartParams(args: {
         if (!model) {
             throw new Error(`Collaboration mode '${collaborationMode}' requires a resolved model`);
         }
-        const { developerInstructions } = resolveInstructions(args);
         params.collaborationMode = {
             mode: collaborationMode,
             settings: {
                 model,
                 ...(modelReasoningEffort !== undefined ? { reasoning_effort: modelReasoningEffort } : {}),
-                developer_instructions: appendCollaborationInstructions(developerInstructions, args.mode?.proactiveMultiAgent)
+                developer_instructions: collaborationMode === 'plan'
+                    ? null
+                    : appendCollaborationInstructions(resolveInstructions(args).developerInstructions, args.mode?.proactiveMultiAgent)
             }
         };
     } else if (model) {

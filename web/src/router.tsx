@@ -13,6 +13,10 @@ import {
     useSearch,
 } from '@tanstack/react-router'
 import { getScrollRestorationKey } from '@/lib/scrollRestorationKey'
+import {
+    getSessionListSelectionNavigation,
+    PRESERVE_SESSION_SIDEBAR_SCROLL,
+} from '@/lib/sessionNavigation'
 import { App } from '@/App'
 import { SessionChat } from '@/components/SessionChat'
 import { SessionList } from '@/components/SessionList'
@@ -43,11 +47,14 @@ import { useToast } from '@/lib/toast-context'
 import { useTranslation } from '@/lib/use-translation'
 import { seedMessageWindowFromSession, syncTailMessages } from '@/lib/message-window-store'
 import { clearDraftsAfterSend } from '@/lib/clearDraftsAfterSend'
-import { inactiveSessionCanResume } from '@/lib/sessionResume'
+import { transferComposerDraftThenNavigate } from '@/lib/composer-draft-transfer'
+import { getDraftAttachments } from '@/lib/composer-attachment-drafts'
+import { refreshSessionDetailPreservingActive } from '@/lib/session-detail-optimistic'
+import { inactiveSessionCanResume, resolveCursorReopenGate } from '@/lib/sessionResume'
 import { initializeSessionLastSeen, markSessionSeen } from '@/lib/sessionLastSeen'
 import { useSessionBrowserTitle } from '@/hooks/useSessionBrowserTitle'
 import { clearCodexImportedSession } from '@/lib/codexImportedSessions'
-import { getSupersedingSessionId, shouldFollowSupersedingSession } from '@/routes/sessions/followSupersedingSession'
+import { getSupersedingSessionId, prepareFollowSupersedingSession, shouldFollowSupersedingSession } from '@/routes/sessions/followSupersedingSession'
 import { migrateSuppressedSendError } from '@/lib/suppressed-send-error'
 import FilesPage from '@/routes/sessions/files'
 import FilePage from '@/routes/sessions/file'
@@ -67,8 +74,8 @@ import SettingsUsagePage from '@/routes/settings/usage'
 import SharePage from '@/routes/share'
 import DashboardPage from '@/routes/dashboard'
 import VoicePage from '@/routes/voice'
-import { setSharePendingTransfer } from '@/lib/sharePendingState'
-import { deleteShareTransfer } from '@/lib/shareTransfer'
+import { retargetSharePendingTransfer, setSharePendingTransfer } from '@/lib/sharePendingState'
+import { deleteShareTransfer, parseShareSearch } from '@/lib/shareTransfer'
 
 
 function BackIcon(props: { className?: string }) {
@@ -171,7 +178,7 @@ function SettingsIcon(props: { className?: string }) {
 }
 
 function SessionsPage() {
-    const { api, baseUrl } = useAppContext()
+    const { api, baseUrl, titleSuggestionAvailable = false } = useAppContext()
     const navigate = useNavigate()
     const pathname = useLocation({ select: location => location.pathname })
     const matchRoute = useMatchRoute()
@@ -235,7 +242,8 @@ function SessionsPage() {
             to: '/sessions/new',
             search: args.machineId
                 ? { directory: args.directory, machineId: args.machineId }
-                : { directory: args.directory }
+                : { directory: args.directory },
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate])
 
@@ -256,11 +264,11 @@ function SessionsPage() {
                         key={initializedHub === baseUrl ? 'last-seen-ready' : 'last-seen-pending'}
                         sessions={sessions}
                         selectedSessionId={selectedSessionId}
-                        onSelect={(sessionId) => navigate({
-                            to: '/sessions/$sessionId',
-                            params: { sessionId },
+                        onSelect={(sessionId) => navigate(getSessionListSelectionNavigation(sessionId))}
+                        onNewSession={() => navigate({
+                            to: '/sessions/new',
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
                         })}
-                        onNewSession={() => navigate({ to: '/sessions/new' })}
                         onNewSessionInDirectory={handleNewSessionInDirectory}
                         onBrowse={canBrowse ? () => navigate({ to: '/browse' }) : undefined}
                         onRefresh={handleRefresh}
@@ -297,7 +305,10 @@ function SessionsPage() {
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={() => navigate({ to: '/sessions/new' })}
+                                    onClick={() => navigate({
+                                        to: '/sessions/new',
+                                        ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+                                    })}
                                     className="session-list-new-button flex h-9 w-9 items-center justify-center rounded-full text-[var(--app-link)] transition-colors"
                                     title={t('sessions.new')}
                                 >
@@ -306,6 +317,7 @@ function SessionsPage() {
                             </div>
                         )}
                         api={api}
+                        titleSuggestionAvailable={titleSuggestionAvailable}
                         machineLabelsById={machineLabelsById}
                         machinesById={machinesById}
                     />
@@ -358,7 +370,7 @@ function classifySendError(
 }
 
 function SessionPage() {
-    const { api } = useAppContext()
+    const { api, titleSuggestionAvailable = false } = useAppContext()
     const { t } = useTranslation()
     const goBack = useAppGoBack()
     const navigate = useNavigate()
@@ -375,6 +387,7 @@ function SessionPage() {
         status: cursorChatStoreStatus,
         isApplicable: cursorChatStoreApplicable,
         error: cursorChatStoreError,
+        isLoading: cursorChatStoreLoading,
     } = useCursorChatStoreStatus({ api, session })
     const {
         messages,
@@ -388,6 +401,7 @@ function SessionPage() {
         viewMode: messagesViewMode,
         messagesVersion,
         historyVersion,
+        tailRevision,
         setViewMode,
     } = useMessages(api, sessionId)
 
@@ -465,11 +479,17 @@ function SessionPage() {
                 await queryClient.invalidateQueries({ queryKey: queryKeys.session(result.sessionId) })
                 await queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
                 if (result.sessionId && result.sessionId !== errorSessionId) {
-                    navigate({
-                        to: '/sessions/$sessionId',
-                        params: { sessionId: result.sessionId },
-                        replace: true
-                    })
+                    retargetSharePendingTransfer(errorSessionId, result.sessionId)
+                    await transferComposerDraftThenNavigate(
+                        errorSessionId,
+                        result.sessionId,
+                        () => navigate({
+                            to: '/sessions/$sessionId',
+                            params: { sessionId: result.sessionId },
+                            replace: true,
+                            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+                        }),
+                    )
                 }
             } catch (err) {
                 const message = err instanceof Error ? err.message : t('dialog.error.default')
@@ -485,12 +505,19 @@ function SessionPage() {
         })()
     }, [api, queryClient, navigate, addToast, t])
 
-    const cursorReopenDisabledReason = cursorChatStoreApplicable && cursorChatStoreStatus?.onDisk !== true
-        ? cursorChatStoreError
-            ? t('session.action.reopenCursorCheckFailed')
-            : cursorChatStoreStatus?.onDisk === false
-                ? t('session.action.reopenCursorMissing')
-                : t('session.action.reopenCursorChecking')
+    const cursorReopenGate = resolveCursorReopenGate({
+        applicable: cursorChatStoreApplicable,
+        onDisk: cursorChatStoreStatus?.onDisk,
+        error: cursorChatStoreError,
+        isLoading: cursorChatStoreLoading,
+    })
+    const cursorReopenDisabledReason = cursorReopenGate.disabledReason === 'missing'
+        ? t('session.action.reopenCursorMissing')
+        : cursorReopenGate.disabledReason === 'checking'
+            ? t('session.action.reopenCursorChecking')
+            : undefined
+    const cursorReopenUnverifiedHint = cursorReopenGate.probeUnverified
+        ? t('session.action.reopenCursorUnverified')
         : undefined
     const canOfferInactiveReopen = session
         ? inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)
@@ -515,10 +542,82 @@ function SessionPage() {
         }
         : null
 
+    const resolvedSessionRef = useRef<{ source: string; target: Promise<string> } | null>(null)
+    // Clear when the session id or active flag changes so a same-id resume
+    // that later archives again cannot reuse a stale in-flight/cached resume.
+    useEffect(() => {
+        resolvedSessionRef.current = null
+    }, [session?.id, session?.active])
+    const resolveSessionId = useCallback(async (currentSessionId: string) => {
+        if (!api || !session || session.active) {
+            return { sessionId: currentSessionId, resumed: false }
+        }
+        const cached = resolvedSessionRef.current
+        if (cached?.source === currentSessionId) {
+            return { sessionId: await cached.target, resumed: true }
+        }
+        if (!inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)) {
+            throw new ApiError(
+                t('chat.sendError.sessionInactive'),
+                409,
+                'session_inactive',
+            )
+        }
+        try {
+            const target = api.resumeSession(currentSessionId, { permissionMode: session.permissionMode ?? undefined })
+            resolvedSessionRef.current = { source: currentSessionId, target }
+            return { sessionId: await target, resumed: true }
+        } catch (error) {
+            if (resolvedSessionRef.current?.source === currentSessionId) {
+                resolvedSessionRef.current = null
+            }
+            const message = error instanceof Error ? error.message : t('dialog.error.default')
+            addToast({
+                title: t('resume.failed.title'),
+                body: message,
+                sessionId: currentSessionId,
+                url: ''
+            })
+            throw new ApiError(
+                t('chat.sendError.sessionInactive'),
+                409,
+                'session_inactive',
+            )
+        }
+    }, [api, session, messages.length, cursorChatStoreStatus?.onDisk, t, addToast])
+
+    const handleSessionResolved = useCallback((resolvedSessionId: string) => {
+        if (session) {
+            if (resolvedSessionId !== session.id) {
+                retargetSharePendingTransfer(session.id, resolvedSessionId)
+                seedMessageWindowFromSession(session.id, resolvedSessionId)
+            }
+            queryClient.setQueryData(queryKeys.session(resolvedSessionId), (previous: { session?: typeof session } | undefined) => ({
+                session: { ...(previous?.session ?? session), id: resolvedSessionId, active: true }
+            }))
+            void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
+        }
+        navigate({
+            to: '/sessions/$sessionId',
+            params: { sessionId: resolvedSessionId },
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
+        if (api) {
+            void refreshSessionDetailPreservingActive(
+                queryClient,
+                resolvedSessionId,
+                () => api.getSession(resolvedSessionId),
+            )
+            void syncTailMessages(api, resolvedSessionId).catch(() => {})
+        }
+    }, [api, navigate, queryClient, session])
+
     const {
         sendMessage,
         retryMessage,
         isSending,
+        sendSettlement,
     } = useSendMessage(api, sessionId, {
         isSessionThinking: session?.thinking ?? false,
         onSuccess: (sentSessionId) => {
@@ -551,83 +650,29 @@ function SessionPage() {
                 }
             }))
         },
-        resolveSessionId: async (currentSessionId) => {
-            if (!api || !session || session.active) {
-                return currentSessionId
-            }
-            if (!inactiveSessionCanResume(session, messages.length, cursorChatStoreStatus?.onDisk)) {
-                // #918: surface as a session_inactive ApiError so the
-                // onError consumer's classifier renders the Reopen
-                // affordance.  `status: 409` mirrors the hub guard for
-                // structural parity; no HTTP call was made.
-                throw new ApiError(
-                    t('chat.sendError.sessionInactive'),
-                    409,
-                    'session_inactive',
-                )
-            }
-            try {
-                return await api.resumeSession(currentSessionId, { permissionMode: session.permissionMode ?? undefined })
-            } catch (error) {
-                const message = error instanceof Error ? error.message : t('dialog.error.default')
-                addToast({
-                    title: t('resume.failed.title'),
-                    body: message,
-                    sessionId: currentSessionId,
-                    url: ''
-                })
-                // Rebrand as a session_inactive ApiError so the inline
-                // affordance offers Reopen (a separate code path from the
-                // failed Resume) and the operator has a recovery click.
-                throw new ApiError(
-                    t('chat.sendError.sessionInactive'),
-                    409,
-                    'session_inactive',
-                )
-            }
-        },
-        onSessionResolved: (resolvedSessionId) => {
-            // A direct retry retains its old alert with restoreSuppressed=true.
-            // Move it to the target session before navigation so the mutation's
-            // onSuccess/onError can clear or replace the same record.
-            setSendErrors((previous) => migrateSuppressedSendError(
-                previous,
+        resolveSessionId,
+        onSessionResolved: async (resolvedSessionId, context) => {
+            if (!sessionId) return undefined
+            setSendErrors((prev) => migrateSuppressedSendError(prev, sessionId, resolvedSessionId))
+            await transferComposerDraftThenNavigate(
                 sessionId,
                 resolvedSessionId,
-            ))
-            void (async () => {
-                if (api) {
-                    if (session) {
-                        if (resolvedSessionId !== session.id) {
-                            seedMessageWindowFromSession(session.id, resolvedSessionId)
-                        }
-                        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
-                    }
-                    try {
-                        await Promise.all([
-                            queryClient.prefetchQuery({
-                                queryKey: queryKeys.session(resolvedSessionId),
-                                queryFn: () => api.getSession(resolvedSessionId),
-                            }),
-                            syncTailMessages(api, resolvedSessionId),
-                        ])
-                    } catch {
-                    }
-                    if (session) {
-                        // 中文注释：恢复接口成功后，REST/SSE 可能仍有短暂竞态；最后再乐观置为在线，
-                        // 避免刚 prefetch 到旧 inactive 快照导致状态栏继续显示离线。
-                        queryClient.setQueryData(queryKeys.session(resolvedSessionId), (previous: { session?: typeof session } | undefined) => ({
-                            session: { ...(previous?.session ?? session), id: resolvedSessionId, active: true }
-                        }))
-                    }
-                }
-                navigate({
-                    to: '/sessions/$sessionId',
-                    params: { sessionId: resolvedSessionId },
-                    replace: true
-                })
-            })()
+                () => handleSessionResolved(resolvedSessionId),
+                [],
+                // assistant-ui clears composer text without awaiting this path;
+                // keep the submitted snapshot so deferred hydration still has it.
+                { textOverride: context.text },
+            )
+            // Cross-session resume: visible metadata may still carry source-scoped
+            // upload paths, and inactive remounts hide stored files entirely.
+            // Always defer so the active target can hydrate/re-upload before POST.
+            const stored = await getDraftAttachments(resolvedSessionId)
+            if ((context.attachments?.length ?? 0) > 0 || stored.length > 0) {
+                return { deferUntilDraftHydrated: true }
+            }
+            return undefined
         },
+
         onBlocked: (reason) => {
             if (reason === 'no-api') {
                 addToast({
@@ -650,7 +695,7 @@ function SessionPage() {
     const {
         getSuggestions: getSkillSuggestions,
     } = useSkills(api, sessionId)
-    // Same list + search matcher as sidebar / share picker (tiann/hapi#1213).
+    // Mention pool is stricter than sidebar (#1506): titled sessions only; match via sessionMatchesQuery.
     const { sessions: allSessions } = useSessions(api)
     const { machines: mentionMachines } = useMachines(api, true)
     const mentionMachineLabelsById = useMachineLabels(mentionMachines)
@@ -736,6 +781,7 @@ function SessionPage() {
             to: '/sessions/$sessionId',
             params: { sessionId },
             replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, sessionId])
 
@@ -774,23 +820,29 @@ function SessionPage() {
     return (
         <SessionChat
             api={api}
+            titleSuggestionAvailable={titleSuggestionAvailable}
             session={session}
             cursorChatOnDisk={cursorChatStoreStatus?.onDisk}
             reopenDisabledReason={cursorReopenDisabledReason}
+            reopenHint={cursorReopenUnverifiedHint}
             messages={messages}
             messagesWarning={messagesWarning}
             hasMoreMessages={messagesHasMore}
             isSyncingTail={messagesSyncingTail}
             isLoadingMoreMessages={messagesLoadingMore}
             isSending={isSending}
+            sendSettlement={sendSettlement}
             viewMode={messagesViewMode}
             messagesVersion={messagesVersion}
             historyVersion={historyVersion}
+            tailRevision={tailRevision}
             onBack={goBack}
             onRefresh={refreshSelectedSession}
             onLoadMore={loadMoreMessages}
             onCancelLoadMore={cancelLoadMoreMessages}
             onSend={sendMessage}
+            resolveSessionIdForUpload={async (id) => (await resolveSessionId(id)).sessionId}
+            onUploadSessionResolved={handleSessionResolved}
             onViewModeChange={setViewMode}
             onRetryMessage={retryMessage}
             autocompleteSuggestions={getAutocompleteSuggestions}
@@ -810,7 +862,7 @@ function SessionPage() {
                         message: t('chat.sendError.aborted'),
                         code: 'abort',
                         scheduledAt: null,
-                        deliveryMode: 'steer',
+                        deliveryMode: 'queue',
                         mutationStarted: true,
                         restoreSuppressed: false
                     }
@@ -846,10 +898,12 @@ function SessionDetailRoute() {
         )
         observedSessionRef.current = { sessionId, supersedingSessionId }
         if (!shouldFollow || !supersedingSessionId) return
+        prepareFollowSupersedingSession(sessionId, supersedingSessionId)
         navigate({
             to: '/sessions/$sessionId',
             params: { sessionId: supersedingSessionId },
-            replace: true
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
         })
     }, [navigate, session, sessionId, supersedingSessionId])
 
@@ -857,7 +911,11 @@ function SessionDetailRoute() {
         if (!sessionNotFound) {
             return
         }
-        navigate({ to: '/sessions', replace: true })
+        navigate({
+            to: '/sessions',
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
     }, [navigate, sessionNotFound, sessionId])
 
     if (sessionNotFound) {
@@ -884,21 +942,29 @@ function NewSessionPage() {
         if (shareTransferId) {
             void deleteShareTransfer(shareTransferId)
         }
-        navigate({ to: '/sessions' })
+        navigate({
+            to: '/sessions',
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
     }, [navigate, shareTransferId])
 
     const handleSuccess = useCallback((sessionId: string) => {
         if (shareTransferId) {
-            setSharePendingTransfer(shareTransferId)
+            setSharePendingTransfer(shareTransferId, sessionId)
         }
         void queryClient.invalidateQueries({ queryKey: queryKeys.sessions })
         // Replace current page with /sessions to clear spawn flow from history
-        navigate({ to: '/sessions', replace: true })
+        navigate({
+            to: '/sessions',
+            replace: true,
+            ...PRESERVE_SESSION_SIDEBAR_SCROLL,
+        })
         // Then navigate to new session
         requestAnimationFrame(() => {
             navigate({
                 to: '/sessions/$sessionId',
                 params: { sessionId },
+                ...PRESERVE_SESSION_SIDEBAR_SCROLL,
             })
         })
     }, [navigate, queryClient, shareTransferId])
@@ -1065,6 +1131,7 @@ type SessionFileSearch = {
     staged?: boolean
     tab?: 'changes' | 'directories'
     query?: string
+    origin?: 'chat'
 }
 
 const sessionFileRoute = createRoute({
@@ -1087,6 +1154,7 @@ const sessionFileRoute = createRoute({
         const query = typeof search.query === 'string' && search.query.length > 0
             ? search.query
             : undefined
+        const origin = search.origin === 'chat' ? 'chat' : undefined
 
         const result: SessionFileSearch = { path }
         if (staged !== undefined) {
@@ -1097,6 +1165,9 @@ const sessionFileRoute = createRoute({
         }
         if (query !== undefined) {
             result.query = query
+        }
+        if (origin !== undefined) {
+            result.origin = origin
         }
         return result
     },
@@ -1240,19 +1311,12 @@ const settingsUsageRoute = createRoute({
 // Web Share Target landing route. Service worker (`web/src/sw.ts`)
 // intercepts the manifest's `POST /share` and 303-redirects here with an
 // IDB transfer id. `error=ingest` is set when the SW failed to write IDB.
+// Native / deep-link clients open `/share#url=&text=&title=` (fragment, not
+// query) so shared content is never part of the HTTP request line.
 const shareRoute = createRoute({
     getParentRoute: () => rootRoute,
     path: '/share',
-    validateSearch: (search: Record<string, unknown>): { id?: string; error?: string } => {
-        const result: { id?: string; error?: string } = {}
-        if (typeof search.id === 'string' && search.id) {
-            result.id = search.id
-        }
-        if (typeof search.error === 'string' && search.error) {
-            result.error = search.error
-        }
-        return result
-    },
+    validateSearch: (search: Record<string, unknown>) => parseShareSearch(search),
     component: SharePage,
 })
 

@@ -69,6 +69,13 @@ describe('getPendingRequestKinds', () => {
 })
 
 describe('toSessionSummary', () => {
+    it('includes the pinned state', () => {
+        expect(toSessionSummary(makeSession({ pinned: true })).pinned).toBe(true)
+        expect(toSessionSummary(makeSession({ globalPinned: true })).globalPinned).toBe(true)
+        expect(toSessionSummary(makeSession()).pinned).toBe(false)
+        expect(toSessionSummary(makeSession()).globalPinned).toBe(false)
+    })
+
     it('uses grokSessionId as the native resume token', () => {
         const summary = toSessionSummary(makeSession({
             metadata: {
@@ -93,6 +100,19 @@ describe('toSessionSummary', () => {
         }))
 
         expect(summary.metadata?.agentSessionId).toBe('cursor-session-1')
+    })
+
+    it('does not claim a native resume token for fresh-only DSH ACP', () => {
+        const summary = toSessionSummary(makeSession({
+            metadata: {
+                path: '/proj',
+                host: 'local',
+                flavor: 'dsh',
+                codexSessionId: 'stale-codex-id'
+            }
+        }))
+
+        expect(summary.metadata?.agentSessionId).toBeUndefined()
     })
 
     it('does not fall back to a stale cross-agent id for a known flavor', () => {
@@ -164,6 +184,18 @@ describe('toSessionSummary', () => {
         }))
 
         expect(summary.metadata?.lifecycleState).toBe('archived')
+    })
+
+    it('includes hapiMcpUrl in summary metadata when session bridge is live', () => {
+        const summary = toSessionSummary(makeSession({
+            metadata: {
+                path: '/proj',
+                host: 'local',
+                hapiMcpUrl: 'http://127.0.0.1:42133/'
+            }
+        }))
+
+        expect(summary.metadata?.hapiMcpUrl).toBe('http://127.0.0.1:42133/')
     })
 
     it('includes structured pendingRequests for hover-tooltip copy', () => {

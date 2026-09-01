@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { COPILOT_AGENT_MODES, type CopilotAgentMode } from './copilotModes'
 import { CODEX_COLLABORATION_MODES, PERMISSION_MODES } from './modes'
+import { AgentConfigDescriptorSchema } from './agentConfig'
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES)
 export const CodexCollaborationModeSchema = z.enum(CODEX_COLLABORATION_MODES)
@@ -193,6 +194,9 @@ export type AgentStateCompletedRequest = z.infer<typeof AgentStateCompletedReque
 
 export const AgentStateSchema = z.object({
     controlledByUser: z.boolean().nullish(),
+    // True while the CLI is delivering a queued message into the active turn
+    // (Steer). Surfaced so the web can reflect the inject in progress.
+    steeringActive: z.boolean().nullish(),
     // The mode the session was started in. Persisted so reopen/resume can
     // re-spawn in the same mode — notably 'pty', which has no agent terminal
     // otherwise (a reopened PTY session would silently fall back to 'remote').
@@ -254,7 +258,14 @@ export const TeamStateSchema = z.object({
 
 export type TeamState = z.infer<typeof TeamStateSchema>
 
-export const ThreadGoalStatusSchema = z.enum(['active', 'paused', 'budgetLimited', 'complete'])
+export const ThreadGoalStatusSchema = z.enum([
+    'active',
+    'paused',
+    'budgetLimited',
+    'complete',
+    'blocked',
+    'usageLimited'
+])
 export type ThreadGoalStatus = z.infer<typeof ThreadGoalStatusSchema>
 
 export const ThreadGoalSchema = z.object({
@@ -288,7 +299,12 @@ export const DecryptedMessageSchema = z.object({
     content: z.unknown(),
     createdAt: z.number(),
     invokedAt: z.number().nullable().optional(),
-    scheduledAt: z.number().nullable().optional()
+    scheduledAt: z.number().nullable().optional(),
+    // The agent was sent the steer but its final outcome could not be proven.
+    // The row stays uninvoked and requires an explicit user resolution.
+    deliveryState: z.literal('indeterminate').optional(),
+    // Live signal via messages-consumed (steered:true); not persisted by the hub.
+    steered: z.boolean().optional()
 })
 
 export type DecryptedMessage = z.infer<typeof DecryptedMessageSchema>
@@ -299,6 +315,8 @@ export const SessionSchema = z.object({
     seq: z.number(),
     createdAt: z.number(),
     updatedAt: z.number(),
+    pinned: z.boolean().optional(),
+    globalPinned: z.boolean().optional(),
     active: z.boolean(),
     // Hub may still emit null for legacy SQLite rows; keep output type number.
     activeAt: z.number().nullish().transform((value) => value ?? 0),
@@ -430,7 +448,18 @@ export const MachineMetadataSchema = z.object({
     homeDir: z.string().optional(),
     happyHomeDir: z.string().optional(),
     happyLibDir: z.string().optional(),
-    workspaceRoots: z.array(z.string()).optional()
+    workspaceRoots: z.array(z.string()).optional(),
+    /** Machine-scoped RPC capability ids this runner registers (see runnerCapabilities). */
+    capabilities: z.array(z.string()).optional(),
+    /** CLI binary/package mtime when this runner process started. */
+    startedCliMtimeMs: z.number().optional(),
+    /** Current on-disk CLI binary/package mtime (may differ after upgrade). */
+    installedCliMtimeMs: z.number().optional(),
+    /**
+     * Runner is under systemd/pm2 (HAPI_RUNNER_SUPERVISED=1). Banner Restart
+     * may stop-runner; unsupervised detached runners must not use that path.
+     */
+    supervisedRestart: z.boolean().optional(),
 })
 
 export type MachineMetadata = z.infer<typeof MachineMetadataSchema>
@@ -440,7 +469,10 @@ export const RunnerStateSchema = z.object({
     pid: z.number().optional(),
     httpPort: z.number().optional(),
     startedAt: z.number().optional(),
-    capabilities: z.object({ piExistingSessionResume: z.literal(true).optional() }).optional(),
+    capabilities: z.object({
+        piExistingSessionResume: z.literal(true).optional(),
+        agentConfigs: z.array(AgentConfigDescriptorSchema).optional()
+    }).optional(),
     shutdownRequestedAt: z.number().optional(),
     shutdownSource: z.union([z.enum(['mobile-app', 'cli', 'os-signal', 'unknown']), z.string()]).optional(),
     lastSpawnError: z.object({
@@ -551,7 +583,17 @@ export const SyncEventSchema = z.discriminatedUnion('type', [
     SessionChangedSchema.extend({
         type: z.literal('messages-consumed'),
         localIds: z.array(z.string()),
-        invokedAt: z.number()
+        invokedAt: z.number(),
+        // True when messages were steered into an active turn (not a normal queue drain).
+        steered: z.boolean().optional()
+    }),
+    SessionChangedSchema.extend({
+        type: z.literal('messages-indeterminate'),
+        localIds: z.array(z.string())
+    }),
+    SessionChangedSchema.extend({
+        type: z.literal('messages-requeued'),
+        localIds: z.array(z.string())
     }),
     SessionChangedSchema.extend({
         type: z.literal('message-cancelled'),
@@ -585,6 +627,16 @@ export type SyncEvent = z.infer<typeof SyncEventSchema>
 export const CancelMessageResponseSchema = z.discriminatedUnion('status', [
     z.object({ status: z.literal('cancelled'), localId: z.string().nullable() }),
     z.object({ status: z.literal('invoked'), message: DecryptedMessageSchema }),
+    // The row is inside an async steer: not removed, but not consumed either.
+    z.object({ status: z.literal('busy'), localId: z.string() }),
 ])
 
 export type CancelMessageResponse = z.infer<typeof CancelMessageResponseSchema>
+
+export const SteerQueuedMessageResponseSchema = z.discriminatedUnion('status', [
+    z.object({ status: z.literal('steered'), localId: z.string() }),
+    z.object({ status: z.literal('invoked'), message: DecryptedMessageSchema }),
+    z.object({ status: z.literal('failed'), error: z.string(), localId: z.string().nullable() }),
+])
+
+export type SteerQueuedMessageResponse = z.infer<typeof SteerQueuedMessageResponseSchema>

@@ -57,6 +57,12 @@ const harness = vi.hoisted(() => ({
     failNextCompact: false,
     deferCompactCompletion: false,
     deferThreadStatusNotifications: false,
+    steerTurnParams: [] as Array<Record<string, unknown>>,
+    steerDispatchError: null as Error | null,
+    steerCompletionError: null as Error | null,
+    readThreadParams: [] as Array<Record<string, unknown>>,
+    readThreadError: null as Error | null,
+    readThreadResponse: { thread: { turns: [] as unknown[] } } as { thread: { turns?: Array<{ items?: Array<Record<string, unknown>> }> } },
     emitStaleTaskCompleteAfterRetry: false,
     emitStaleTaskFailedAfterRetry: false,
     emitStaleThreadStatusFailureAfterRetry: false,
@@ -90,11 +96,20 @@ const harness = vi.hoisted(() => ({
 }));
 
 vi.mock('./codexAppServerClient', () => {
+    const INDETERMINATE_SYMBOL = Symbol('codex-app-server-indeterminate');
     class MockCodexAppServerClient {
         private notificationHandler: ((method: string, params: unknown) => void) | null = null;
         private stderrHandler: ((text: string) => void) | null = null;
 
         async connect(): Promise<void> {}
+
+        isConnected(): boolean {
+            return true;
+        }
+
+        isInitialized(): boolean {
+            return true;
+        }
 
         async initialize(params: unknown): Promise<{ protocolVersion: number }> {
             harness.initializeCalls.push(params);
@@ -105,6 +120,8 @@ vi.mock('./codexAppServerClient', () => {
             this.notificationHandler = handler;
             harness.dispatchNotification = handler;
         }
+
+        setTransportAbandonedHandler(_handler: (() => void) | null): void {}
 
         setStderrHandler(handler: ((text: string) => void) | null): void {
             this.stderrHandler = handler;
@@ -193,6 +210,33 @@ vi.mock('./codexAppServerClient', () => {
         async getThreadGoal(params?: { threadId?: string }): Promise<{ goal: Record<string, unknown> | null }> {
             harness.goalGetCalls.push(params ?? {});
             return { goal: harness.goal };
+        }
+
+        async steerTurn(params?: { threadId?: string; input?: unknown[]; expectedTurnId?: string; clientUserMessageId?: string }): Promise<{
+            dispatched: Promise<void>;
+            completed: Promise<unknown>;
+        }> {
+            harness.steerTurnParams.push((params ?? {}) as Record<string, unknown>);
+            if (harness.steerDispatchError) {
+                return {
+                    dispatched: Promise.reject(harness.steerDispatchError),
+                    completed: Promise.reject(harness.steerDispatchError)
+                };
+            }
+            return {
+                dispatched: Promise.resolve(),
+                completed: harness.steerCompletionError
+                    ? Promise.reject(harness.steerCompletionError)
+                    : Promise.resolve({ turnId: 'steered-turn' })
+            };
+        }
+
+        async readThread(params?: { threadId?: string; includeTurns?: boolean }): Promise<unknown> {
+            harness.readThreadParams.push((params ?? {}) as Record<string, unknown>);
+            if (harness.readThreadError) {
+                throw harness.readThreadError;
+            }
+            return harness.readThreadResponse;
         }
 
         async clearThreadGoal(params?: { threadId?: string }): Promise<{ cleared: boolean }> {
@@ -1028,7 +1072,13 @@ vi.mock('./codexAppServerClient', () => {
         async disconnect(): Promise<void> {}
     }
 
-    return { CodexAppServerClient: MockCodexAppServerClient };
+    return {
+        CodexAppServerClient: MockCodexAppServerClient,
+        INDETERMINATE_SYMBOL,
+        isIndeterminateError: (error: unknown) => Boolean(
+            error && (error as Record<symbol, unknown>)[INDETERMINATE_SYMBOL] === true
+        )
+    };
 });
 
 vi.mock('./utils/buildHapiMcpBridge', () => ({
@@ -1043,7 +1093,9 @@ vi.mock('./utils/buildHapiMcpBridge', () => ({
     }
 }));
 
-import { codexRemoteLauncher } from './codexRemoteLauncher';
+import { codexRemoteLauncher, isCurrentSteerHandler } from './codexRemoteLauncher';
+import { INDETERMINATE_SYMBOL } from './codexAppServerClient';
+import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 
 type FakeAgentState = {
     requests: Record<string, unknown>;
@@ -1061,7 +1113,8 @@ function createMode(): EnhancedMode {
 function createSessionStub(
     messages = ['hello from launcher test'],
     mode = createMode(),
-    isolateMessages = false
+    isolateMessages = false,
+    closeQueue = true
 ) {
     const queue = new MessageQueue2<EnhancedMode>((mode) => JSON.stringify(mode));
     messages.forEach((message, index) => {
@@ -1073,7 +1126,9 @@ function createSessionStub(
             queue.push(message, mode);
         }
     });
-    queue.close();
+    if (closeQueue) {
+        queue.close();
+    }
 
     const sessionEvents: Array<{ type: string; [key: string]: unknown }> = [];
     const codexMessages: unknown[] = [];
@@ -1111,7 +1166,10 @@ function createSessionStub(
         },
         sendSessionEvent(event: { type: string; [key: string]: unknown }) {
             sessionEvents.push(event);
-        }
+        },
+        emitMessagesConsumed: vi.fn(),
+        emitSteerIndeterminate: vi.fn(),
+        setSteerDeliveryState: vi.fn(async () => true)
     };
 
     const session = {
@@ -1174,6 +1232,8 @@ function createSessionStub(
         foundSessionIds,
         resetThreadCalls,
         rpcHandlers,
+        emitMessagesConsumed: client.emitMessagesConsumed,
+        emitSteerIndeterminate: client.emitSteerIndeterminate,
         setPermissionMode: (nextMode: EnhancedMode['permissionMode']) => {
             currentPermissionMode = nextMode;
         },
@@ -1186,6 +1246,147 @@ function createSessionStub(
 }
 
 describe('codexRemoteLauncher', () => {
+    it('invalidates queued steer handlers after abort or cleanup', () => {
+        expect(isCurrentSteerHandler(3, 3, false)).toBe(true);
+        expect(isCurrentSteerHandler(4, 3, false)).toBe(false);
+        expect(isCurrentSteerHandler(3, 3, true)).toBe(false);
+    });
+
+    it('steers a queued message into the active turn and acks on dispatch', async () => {
+        harness.suppressTurnCompletion = true;
+        const { session, rpcHandlers, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        expect(result).toEqual({ steered: true });
+        expect(harness.steerTurnParams).toHaveLength(1);
+        expect(harness.steerTurnParams[0]).toMatchObject({
+            expectedTurnId: 'turn-1',
+            clientUserMessageId: 'local-1'
+        });
+        await vi.waitFor(() => expect(emitMessagesConsumed).toHaveBeenCalledWith(['local-1'], { steered: true }));
+        // The suppressed turn never completes, so the launcher stays busy;
+        // close the queue and leave the run promise unawaited.
+        session.queue.close();
+    });
+
+    it('restores the row when the app-server explicitly rejects after dispatch', async () => {
+        harness.suppressTurnCompletion = true;
+        // Plain Error without the indeterminate marker = definite JSON-RPC
+        // rejection: the instruction was not accepted, so restoring is safe.
+        harness.steerCompletionError = new Error('turn/steer not allowed here');
+        const { session, rpcHandlers, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        // Explicit rejection surfaces as failed (not a false steered), and the
+        // row is restored so the normal turn/start path delivers it later.
+        expect(result).toEqual({ steered: false, error: 'turn/steer not allowed here' });
+        await vi.waitFor(() => expect(session.queue.cancelByLocalId('local-1')).toBe(true));
+        expect(emitMessagesConsumed).not.toHaveBeenCalledWith(['local-1'], { steered: true });
+        session.queue.close();
+    });
+
+    it('holds an indeterminate steer for explicit retry or cancel', async () => {
+        harness.suppressTurnCompletion = true;
+        const indeterminate = new Error('Codex app-server disconnected');
+        Object.defineProperty(indeterminate, INDETERMINATE_SYMBOL, { value: true });
+        harness.steerCompletionError = indeterminate;
+        // Reconciliation cannot read the thread either. The row is held out of
+        // automatic replay and the user can explicitly retry or cancel it.
+        harness.readThreadError = new Error('app-server unreachable');
+        const { session, rpcHandlers, emitMessagesConsumed, emitSteerIndeterminate } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        // Transport failure after dispatch: report reconciliation, persist the
+        // ambiguous state, and remove it from the automatic queue.
+        expect(result).toEqual({ steered: false, error: 'Steer outcome is being reconciled' });
+        expect(emitSteerIndeterminate).toHaveBeenCalledWith(['local-1']);
+        expect(session.queue.cancelByLocalId('local-1')).toBe(true);
+        expect(emitMessagesConsumed).not.toHaveBeenCalledWith(['local-1'], { steered: true });
+        session.queue.close();
+    });
+
+    it('reconciles an indeterminate steer to accepted once the thread shows the message', async () => {
+        harness.suppressTurnCompletion = true;
+        const indeterminate = new Error('Codex app-server disconnected');
+        Object.defineProperty(indeterminate, INDETERMINATE_SYMBOL, { value: true });
+        harness.steerCompletionError = indeterminate;
+        harness.readThreadResponse = {
+            thread: {
+                turns: [{
+                    items: [{ type: 'userMessage', clientId: 'local-1', text: 'steer me' }]
+                }]
+            }
+        };
+        const { session, rpcHandlers, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        expect(result).toEqual({ steered: false, error: 'Steer outcome is being reconciled' });
+        // The scheduled reconciliation (1s timer) reads the thread, finds the
+        // message, commits the row and fires the badge — no restore, no
+        // duplicate.
+        await vi.waitFor(() => expect(emitMessagesConsumed).toHaveBeenCalledWith(['local-1'], { steered: true }), { timeout: 5_000 });
+        // Row committed and consumed — the tombstone blocks a stale retry.
+        expect(session.queue.cancelByLocalId('local-1')).toBe('consumed');
+        session.queue.close();
+    });
+
+    it('reconciles when stdin dispatch fails indeterminately', async () => {
+        harness.suppressTurnCompletion = true;
+        const indeterminate = new Error('stdin callback timed out');
+        Object.defineProperty(indeterminate, INDETERMINATE_SYMBOL, { value: true });
+        harness.steerDispatchError = indeterminate;
+        harness.readThreadError = new Error('app-server unreachable');
+        const { session, rpcHandlers, emitMessagesConsumed, emitSteerIndeterminate } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        expect(result).toEqual({ steered: false, error: 'Steer outcome is being reconciled' });
+        expect(emitSteerIndeterminate).toHaveBeenCalledWith(['local-1']);
+        expect(session.queue.cancelByLocalId('local-1')).toBe(true);
+        expect(emitMessagesConsumed).not.toHaveBeenCalledWith(['local-1'], { steered: true });
+        session.queue.close();
+    });
+
+    it('restores the queued row when stdin dispatch fails', async () => {
+        harness.suppressTurnCompletion = true;
+        harness.steerDispatchError = new Error('stdin closed');
+        const { session, rpcHandlers, emitMessagesConsumed } = createSessionStub(['first'], createMode(), false, false);
+        const runPromise = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => expect(harness.startTurnThreadIds.length).toBe(1));
+
+        session.queue.push('steer me', createMode(), 'local-1');
+        const handler = rpcHandlers.get(RPC_METHODS.SteerQueuedMessage)!;
+        const result = await handler({ localId: 'local-1' });
+
+        expect(result).toEqual({ steered: false, error: 'stdin closed' });
+        await vi.waitFor(() => expect(session.queue.cancelByLocalId('local-1')).toBe(true));
+        expect(emitMessagesConsumed).not.toHaveBeenCalledWith(['local-1'], { steered: true });
+        session.queue.close();
+    });
     afterEach(() => {
         harness.notifications = [];
         harness.dispatchNotification = null;
@@ -1241,6 +1442,12 @@ describe('codexRemoteLauncher', () => {
         harness.failNextCompact = false;
         harness.deferCompactCompletion = false;
         harness.deferThreadStatusNotifications = false;
+        harness.steerTurnParams = [];
+        harness.steerDispatchError = null;
+        harness.steerCompletionError = null;
+        harness.readThreadParams = [];
+        harness.readThreadError = null;
+        harness.readThreadResponse = { thread: { turns: [] } };
         harness.emitStaleTaskCompleteAfterRetry = false;
         harness.emitStaleTaskFailedAfterRetry = false;
         harness.emitStaleThreadStatusFailureAfterRetry = false;
@@ -1486,7 +1693,7 @@ describe('codexRemoteLauncher', () => {
         });
     });
 
-    it('retries plan turns without collaborationMode when the runtime rejects the field', async () => {
+    it('does not retry plan turns as normal turns when the runtime rejects the field', async () => {
         harness.startTurnErrors.push(new Error('unknown field collaborationMode'));
         const { session, sessionEvents } = createSessionStub(['plan this'], {
             permissionMode: 'default',
@@ -1497,19 +1704,17 @@ describe('codexRemoteLauncher', () => {
         const exitReason = await codexRemoteLauncher(session as never);
 
         expect(exitReason).toBe('exit');
-        expect(harness.startTurnParams).toHaveLength(2);
+        expect(harness.startTurnParams).toHaveLength(1);
         expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
             mode: 'plan'
         });
-        expect(harness.startTurnParams[1]?.collaborationMode).toBeUndefined();
-        expect(harness.startTurnParams[1]?.model).toBe('gpt-5.4');
         expect(sessionEvents).toContainEqual({
             type: 'message',
-            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+            message: 'Task failed: Plan mode is not supported by this Codex runtime.'
         });
     });
 
-    it('retries plan turns when unsupported errors use spaced collaboration mode wording', async () => {
+    it('does not retry plan turns when unsupported errors use spaced collaboration mode wording', async () => {
         harness.startTurnErrors.push(new Error('unsupported collaboration mode'));
         const { session, sessionEvents } = createSessionStub(['plan this'], {
             permissionMode: 'default',
@@ -1520,14 +1725,13 @@ describe('codexRemoteLauncher', () => {
         const exitReason = await codexRemoteLauncher(session as never);
 
         expect(exitReason).toBe('exit');
-        expect(harness.startTurnParams).toHaveLength(2);
+        expect(harness.startTurnParams).toHaveLength(1);
         expect(harness.startTurnParams[0]?.collaborationMode).toMatchObject({
             mode: 'plan'
         });
-        expect(harness.startTurnParams[1]?.collaborationMode).toBeUndefined();
         expect(sessionEvents).toContainEqual({
             type: 'message',
-            message: 'Plan mode is not supported by this Codex runtime. Sent as a normal turn instead.'
+            message: 'Task failed: Plan mode is not supported by this Codex runtime.'
         });
     });
 
@@ -1574,7 +1778,7 @@ describe('codexRemoteLauncher', () => {
         });
     });
 
-    it('sets a Codex goal without starting a normal turn', async () => {
+    it('sets a Codex goal without starting a duplicate client turn', async () => {
         const { session, sessionEvents, codexMessages, foundSessionIds } = createSessionStub(['/goal improve benchmark coverage']);
 
         const exitReason = await codexRemoteLauncher(session as never);
@@ -1644,6 +1848,70 @@ describe('codexRemoteLauncher', () => {
                 })
             })
         ]));
+    });
+
+    it('does not start client turns for goal commands', async () => {
+        const { session } = createSessionStub([
+            '/goal improve benchmark coverage',
+            '/goal',
+            '/goal pause',
+            '/goal resume',
+            '/goal clear'
+        ], createMode(), true);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(harness.startTurnParams).toHaveLength(0);
+    });
+
+    it('tracks externally started turns used by app-server goals', async () => {
+        const { session, thinkingChanges } = createSessionStub(['/goal improve benchmark coverage']);
+
+        const running = codexRemoteLauncher(session as never);
+        await vi.waitFor(() => {
+            expect(harness.goalSetCalls).toHaveLength(1);
+        });
+
+        harness.dispatchNotification?.('turn/started', {
+            threadId: 'thread-1',
+            turn: { id: 'goal-turn-1' }
+        });
+        await vi.waitFor(() => {
+            expect(session.thinking).toBe(true);
+        });
+
+        harness.dispatchNotification?.('turn/completed', {
+            threadId: 'thread-1',
+            turn: { id: 'goal-turn-1', status: 'completed' }
+        });
+        await vi.waitFor(() => {
+            expect(session.thinking).toBe(false);
+        });
+
+        expect(thinkingChanges).toEqual(expect.arrayContaining([true, false]));
+        expect(await running).toBe('exit');
+    });
+
+    it('formats usage-limited goal status', async () => {
+        harness.goal = {
+            threadId: 'thread-1',
+            objective: 'improve benchmark coverage',
+            status: 'usageLimited',
+            tokenBudget: null,
+            tokensUsed: 10,
+            timeUsedSeconds: 1,
+            createdAt: 1,
+            updatedAt: 2
+        };
+        const { session, sessionEvents } = createSessionStub(['/goal']);
+
+        await codexRemoteLauncher(session as never);
+
+        expect(harness.startTurnParams).toHaveLength(0);
+        expect(sessionEvents).toContainEqual({
+            type: 'message',
+            message: 'Goal limited by usage · 10 tokens'
+        });
     });
 
     it('does not emit ready when a goal command interrupts an active turn', async () => {
@@ -2695,6 +2963,8 @@ describe('codexRemoteLauncher', () => {
         expect(codexMessages).toContainEqual(expect.objectContaining({
             type: 'token_count',
             thread_id: 'thread-1',
+            usageSchema: 'hapi.usage.v1',
+            inputTokenSemantics: 'includes-cache',
             scope_role: 'parent',
             scope: expect.objectContaining({
                 role: 'parent',

@@ -1,11 +1,13 @@
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 import { spawn, execSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { reapTestOwnedProcesses } from './auditTestProcesses'
+import { TEST_OWNED_MARKER_KEY } from './integrationEnv'
 
 // Workers can't inherit process.env from globalSetup, so we write config to a file
 // and let setupFile.ts read it in each worker.
@@ -56,6 +58,19 @@ export async function setup() {
     const token = randomBytes(20).toString('base64url')
     const bunExec = findBunExec()
 
+    // The runner integration suite spawns sessions whose agent-availability
+    // preflight requires an installable Claude CLI. CI runners have none, so
+    // provide a stub binary and point workers at it (see setup.ts). POSIX
+    // only: the shebang stub is meaningless on Windows, and the integration
+    // suite is not part of any Windows path anyway.
+    let stubClaudePath: string | undefined
+    if (process.platform !== 'win32') {
+        const stubBin = join(tmpHome, 'bin')
+        mkdirSync(stubBin, { recursive: true })
+        stubClaudePath = join(stubBin, 'claude')
+        writeFileSync(stubClaudePath, '#!/bin/sh\nexec sleep 300\n', { mode: 0o755 })
+    }
+
     // Use a minimal env whitelist to prevent shell credentials (DB_PATH,
     // TELEGRAM_BOT_TOKEN, ELEVENLABS_API_KEY, etc.) from leaking into the
     // test hub and triggering real notifications or opening a production DB.
@@ -75,7 +90,7 @@ export async function setup() {
     }
 
     // Write config so setupFile.ts can inject env vars into each test worker
-    writeFileSync(TEST_CONFIG_FILE, JSON.stringify({ port, token, tmpHome, bunExec }))
+    writeFileSync(TEST_CONFIG_FILE, JSON.stringify({ port, token, tmpHome, bunExec, stubClaudePath }))
 
     const hubEntry = join(
         dirname(fileURLToPath(import.meta.url)),
@@ -110,7 +125,34 @@ async function stopHubProcess(): Promise<void> {
 export async function teardown() {
     await stopHubProcess()
     try { rmSync(TEST_CONFIG_FILE) } catch {}
+
+    // Final audit: test children carry `HAPI_TEST_MARKER=<tmpHome>` in their
+    // environment (see integrationEnv.ts). Anything still alive after the
+    // suites ran is a test-owned leak — reap it, then fail the run with
+    // PID/command diagnostics if something could not be reaped. The temp home
+    // is always removed so a leak cannot also accumulate DB rows on disk.
+    let auditError: Error | null = null
+    if (tmpHome && process.platform !== 'win32') {
+        try {
+            const leftovers = await reapTestOwnedProcesses(`${TEST_OWNED_MARKER_KEY}=${tmpHome}`)
+            if (leftovers.length > 0) {
+                const detail = leftovers
+                    .map((p) => `  pid=${p.pid} ppid=${p.ppid} rss=${p.rssKb}KB ${p.command}`)
+                    .join('\n')
+                auditError = new Error(
+                    `[globalSetup] ${leftovers.length} test-owned process(es) survived teardown:\n${detail}`
+                )
+            }
+        } catch (error) {
+            // A failed process-table scan must fail the run, never pass as a
+            // "clean" audit.
+            auditError = error instanceof Error ? error : new Error(String(error))
+        }
+    }
     if (tmpHome) {
         rmSync(tmpHome, { recursive: true, force: true })
+    }
+    if (auditError) {
+        throw auditError
     }
 }

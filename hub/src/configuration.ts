@@ -11,6 +11,7 @@
  * - TELEGRAM_NOTIFICATION: Enable/disable Telegram notifications (default: true)
  * - SERVERCHAN_SENDKEY: Server酱 SendKey/AppKey for push notifications
  * - SERVERCHAN_NOTIFICATION: Enable/disable Server酱 notifications (default: true)
+ * - SERVERCHAN_BACKGROUND_ONLY: Only send Server酱 notifications without visible HAPI clients (default: false)
  * - HAPI_LISTEN_HOST: Host/IP to bind the HTTP service (default: 127.0.0.1)
  * - HAPI_LISTEN_PORT: Port for HTTP service (default: 3006)
  * - HAPI_PUBLIC_URL: Public URL for external access (e.g., Telegram Mini App)
@@ -19,6 +20,12 @@
  * - HAPI_RELAY_AUTH: Relay auth key override (default: per-hub key issued by the relay)
  * - HAPI_RELAY_FORCE_TCP: Force TCP relay mode when UDP is unavailable (true/1)
  * - VAPID_SUBJECT: Contact email or URL for Web Push (defaults to mailto:admin@hapi.run)
+ * - FCM_SERVICE_ACCOUNT_PATH: Firebase service-account JSON for Android push (settings: fcmServiceAccountPath;
+ *   the project id comes from the JSON itself)
+ * - HAPI_IOS_PUSH: iOS push transport apns|relay|off (default: relay; settings: iosPushMode)
+ * - HAPI_PUSH_RELAY_URL: iOS push relay URL (settings: iosPushRelayUrl)
+ * - APNS_KEY_P8_PATH, APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, APNS_ENV:
+ *   direct-APNs credentials (settings: apnsKeyP8Path, apnsKeyId, apnsTeamId, apnsBundleId, apnsEnv)
  * - HAPI_HOME: Data directory (default: ~/.hapi)
  * - DB_PATH: SQLite database path (default: {HAPI_HOME}/hapi.db)
  */
@@ -27,6 +34,7 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getOrCreateCliApiToken } from './config/cliApiToken'
+import { applyProviderCredentialsFromSettings } from './config/providerCredentials'
 import { getSettingsFile } from './config/settings'
 import { loadServerSettings, type ServerSettings, type ServerSettingsResult } from './config/serverSettings'
 
@@ -37,10 +45,19 @@ export interface ConfigSources {
     telegramNotification: ConfigSource
     serverChanSendKey: ConfigSource
     serverChanNotification: ConfigSource
+    serverChanBackgroundOnly: ConfigSource
     listenHost: ConfigSource
     listenPort: ConfigSource
     publicUrl: ConfigSource
     corsOrigins: ConfigSource
+    fcmServiceAccountPath: ConfigSource
+    iosPushMode: ConfigSource
+    iosPushRelayUrl: ConfigSource
+    apnsKeyP8Path: ConfigSource
+    apnsKeyId: ConfigSource
+    apnsTeamId: ConfigSource
+    apnsBundleId: ConfigSource
+    apnsEnv: ConfigSource
     cliApiToken: 'env' | 'file' | 'generated'
 }
 
@@ -59,6 +76,9 @@ class Configuration {
 
     /** Server酱 notifications enabled */
     public readonly serverChanNotification: boolean
+
+    /** Only send Server酱 notifications when no visible HAPI client exists */
+    public readonly serverChanBackgroundOnly: boolean
 
     /** CLI auth token (shared secret) */
     public cliApiToken: string
@@ -90,6 +110,17 @@ class Configuration {
     /** Allowed CORS origins for Mini App + Socket.IO (comma-separated env override) */
     public readonly corsOrigins: string[]
 
+    // Push delivery (FCM + iOS/APNs) — nullable strings interpreted by
+    // fcm/fcmConfig.ts and push-ios/iosPushConfig.ts.
+    public readonly fcmServiceAccountPath: string | null
+    public readonly iosPushMode: string | null
+    public readonly iosPushRelayUrl: string | null
+    public readonly apnsKeyP8Path: string | null
+    public readonly apnsKeyId: string | null
+    public readonly apnsTeamId: string | null
+    public readonly apnsBundleId: string | null
+    public readonly apnsEnv: string | null
+
     /** Sources of each configuration value */
     public readonly sources: ConfigSources
 
@@ -110,10 +141,19 @@ class Configuration {
         this.telegramNotification = serverSettings.telegramNotification
         this.serverChanSendKey = serverSettings.serverChanSendKey
         this.serverChanNotification = serverSettings.serverChanNotification
+        this.serverChanBackgroundOnly = serverSettings.serverChanBackgroundOnly
         this.listenHost = serverSettings.listenHost
         this.listenPort = serverSettings.listenPort
         this.publicUrl = serverSettings.publicUrl
         this.corsOrigins = serverSettings.corsOrigins
+        this.fcmServiceAccountPath = serverSettings.fcmServiceAccountPath
+        this.iosPushMode = serverSettings.iosPushMode
+        this.iosPushRelayUrl = serverSettings.iosPushRelayUrl
+        this.apnsKeyP8Path = serverSettings.apnsKeyP8Path
+        this.apnsKeyId = serverSettings.apnsKeyId
+        this.apnsTeamId = serverSettings.apnsTeamId
+        this.apnsBundleId = serverSettings.apnsBundleId
+        this.apnsEnv = serverSettings.apnsEnv
 
         // CLI API token - will be set by _setCliApiToken() before create() returns
         this.cliApiToken = ''
@@ -154,6 +194,10 @@ class Configuration {
         if (settingsResult.savedToFile) {
             console.log(`[Hub] Configuration saved to ${getSettingsFile(dataDir)}`)
         }
+
+        // 3b. Apply Settings-managed provider credentials into process.env
+        // (env vars set at process start still win; no restart needed for UI saves)
+        await applyProviderCredentialsFromSettings(dataDir)
 
         // 4. Create configuration instance
         const config = new Configuration(

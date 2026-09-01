@@ -50,10 +50,32 @@ export const CliMessagesResponseSchema = z.object({
 export type CliMessagesResponse = z.infer<typeof CliMessagesResponseSchema>
 
 export const CreateSessionResponseSchema = z.object({
-    session: SessionSchema
+    session: SessionSchema,
+    /** Hub opt-in for AGENT_NOTIFY_SUMMARY prompt injection (default off when omitted). */
+    sessionSummaryContract: z.boolean().optional()
 })
 
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>
+
+export const HubSettingsResponseSchema = z.object({
+    sessionSummaryContract: z.boolean(),
+    /** Show compact AGENT_NOTIFY_SUMMARY in chat (default off / hide). */
+    sessionSummaryInChat: z.boolean()
+})
+
+export type HubSettingsResponse = z.infer<typeof HubSettingsResponseSchema>
+
+export const UpdateHubSettingsRequestSchema = z
+    .object({
+        sessionSummaryContract: z.boolean().optional(),
+        sessionSummaryInChat: z.boolean().optional()
+    })
+    .refine(
+        (data) => data.sessionSummaryContract !== undefined || data.sessionSummaryInChat !== undefined,
+        { message: 'At least one hub setting field is required' }
+    )
+
+export type UpdateHubSettingsRequest = z.infer<typeof UpdateHubSettingsRequestSchema>
 
 export const CreateMachineResponseSchema = z.object({
     machine: MachineSchema
@@ -108,7 +130,12 @@ export type MachinesResponse = { machines: Machine[] }
 
 export type SpawnResponse =
     | { type: 'success'; sessionId: string }
-    | { type: 'error'; message: string }
+    | {
+        type: 'error'
+        message: string
+        code?: 'agent_unavailable' | 'runner_upgrade_required' | 'outside_workspace_roots'
+        agent?: z.infer<typeof AgentFlavorSchema>
+    }
 
 export const SessionPermissionModeRequestSchema = z.object({
     mode: PermissionModeSchema
@@ -154,6 +181,11 @@ export const CodexImportedMessageSchema = z.union([
     z.object({
         role: z.literal('agent'),
         content: z.object({ type: z.literal('codex'), data: z.unknown() }),
+        meta: z.object({ sentFrom: z.literal('cli') })
+    }),
+    z.object({
+        role: z.literal('agent'),
+        content: z.object({ type: z.literal('event'), data: z.unknown() }),
         meta: z.object({ sentFrom: z.literal('cli') })
     })
 ])
@@ -293,6 +325,25 @@ export const RenameSessionRequestSchema = z.object({
 })
 
 export type RenameSessionRequest = z.infer<typeof RenameSessionRequestSchema>
+
+export const UpdateSessionSummaryRequestSchema = z.object({
+    text: z.string().trim().min(1).max(255)
+})
+
+export type UpdateSessionSummaryRequest = z.infer<typeof UpdateSessionSummaryRequestSchema>
+
+export const SessionTitleSuggestionResponseSchema = z.object({
+    title: z.string().min(1).max(255)
+})
+
+export type SessionTitleSuggestionResponse = z.infer<typeof SessionTitleSuggestionResponseSchema>
+
+export const SetSessionPinnedRequestSchema = z.object({
+    mode: z.enum(['none', 'project', 'global'])
+})
+
+export type SetSessionPinnedRequest = z.infer<typeof SetSessionPinnedRequestSchema>
+export type SessionPinMode = SetSessionPinnedRequest['mode']
 
 /**
  * An empty string clears the custom name, so unlike session rename there is no
@@ -549,6 +600,7 @@ export type QueuedStateRequest = z.infer<typeof QueuedStateRequestSchema>
 
 export type QueuedStateResponse = {
     queuedLocalIds: string[]
+    indeterminateLocalIds?: string[]
     invokedLocalMessages: Array<{
         localId: string
         invokedAt: number
@@ -586,6 +638,21 @@ export const MachinePathsExistsRequestSchema = z.object({
 
 export type MachinePathsExistsRequest = z.infer<typeof MachinePathsExistsRequestSchema>
 
+export const AgentAvailabilityReasonSchema = z.enum(['not_found', 'invalid_configuration'])
+export type AgentAvailabilityReason = z.infer<typeof AgentAvailabilityReasonSchema>
+
+export const AgentAvailabilityEntrySchema = z.object({
+    agent: AgentFlavorSchema,
+    available: z.boolean(),
+    reason: AgentAvailabilityReasonSchema.optional()
+})
+export type AgentAvailabilityEntry = z.infer<typeof AgentAvailabilityEntrySchema>
+
+export const AgentAvailabilityResponseSchema = z.object({
+    agents: z.array(AgentAvailabilityEntrySchema)
+})
+export type AgentAvailabilityResponse = z.infer<typeof AgentAvailabilityResponseSchema>
+
 export const AuthRequestSchema = z.union([
     z.object({ initData: z.string() }),
     z.object({ accessToken: z.string() })
@@ -606,6 +673,8 @@ export type GitCommandResponse = CommandResponse
 export type FileReadResponse = {
     success: boolean
     content?: string
+    size?: number
+    modified?: number
     error?: string
 }
 
@@ -667,6 +736,8 @@ export type MachineListDirectoryResponse = {
 
 export type PathExistsResponse = {
     exists: Record<string, boolean>
+    /** Requested paths rejected by the runner's configured workspace roots. */
+    outsideWorkspaceRoots?: string[]
 }
 
 export type MachinePathsExistsResponse = PathExistsResponse

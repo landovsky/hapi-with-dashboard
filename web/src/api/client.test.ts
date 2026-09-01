@@ -80,6 +80,32 @@ describe('ApiClient error mapping', () => {
         }
     })
 
+    it('returns export warnings and sends explicit confirmation for large exports', async () => {
+        const warning = {
+            type: 'warning',
+            count: 20_001,
+            limit: 20_000,
+            estimatedBytes: 12_345_678
+        }
+        const payload = {
+            schemaVersion: 2,
+            exportedAt: 1_762_000_000_000,
+            session: { id: 'session-1' },
+            messages: [],
+            scratchlist: []
+        }
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify(warning), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.getSessionExport('session-1')).resolves.toEqual(warning)
+        await expect(api.getSessionExport('session-1', { force: true })).resolves.toEqual(payload)
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session-1/export')
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/sessions/session-1/export?force=true')
+    })
+
     it('loads the Cursor chat store status for the selected session', async () => {
         fetchMock.mockResolvedValueOnce(
             new Response(JSON.stringify({ onDisk: false, store: null }), { status: 200 })
@@ -91,6 +117,40 @@ describe('ApiClient error mapping', () => {
             store: null
         })
         expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session%20cursor/cursor-chat-store')
+    })
+
+    it('generates a title and saves the summary through separate session endpoints', async () => {
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify({ title: 'Generated title' }), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.suggestSessionTitle('session /?#')).resolves.toEqual({ title: 'Generated title' })
+        await api.updateSessionSummary('session /?#', 'Generated title')
+
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/sessions/session%20%2F%3F%23/title-suggestion')
+        expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: 'POST' })
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/sessions/session%20%2F%3F%23/summary')
+        expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+            method: 'PATCH',
+            body: JSON.stringify({ text: 'Generated title' })
+        })
+    })
+
+    it('reads the Hub title suggestion capability', async () => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+            status: 'ok',
+            protocolVersion: 1,
+            capabilities: { titleSuggestion: true }
+        }), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.getHealth()).resolves.toEqual({
+            status: 'ok',
+            protocolVersion: 1,
+            capabilities: { titleSuggestion: true }
+        })
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/health')
     })
 
     it('lists and imports Pi sessions through the selected machine', async () => {
@@ -151,6 +211,22 @@ describe('ApiClient error mapping', () => {
         })
     })
 
+    it('posts a steer for a queued message', async () => {
+        fetchMock.mockResolvedValueOnce(
+            new Response(JSON.stringify({ status: 'steered', localId: 'local-1' }), { status: 200 })
+        )
+
+        const api = new ApiClient('test-token')
+        await expect(api.steerMessage('session /?#', 'msg-1')).resolves.toEqual({
+            status: 'steered',
+            localId: 'local-1',
+        })
+
+        const [url, init] = fetchMock.mock.calls[0] ?? []
+        expect(url).toBe('/api/sessions/session%20%2F%3F%23/messages/msg-1/steer')
+        expect(init).toMatchObject({ method: 'POST' })
+    })
+
     it('requests usage buckets in the viewer IANA time zone', async () => {
         fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }))
 
@@ -182,5 +258,41 @@ describe('ApiClient error mapping', () => {
         const api = new ApiClient('test-token')
         await expect(api.fetchVoiceBackend()).resolves.toEqual({ backend: null, backends: [] })
         expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/voice/backend')
+    })
+
+    it('reads and updates masked transcription credentials', async () => {
+        const status = {
+            openai: { configured: true, source: 'settings', hint: '••••cret', editable: true },
+            elevenlabs: { configured: false, source: 'none', hint: null, editable: true },
+            deepgram: { configured: false, source: 'none', hint: null, editable: true },
+            groq: { configured: false, source: 'none', hint: null, editable: true },
+            openaiCompatible: {
+                configured: false,
+                source: 'none',
+                baseUrl: null,
+                model: null,
+                baseUrlEditable: true,
+                modelEditable: true,
+                apiKey: { configured: false, source: 'none', hint: null, editable: true },
+            },
+            voiceBackends: {
+                elevenlabs: { configured: false, source: 'none', hint: null, editable: true },
+                geminiLive: { configured: false, source: 'none', hint: null, editable: true },
+                qwenRealtime: { configured: false, source: 'none', hint: null, editable: true },
+            },
+        }
+        fetchMock
+            .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify(status), { status: 200 }))
+
+        const api = new ApiClient('test-token')
+        await expect(api.fetchTranscriptionCredentials()).resolves.toEqual(status)
+        expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/voice/transcription/credentials')
+
+        await expect(api.updateTranscriptionCredentials({ openai: 'sk-test' })).resolves.toEqual(status)
+        const [, init] = fetchMock.mock.calls[1] ?? []
+        expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/voice/transcription/credentials')
+        expect(init?.method).toBe('PUT')
+        expect(init?.body).toBe(JSON.stringify({ openai: 'sk-test' }))
     })
 })

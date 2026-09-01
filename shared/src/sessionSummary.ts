@@ -41,6 +41,8 @@ export type SessionSummaryMetadata = {
     worktree?: WorktreeMetadata
     agentSessionId?: string
     lifecycleState?: string
+    /** Loopback MCP URL when session CLI happy server is running (#956). */
+    hapiMcpUrl?: string
 }
 
 export type SessionSummary = {
@@ -49,6 +51,8 @@ export type SessionSummary = {
     thinking: boolean
     activeAt: number
     updatedAt: number
+    pinned?: boolean
+    globalPinned?: boolean
     metadata: SessionSummaryMetadata | null
     /** Watermarks for structured SSE patches (PR #897). List cache must gate
      *  without requiring a detail query — otherwise global SSE forces O(N)
@@ -144,7 +148,7 @@ export function computeTodoProgress(todos: TodoItem[] | undefined): SessionSumma
     }
 }
 
-const AGENT_SESSION_ID_FIELD_BY_FLAVOR = {
+const AGENT_SESSION_ID_FIELD_BY_FLAVOR: Partial<Record<AgentFlavor, keyof Metadata>> = {
     claude: 'claudeSessionId',
     codex: 'codexSessionId',
     gemini: 'geminiSessionId',
@@ -155,12 +159,13 @@ const AGENT_SESSION_ID_FIELD_BY_FLAVOR = {
     kimi: 'kimiSessionId',
     copilot: 'copilotSessionId',
     pi: 'piSessionId'
-} as const satisfies Record<AgentFlavor, keyof Metadata>
+}
 
 function getSummaryAgentSessionId(metadata: Metadata): string | undefined {
     const flavor = metadata.flavor
     if (isKnownFlavor(flavor)) {
         const flavorField = AGENT_SESSION_ID_FIELD_BY_FLAVOR[flavor]
+        if (!flavorField) return undefined
         const flavorSessionId = metadata[flavorField]
         return typeof flavorSessionId === 'string' && flavorSessionId.trim()
             ? flavorSessionId.trim()
@@ -192,7 +197,8 @@ export function toSessionSummaryMetadata(metadata: Metadata | null | undefined):
         flavor: metadata.flavor ?? null,
         worktree: metadata.worktree,
         agentSessionId: getSummaryAgentSessionId(metadata),
-        lifecycleState: metadata.lifecycleState
+        lifecycleState: metadata.lifecycleState,
+        hapiMcpUrl: metadata.hapiMcpUrl ?? undefined
     }
 }
 
@@ -203,6 +209,8 @@ export function toSessionSummary(session: Session): SessionSummary {
         thinking: session.thinking,
         activeAt: session.activeAt,
         updatedAt: session.updatedAt,
+        pinned: session.pinned ?? false,
+        globalPinned: session.globalPinned ?? false,
         metadata: toSessionSummaryMetadata(session.metadata),
         metadataVersion: session.metadataVersion,
         agentStateVersion: session.agentStateVersion,

@@ -91,6 +91,23 @@ function makeHiddenAgentMessage(props: { id: string; seq: number; at: number }):
     } as DecryptedMessage
 }
 
+function makeReasoningMessage(id: string, streamId: string, seq: number, at: number, live = true): DecryptedMessage {
+    return {
+        id,
+        seq,
+        localId: null,
+        content: {
+            role: 'agent',
+            content: {
+                type: 'codex',
+                data: { type: 'reasoning', message: id, id: streamId, ...(live ? { live: true } : {}) }
+            }
+        },
+        createdAt: at,
+        invokedAt: at
+    } as DecryptedMessage
+}
+
 function makeAgentRunMessage(id: string, seq: number, at: number): DecryptedMessage {
     return {
         id,
@@ -230,16 +247,16 @@ afterEach(() => {
 })
 
 describe('message tail synchronization', () => {
-    it('renders a persisted window immediately, activates tail mode, then requests only missed messages', async () => {
+    it('renders a persisted window immediately, then requests the latest tail on re-entry', async () => {
         const id = sessionId('reentry')
-        const cached = makeAgentMessage({ id: 'cached', seq: 10, at: 1_000 })
+        const cached = makeAgentMessage({ id: 'cached', seq: 40, at: 40_000 })
         sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
             messages: [cached],
             hasMore: true,
-            oldestPositionAt: 1_000,
-            oldestPositionSeq: 10,
-            newestPositionAt: 1_000,
-            newestPositionSeq: 10,
+            oldestPositionAt: 40_000,
+            oldestPositionSeq: 40,
+            newestPositionAt: 40_000,
+            newestPositionSeq: 40,
             epoch: 3
         }))
 
@@ -248,26 +265,92 @@ describe('message tail synchronization', () => {
         activateMessageWindow(id)
         expect(getMessageWindowState(id).viewMode).toBe('tail')
 
-        const missed = makeAgentMessage({ id: 'missed', seq: 11, at: 1_100 })
-        const getMessages = vi.fn(async () => afterResponse([missed], {
+        const latest = makeAgentMessage({ id: 'latest', seq: 2_040, at: 2_040_000 })
+        const getMessages = vi.fn(async () => latestResponse([latest], {
             epoch: 3,
-            nextAfterAt: 1_100,
-            nextAfterSeq: 11,
-            snapshotHeadAt: 1_100,
-            snapshotHeadSeq: 11
+            hasMore: true,
+            nextBeforeAt: 1_841_000,
+            nextBeforeSeq: 1_841
+        }))
+        await syncTailMessages(createApi(getMessages), id)
+
+        expect(getMessages).toHaveBeenCalledWith(id, { limit: 200 })
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['latest'])
+        expect(getMessageWindowState(id).hasMore).toBe(true)
+        expect('pending' in getMessageWindowState(id)).toBe(false)
+    })
+
+    it('preserves queued rows while replacing stale server rows on re-entry', async () => {
+        const id = sessionId('reentry-queued')
+        const cached = makeAgentMessage({ id: 'cached', seq: 40, at: 4_000 })
+        const queued = makeUserMessage({
+            id: 'local-1',
+            localId: 'local-1',
+            createdAt: 4_100,
+            invokedAt: null,
+            status: 'queued'
+        })
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [cached, queued],
+            hasMore: true,
+            oldestPositionAt: 4_000,
+            oldestPositionSeq: 40,
+            newestPositionAt: 4_000,
+            newestPositionSeq: 40,
+            epoch: 3
+        }))
+
+        activateMessageWindow(id)
+        const latest = makeAgentMessage({ id: 'latest', seq: 2_000, at: 200_000 })
+        const getMessages = vi.fn(async () => latestResponse([latest], { epoch: 3 }))
+        await syncTailMessages(createApi(getMessages), id)
+
+        expect(getMessages).toHaveBeenCalledWith(id, { limit: 200 })
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual([
+            'local-1',
+            'latest'
+        ])
+        expect(getMessageWindowState(id).messages).toContainEqual(expect.objectContaining({
+            id: 'local-1',
+            status: 'queued'
+        }))
+    })
+
+    it('keeps incremental synchronization for non-activation refreshes', async () => {
+        const id = sessionId('incremental-refresh')
+        const cached = makeAgentMessage({ id: 'cached', seq: 40, at: 40_000 })
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [cached],
+            hasMore: true,
+            oldestPositionAt: 40_000,
+            oldestPositionSeq: 40,
+            newestPositionAt: 40_000,
+            newestPositionSeq: 40,
+            epoch: 3
+        }))
+
+        const latest = makeAgentMessage({ id: 'latest', seq: 41, at: 41_000 })
+        const getMessages = vi.fn(async () => afterResponse([latest], {
+            epoch: 3,
+            nextAfterAt: 41_000,
+            nextAfterSeq: 41,
+            snapshotHeadAt: 41_000,
+            snapshotHeadSeq: 41
         }))
         await syncTailMessages(createApi(getMessages), id)
 
         expect(getMessages).toHaveBeenCalledWith(id, {
-            afterAt: 1_000,
-            afterSeq: 10,
+            afterAt: 40_000,
+            afterSeq: 40,
             untilAt: null,
             untilSeq: null,
             epoch: 3,
             limit: 200
         })
-        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['cached', 'missed'])
-        expect('pending' in getMessageWindowState(id)).toBe(false)
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual([
+            'cached',
+            'latest'
+        ])
     })
 
     it('preserves SSE rows that arrive while the latest snapshot is in flight', async () => {
@@ -460,6 +543,49 @@ describe('message tail synchronization', () => {
             'page',
             'concurrent'
         ])
+    })
+
+    it('invalidates an in-flight incremental request when re-entry prioritizes latest', async () => {
+        const id = sessionId('reentry-in-flight')
+        const cached = makeAgentMessage({ id: 'cached', seq: 40, at: 40_000 })
+        sessionStorage.setItem(`hapi:message-window:v2:${id}`, JSON.stringify({
+            messages: [cached],
+            hasMore: true,
+            oldestPositionAt: 40_000,
+            oldestPositionSeq: 40,
+            newestPositionAt: 40_000,
+            newestPositionSeq: 40,
+            epoch: 3
+        }))
+
+        const staleResponse = deferred<MessagesResponse>()
+        const latest = makeAgentMessage({ id: 'latest', seq: 2_040, at: 2_040_000 })
+        const getMessages = vi.fn()
+            .mockImplementationOnce(async () => await staleResponse.promise)
+            .mockResolvedValueOnce(latestResponse([latest], { epoch: 3 }))
+        const api = createApi(getMessages)
+        const initialSync = syncTailMessages(api, id)
+        await vi.waitFor(() => expect(getMessages).toHaveBeenCalledTimes(1))
+
+        activateMessageWindow(id)
+        const reentrySync = syncTailMessages(api, id)
+        await vi.waitFor(() => expect(getMessages).toHaveBeenCalledTimes(2))
+        expect(getMessages.mock.calls[1]?.[1]).toEqual({ limit: 200 })
+        staleResponse.resolve(afterResponse([
+            makeAgentMessage({ id: 'stale-page', seq: 41, at: 41_000 })
+        ], {
+            epoch: 3,
+            nextAfterAt: 41_000,
+            nextAfterSeq: 41,
+            snapshotHeadAt: 2_040_000,
+            snapshotHeadSeq: 2_040,
+            hasMore: true
+        }))
+
+        await initialSync
+        await reentrySync
+
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['latest'])
     })
 
     it('deduplicates SSE and REST delivery while preserving the authoritative invocation timestamp', async () => {
@@ -816,6 +942,39 @@ describe('history view and older pagination', () => {
         expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['older', 'latest'])
     })
 
+    it('advances the tail revision for live messages but not older-page loads', async () => {
+        const id = sessionId('tail-revision')
+        const latest = makeAgentMessage({ id: 'latest', seq: 10, at: 10_000 })
+        const older = makeAgentMessage({ id: 'older', seq: 9, at: 9_000 })
+        const getMessages = vi.fn()
+            .mockResolvedValueOnce(latestResponse([latest], {
+                epoch: 4,
+                hasMore: true,
+                nextBeforeAt: 10_000,
+                nextBeforeSeq: 10
+            }))
+            .mockResolvedValueOnce(beforeResponse([older], {
+                epoch: 4,
+                hasMore: false,
+                nextBeforeAt: 9_000,
+                nextBeforeSeq: 9
+            }))
+        const api = createApi(getMessages)
+
+        await syncTailMessages(api, id)
+        const afterTailSync = getMessageWindowState(id).tailRevision
+        setMessageViewMode(id, 'history')
+        await fetchOlderMessages(api, id)
+
+        expect(getMessageWindowState(id).tailRevision).toBe(afterTailSync)
+
+        ingestIncomingMessages(id, [
+            makeAgentMessage({ id: 'new-live', seq: 11, at: 11_000 })
+        ])
+
+        expect(getMessageWindowState(id).tailRevision).toBe(afterTailSync + 1)
+    })
+
     it('leaves the window unchanged when the final older-page apply check rejects', async () => {
         const id = sessionId('older-page-apply-rejected')
         const latest = makeAgentMessage({ id: 'latest', seq: 10, at: 10_000 })
@@ -1106,6 +1265,7 @@ describe('optimistic and queued-message operations', () => {
             makeAgentMessage({ id: 'agent', seq: 2, at: 2_000 })
         ])
 
+        const beforeConsumed = getMessageWindowState(id).tailRevision
         markMessagesConsumed(id, ['local-1'], 3_000)
 
         expect(getMessageWindowState(id).messages.at(-1)).toMatchObject({
@@ -1113,6 +1273,7 @@ describe('optimistic and queued-message operations', () => {
             status: 'sent',
             invokedAt: 3_000
         })
+        expect(getMessageWindowState(id).tailRevision).toBe(beforeConsumed + 1)
     })
 
     it('reconciles queued candidates without a secondary pending collection', () => {
@@ -1189,5 +1350,89 @@ describe('V2 persistence boundary', () => {
 
         expect(getMessageWindowState(id).messages[0]?.status).toBe('queued')
         expect(getQueuedReconcileCandidateLocalIds(id)).toEqual(['local-1'])
+    })
+})
+
+
+describe('reasoning snapshot compaction', () => {
+    it('keeps only the newest snapshot of each stream', () => {
+        const id = sessionId('reasoning-compaction')
+        const snapshots = Array.from({ length: 5 }, (_, index) =>
+            makeReasoningMessage(`snap-${index}`, 'stream-1', index + 1, index + 1)
+        )
+        const others = [
+            makeUserMessage({ id: 'user-1', seq: 10, invokedAt: 10, createdAt: 10 }),
+            makeUserMessage({ id: 'user-2', seq: 11, invokedAt: 11, createdAt: 11 })
+        ]
+        ingestIncomingMessages(id, [...snapshots, ...others])
+
+        expect(getMessageWindowState(id).messages.map((message) => message.id))
+            .toEqual(['snap-4', 'user-1', 'user-2'])
+    })
+
+    it('keeps the newest snapshot of every stream independently', () => {
+        const id = sessionId('reasoning-multi-stream')
+        ingestIncomingMessages(id, [
+            makeReasoningMessage('a-1', 'stream-a', 1, 1),
+            makeReasoningMessage('a-2', 'stream-a', 2, 2),
+            makeReasoningMessage('b-1', 'stream-b', 3, 3),
+            makeReasoningMessage('b-2', 'stream-b', 4, 4)
+        ])
+
+        expect(getMessageWindowState(id).messages.map((message) => message.id)).toEqual(['a-2', 'b-2'])
+    })
+
+    it('leaves messages without a reasoning stream untouched', () => {
+        const id = sessionId('reasoning-unrelated')
+        const messages = [
+            makeUserMessage({ id: 'user-1', seq: 1, invokedAt: 1, createdAt: 1 }),
+            makeAgentRunMessage('run-1', 2, 2),
+            makeAgentRunMessage('run-2', 3, 3)
+        ]
+        ingestIncomingMessages(id, messages)
+
+        expect(getMessageWindowState(id).messages).toHaveLength(3)
+    })
+
+    it('spends the window budget on conversation rather than duplicate snapshots', () => {
+        const id = sessionId('reasoning-window-budget')
+        // A session already carrying a flood of stored snapshots: without
+        // compaction they consume the whole window and the conversation that
+        // surrounds them falls out of it.
+        const flood = Array.from({ length: VISIBLE_WINDOW_SIZE }, (_, index) =>
+            makeReasoningMessage(`flood-${index}`, 'stream-1', index + 1, index + 1)
+        )
+        const conversation = Array.from({ length: 50 }, (_, index) =>
+            makeUserMessage({
+                id: `talk-${index}`,
+                seq: VISIBLE_WINDOW_SIZE + index + 1,
+                invokedAt: VISIBLE_WINDOW_SIZE + index + 1,
+                createdAt: VISIBLE_WINDOW_SIZE + index + 1
+            })
+        )
+        ingestIncomingMessages(id, [...flood, ...conversation])
+
+        const kept = getMessageWindowState(id).messages
+        for (const message of conversation) {
+            expect(kept.some((candidate) => candidate.id === message.id)).toBe(true)
+        }
+        expect(kept.filter((message) => message.id.startsWith('flood-'))).toHaveLength(1)
+    })
+
+    // The seq bounds are a view over what the window currently holds; the
+    // cursor that drives older-page requests is the server's own
+    // `nextBefore*`, which compaction never touches. Pinning the bounds keeps
+    // that distinction honest if the two are ever conflated.
+    it('derives its seq bounds from the surviving rows', () => {
+        const id = sessionId('reasoning-bounds')
+        ingestIncomingMessages(id, [
+            makeReasoningMessage('snap-1', 'stream-1', 1, 1),
+            makeReasoningMessage('snap-2', 'stream-1', 2, 2),
+            makeUserMessage({ id: 'user-1', seq: 3, invokedAt: 3, createdAt: 3 })
+        ])
+
+        const state = getMessageWindowState(id)
+        expect(state.oldestSeq).toBe(2)
+        expect(state.newestSeq).toBe(3)
     })
 })

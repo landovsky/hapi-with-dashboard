@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useParams, useSearch } from '@tanstack/react-router'
 import type { GitCommandResponse } from '@/types/api'
@@ -14,6 +14,7 @@ import { useTranslation } from '@/lib/use-translation'
 import { decodeBase64 } from '@/lib/utils'
 import { ImagePreview } from '@/components/ImagePreview'
 import { MarkdownRenderer } from '@/components/MarkdownRenderer'
+import { formatFileMetadata } from '@/lib/file-metadata'
 import {
     getInitialMarkdownPreviewMode,
     isMarkdownFile,
@@ -23,6 +24,11 @@ import {
 import { downloadBase64File } from '@/lib/file-download'
 
 const MAX_COPYABLE_FILE_BYTES = 1_000_000
+const FILE_SCROLL_KEY_PREFIX = 'hapi-file-scroll-'
+
+function getFileScrollStorageKey(sessionId: string, filePath: string, staged: boolean | undefined): string {
+    return `${FILE_SCROLL_KEY_PREFIX}${sessionId}:${encodeURIComponent(filePath)}:${staged === true ? 'staged' : 'unstaged'}`
+}
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
     apng: 'image/apng',
     avif: 'image/avif',
@@ -199,7 +205,7 @@ function extractCommandError(result: GitCommandResponse | undefined): string | n
 
 export default function FilePage() {
     const { api } = useAppContext()
-    const { t } = useTranslation()
+    const { t, locale } = useTranslation()
     const { copied: pathCopied, copy: copyPath } = useCopyToClipboard()
     const { copied: contentCopied, copy: copyContent } = useCopyToClipboard()
     const goBack = useAppGoBack()
@@ -271,6 +277,51 @@ export default function FilePage() {
     const canDownload = fileContentResult?.success === true && Boolean(fileContentResult.content)
 
     const [displayMode, setDisplayMode] = useState<'diff' | 'file'>('diff')
+    const fileScrollRef = useRef<HTMLDivElement>(null)
+    const restoredScrollKeyRef = useRef<string | null>(null)
+    const fileScrollKey = useMemo(
+        () => getFileScrollStorageKey(sessionId, filePath, staged),
+        [filePath, sessionId, staged]
+    )
+
+    const restoreFileScroll = useCallback((element: HTMLDivElement | null = fileScrollRef.current) => {
+        if (!element) return
+        try {
+            const saved = sessionStorage.getItem(fileScrollKey)
+            if (saved !== null) element.scrollTop = Number(saved)
+        } catch {
+            // Ignore unavailable storage.
+        }
+    }, [fileScrollKey])
+
+    useLayoutEffect(() => {
+        restoreFileScroll()
+        const frame = typeof requestAnimationFrame === 'function'
+            ? requestAnimationFrame(() => restoreFileScroll())
+            : undefined
+        return () => {
+            if (frame !== undefined && typeof cancelAnimationFrame === 'function') {
+                cancelAnimationFrame(frame)
+            }
+            const element = fileScrollRef.current
+            if (!element) return
+            try {
+                sessionStorage.setItem(fileScrollKey, String(element.scrollTop))
+            } catch {
+                // Ignore unavailable storage.
+            }
+        }
+    }, [fileScrollKey, restoreFileScroll])
+
+    // Query results can arrive after the route first renders. Re-apply the
+    // saved position once content has been mounted, but do not overwrite
+    // user scrolling when a query refreshes the same file.
+    useEffect(() => {
+        if (diffQuery.isLoading || fileQuery.isLoading) return
+        if (restoredScrollKeyRef.current === fileScrollKey) return
+        restoreFileScroll()
+        restoredScrollKeyRef.current = fileScrollKey
+    }, [diffQuery.isLoading, fileQuery.isLoading, fileScrollKey, restoreFileScroll])
 
     const setMarkdownPreviewMode = (mode: MarkdownPreviewMode) => {
         setMarkdownMode(mode)
@@ -298,6 +349,7 @@ export default function FilePage() {
     const missingPath = !filePath
     const diffErrorMessage = diffError ? formatDiffError(diffError, t) : null
     const fileErrorMessage = fileError ? formatReadFileError(fileError, t) : null
+    const fileMetadata = formatFileMetadata(fileContentResult?.size, fileContentResult?.modified, locale)
 
     return (
         <div className="flex h-full min-h-0 flex-col">
@@ -312,7 +364,7 @@ export default function FilePage() {
                     </button>
                     <div className="min-w-0 flex-1">
                         <div className="truncate font-semibold">{fileName}</div>
-                        <div className="truncate text-xs text-[var(--app-hint)]">{filePath || t('file.page.unknownPath')}</div>
+                        <div className="truncate text-xs text-[var(--app-hint)]">{fileMetadata ?? (filePath || t('file.page.unknownPath'))}</div>
                     </div>
                 </div>
             </div>
@@ -386,7 +438,7 @@ export default function FilePage() {
                 </div>
             ) : null}
 
-            <div className="app-scroll-y flex-1 min-h-0">
+            <div ref={fileScrollRef} data-hapi-file-scroll="true" className="app-scroll-y flex-1 min-h-0">
                 <div className="mx-auto w-full max-w-content p-4">
                     {diffErrorMessage ? (
                         <div className="mb-3 rounded-md bg-amber-500/10 p-2 text-xs text-[var(--app-hint)]">

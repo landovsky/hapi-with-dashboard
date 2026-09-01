@@ -52,6 +52,61 @@ describe('getEventPresentation — agent errors', () => {
     })
 })
 
+describe('getEventPresentation — api-error', () => {
+    it('appends the reason to the retry wording rather than replacing it', () => {
+        // An agent that retries without announcing a ceiling. The reason is
+        // what tells a stuck-looking session apart from a rate-limited one,
+        // but "Retrying" is what says the agent has not given up — so both
+        // survive, and no producer has to encode the second one itself.
+        const result = getEventPresentation({
+            type: 'api-error',
+            retryAttempt: 2,
+            maxRetries: 0,
+            error: { message: 'Rate limit exceeded: free-models-per-day. (attempt 2)' }
+        })
+
+        expect(result).toEqual({
+            icon: '⏳',
+            text: 'API error: Retrying... Rate limit exceeded: free-models-per-day. (attempt 2)'
+        })
+    })
+
+    it('reads a reason attached as a bare string', () => {
+        const result = getEventPresentation({
+            type: 'api-error',
+            retryAttempt: 1,
+            maxRetries: 0,
+            error: 'Overloaded.'
+        })
+
+        expect(result.text).toBe('API error: Retrying... Overloaded.')
+    })
+
+    // Claude sessions reach this same branch set and must render exactly as
+    // they did before a reason was ever displayed here.
+    it('keeps the retry wording for an api error carrying no reason', () => {
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 1, maxRetries: 0, error: undefined }))
+            .toEqual({ icon: '⏳', text: 'API error: Retrying...' })
+    })
+
+    it('keeps the retry wording when the reason is empty or unreadable', () => {
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 1, maxRetries: 0, error: { message: '   ' } }).text)
+            .toBe('API error: Retrying...')
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 1, maxRetries: 0, error: { code: 429 } }).text)
+            .toBe('API error: Retrying...')
+    })
+
+    it('keeps the counted, exhausted and bare renderings untouched', () => {
+        const error = { message: 'Rate limit exceeded.' }
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 2, maxRetries: 10, error }))
+            .toEqual({ icon: '⏳', text: 'API error: Retrying (2/10)' })
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 10, maxRetries: 10, error }))
+            .toEqual({ icon: '⚠️', text: 'API error: Max retries reached' })
+        expect(getEventPresentation({ type: 'api-error', retryAttempt: 0, maxRetries: 0, error }))
+            .toEqual({ icon: '⚠️', text: 'API error' })
+    })
+})
+
 describe('getEventPresentation — limit-warning', () => {
     it('formats five_hour warning', () => {
         const result = getEventPresentation({
@@ -178,6 +233,27 @@ describe('getEventPresentation — thread goals', () => {
         expect(result.text).toBe('Goal limited by budget · 4k / 5k')
     })
 
+    it.each([
+        ['blocked', 'Goal blocked'],
+        ['usageLimited', 'Goal limited by usage']
+    ] as const)('formats %s goal status', (status, expected) => {
+        const result = getEventPresentation({
+            type: 'thread-goal-updated',
+            goal: {
+                threadId: 'thread-1',
+                objective: 'ship goal support',
+                status,
+                tokenBudget: null,
+                tokensUsed: 0,
+                timeUsedSeconds: 0,
+                createdAt: 1,
+                updatedAt: 2
+            }
+        })
+
+        expect(result.text).toBe(expected)
+    })
+
     it('formats goal clear events', () => {
         const result = getEventPresentation({ type: 'thread-goal-cleared', threadId: 'thread-1' })
 
@@ -194,6 +270,20 @@ describe('getEventPresentation — recap (away_summary)', () => {
 
         expect(result.icon).toBe('💭')
         expect(result.text).toBe('recap: Building the login flow, next: wire up the submit handler.')
+    })
+})
+
+describe('getEventPresentation — compact-summary', () => {
+    it('keeps the label short (the chat renders the full summary as a block)', () => {
+        const result = getEventPresentation({
+            type: 'compact-summary',
+            summary: '## Goal\nLong summary content',
+            tokensBefore: 1000,
+            estimatedTokensAfter: 120
+        })
+
+        expect(result.icon).toBe('📦')
+        expect(result.text).toBe('Context compacted')
     })
 })
 

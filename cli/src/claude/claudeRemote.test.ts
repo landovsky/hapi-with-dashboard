@@ -69,7 +69,8 @@ async function waitFor(condition: () => boolean, timeoutMs = 300, intervalMs = 1
 }
 
 describe('claudeRemote async message handling', () => {
-    it('reports the initial normal message once after the first result', async () => {
+    // CI occasionally exceeds the default 5s under load (unrelated to job work).
+    it('reports the initial normal message once after the first result', { timeout: 15_000 }, async () => {
         const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
         const { claudeRemote } = await import('./claudeRemote');
         const onFirstResult = vi.fn();
@@ -103,6 +104,53 @@ describe('claudeRemote async message handling', () => {
             expect(onFirstResult).toHaveBeenCalledTimes(1);
             expect(onFirstResult).toHaveBeenCalledWith('Review this project');
         } finally {
+            queryMock.mockReset();
+            querySpy.mockRestore();
+        }
+    });
+
+    it('waits for async onReady work before completing the result stream', async () => {
+        const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
+        const { claudeRemote } = await import('./claudeRemote');
+        const releaseReady = deferred<void>();
+        queryMock.mockReturnValueOnce(createAsyncStream([
+            { type: 'result', subtype: 'success' } as unknown as SDKMessage
+        ]));
+
+        let nextCallCount = 0;
+        let readyStarted = false;
+        let settled = false;
+        try {
+            const runPromise = claudeRemote({
+                sessionId: 'session-1',
+                path: process.cwd(),
+                mcpServers: {},
+                claudeEnvVars: {},
+                claudeArgs: [],
+                allowedTools: [],
+                hookSettingsPath: '/tmp/hook.json',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+                nextMessage: async () => nextCallCount++ === 0
+                    ? { message: 'Review this project', mode: { permissionMode: 'default' } }
+                    : null,
+                onReady: async () => {
+                    readyStarted = true;
+                    await releaseReady.promise;
+                },
+                isAborted: () => false,
+                onSessionFound: () => {},
+                onMessage: () => {}
+            });
+            void runPromise.finally(() => { settled = true; });
+
+            await waitFor(() => readyStarted);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(settled).toBe(false);
+
+            releaseReady.resolve();
+            await runPromise;
+        } finally {
+            releaseReady.resolve();
             queryMock.mockReset();
             querySpy.mockRestore();
         }
@@ -362,7 +410,9 @@ describe('claudeRemote /compact result reporting', () => {
                     }
                     return null;
                 },
-                onReady: () => {},
+                onReady: (completionEvent) => {
+                    if (completionEvent) completionEvents.push(completionEvent);
+                },
                 isAborted: () => false,
                 onSessionFound: () => {},
                 onMessage: () => {},
@@ -420,5 +470,43 @@ describe('claudeRemote /compact result reporting', () => {
         ]);
 
         expect(completionEvents).toEqual(['Compaction started', 'Compaction completed']);
+    }, 15_000);
+
+    it('hands compact completion to the ready phase so the result carrier can flush first', async () => {
+        const querySpy = vi.spyOn(claudeSdk, 'query').mockImplementation(queryMock as typeof claudeSdk.query);
+        const { claudeRemote } = await import('./claudeRemote');
+        const wireOrder: string[] = [];
+        const queued: string[] = [];
+        queryMock.mockReturnValueOnce(createAsyncStream([resultMessage]));
+
+        let nextCallCount = 0;
+        try {
+            await claudeRemote({
+                sessionId: 'session-1', path: process.cwd(), mcpServers: {}, claudeEnvVars: {},
+                claudeArgs: [], allowedTools: [], hookSettingsPath: '/tmp/hook.json',
+                canCallTool: async () => ({ behavior: 'allow', updatedInput: {} }),
+                nextMessage: async () => nextCallCount++ === 0
+                    ? { message: '/compact', mode: { permissionMode: 'default' } }
+                    : null,
+                onReady: (completionEvent) => {
+                    wireOrder.push(...queued.splice(0));
+                    if (completionEvent) wireOrder.push(completionEvent);
+                    wireOrder.push('ready');
+                },
+                isAborted: () => false,
+                onSessionFound: () => {},
+                onMessage: (message) => {
+                    if (message.type === 'result') queued.push('result');
+                },
+                onCompletionEvent: (message) => {
+                    if (message !== 'Compaction started') wireOrder.push(message);
+                }
+            });
+        } finally {
+            queryMock.mockReset();
+            querySpy.mockRestore();
+        }
+
+        expect(wireOrder).toEqual(['result', 'Compaction completed', 'ready']);
     }, 15_000);
 });

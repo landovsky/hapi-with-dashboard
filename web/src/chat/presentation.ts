@@ -118,6 +118,8 @@ function formatGoalStatus(status: string): string {
     if (status === 'active') return 'active'
     if (status === 'paused') return 'paused'
     if (status === 'budgetLimited') return 'limited by budget'
+    if (status === 'usageLimited') return 'limited by usage'
+    if (status === 'blocked') return 'blocked'
     if (status === 'complete') return 'complete'
     return status
 }
@@ -168,6 +170,25 @@ export type EventPresentation = {
     text: string
 }
 
+/**
+ * Pulls a human-readable reason out of an `api-error` payload, if it carries
+ * one. The field has always been normalized through (`normalizeAgent.ts`
+ * copies `data.error` verbatim) and never read — an agent that explained
+ * itself was rendered as "API error" all the same.
+ */
+function apiErrorDetail(error: unknown): string | null {
+    if (typeof error === 'string') {
+        return error.trim() || null
+    }
+    if (error && typeof error === 'object' && 'message' in error) {
+        const message = (error as { message: unknown }).message
+        if (typeof message === 'string') {
+            return message.trim() || null
+        }
+    }
+    return null
+}
+
 export function getEventPresentation(event: AgentEvent): EventPresentation {
     if (event.type === 'api-error') {
         const { retryAttempt, maxRetries } = event as { retryAttempt: number; maxRetries: number }
@@ -178,7 +199,15 @@ export function getEventPresentation(event: AgentEvent): EventPresentation {
             return { icon: '⏳', text: `API error: Retrying (${retryAttempt}/${maxRetries})` }
         }
         if (retryAttempt > 0) {
-            return { icon: '⏳', text: 'API error: Retrying...' }
+            // An agent retrying without announcing a ceiling. "Retrying..."
+            // alone is what makes a rate-limited session look like one that
+            // is merely slow, so the reason is appended when there is one —
+            // appended, not substituted, because the existing wording is
+            // the part that says the agent has not given up. Replacing it
+            // would put that entirely in the hands of whatever text a
+            // producer happens to attach.
+            const detail = apiErrorDetail((event as { error?: unknown }).error)
+            return { icon: '⏳', text: detail ? `API error: Retrying... ${detail}` : 'API error: Retrying...' }
         }
         return { icon: '⚠️', text: 'API error' }
     }
@@ -227,6 +256,11 @@ export function getEventPresentation(event: AgentEvent): EventPresentation {
     }
     if (event.type === 'compact') {
         return { icon: '📦', text: 'Conversation compacted' }
+    }
+    if (event.type === 'compact-summary') {
+        // The chat renders the full summary as a dedicated block; this label
+        // only feeds compact contexts (outline anchors, tool traces).
+        return { icon: '📦', text: 'Context compacted' }
     }
     if (event.type === 'recap') {
         // Lowercase `recap:` intentionally mirrors Claude Code's own TUI recap label.

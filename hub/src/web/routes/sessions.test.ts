@@ -60,12 +60,17 @@ function createApp(session: Session, opts?: {
     resumeSession?: (sessionId: string, namespace: string, resumeOpts?: { permissionMode?: string }) => Promise<{ type: string; sessionId?: string; message?: string; code?: string }>
     reopenSession?: (sessionId: string, namespace: string) => Promise<ReopenResultMock>
     listSlashCommands?: SyncEngine['listSlashCommands']
-    getSessionExport?: (sessionId: string, session: Session) => unknown
+    getSessionExport?: (sessionId: string, session: Session, options?: { force?: boolean }) => unknown
     sessionExists?: boolean
     archiveSession?: (sessionId: string) => Promise<void>
     getCursorChatStoreStatus?: SyncEngine['getCursorChatStoreStatus']
+    listCodexModelsForSession?: SyncEngine['listCodexModelsForSession']
     forkConversation?: SyncEngine['forkConversation']
     rewindConversation?: SyncEngine['rewindConversation']
+    suggestSessionTitle?: SyncEngine['suggestSessionTitle']
+    updateSessionSummary?: SyncEngine['updateSessionSummary']
+    setSessionPinned?: (sessionId: string, pinned: boolean) => void
+    setSessionPinMode?: (sessionId: string, mode: 'none' | 'project' | 'global') => void
 }) {
     const applySessionConfigCalls: Array<[string, Record<string, unknown>]> = []
     const applySessionConfig = async (sessionId: string, config: Record<string, unknown>) => {
@@ -125,6 +130,10 @@ function createApp(session: Session, opts?: {
             : { ok: false, reason: 'not-found' },
         applySessionConfig,
         listCursorModelsForSession,
+        listCodexModelsForSession: opts?.listCodexModelsForSession ?? (async () => ({
+            success: true,
+            models: []
+        })),
         listOpencodeModelsForSession,
         listOpencodeReasoningEffortOptionsForSession,
         listGrokModelsForSession,
@@ -136,6 +145,8 @@ function createApp(session: Session, opts?: {
             status: { onDisk: true, store: 'acp' as const }
         })),
         archiveSession: archiveSessionMock,
+        setSessionPinned: opts?.setSessionPinned ?? (() => {}),
+        setSessionPinMode: opts?.setSessionPinMode ?? (() => {}),
         getSessionExport: opts?.getSessionExport ?? (() => ({
             type: 'success',
             payload: {
@@ -151,7 +162,9 @@ function createApp(session: Session, opts?: {
             commands: []
         })),
         forkConversation: opts?.forkConversation ?? (async () => ({ type: 'success', sessionId: 'child-1' })),
-        rewindConversation: opts?.rewindConversation ?? (async () => ({ type: 'success' }))
+        rewindConversation: opts?.rewindConversation ?? (async () => ({ type: 'success' })),
+        suggestSessionTitle: opts?.suggestSessionTitle ?? (async () => 'Generated title'),
+        updateSessionSummary: opts?.updateSessionSummary ?? (async () => {})
     } as Partial<SyncEngine>
 
     const app = new Hono<WebAppEnv>()
@@ -165,6 +178,106 @@ function createApp(session: Session, opts?: {
 }
 
 describe('sessions routes', () => {
+    it('generates a title suggestion without changing session metadata', async () => {
+        const suggest = async (sessionId: string) => {
+            expect(sessionId).toBe('session-1')
+            return 'Generated title'
+        }
+        const { app } = createApp(createSession(), { suggestSessionTitle: suggest })
+
+        const response = await app.request('/api/sessions/session-1/title-suggestion', { method: 'POST' })
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual({ title: 'Generated title' })
+    })
+
+    it('writes generated titles through the summary metadata endpoint', async () => {
+        const updates: Array<[string, string]> = []
+        const { app } = createApp(createSession(), {
+            updateSessionSummary: async (sessionId, text) => {
+                updates.push([sessionId, text])
+            }
+        })
+
+        const response = await app.request('/api/sessions/session-1/summary', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: '  Generated title  ' })
+        })
+
+        expect(response.status).toBe(200)
+        expect(updates).toEqual([['session-1', 'Generated title']])
+    })
+
+    it('rejects an empty summary', async () => {
+        const { app } = createApp(createSession())
+
+        const response = await app.request('/api/sessions/session-1/summary', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: '   ' })
+        })
+
+        expect(response.status).toBe(400)
+    })
+
+    it('updates the persisted pin mode', async () => {
+        const calls: Array<[string, 'none' | 'project' | 'global']> = []
+        const { app } = createApp(createSession(), {
+            setSessionPinMode: (sessionId, mode) => calls.push([sessionId, mode])
+        })
+
+        const response = await app.request('/api/sessions/session-1/pin', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'global' })
+        })
+
+        expect(response.status).toBe(200)
+        expect(calls).toEqual([['session-1', 'global']])
+    })
+
+    it('rejects an invalid pin body', async () => {
+        const { app } = createApp(createSession())
+        const response = await app.request('/api/sessions/session-1/pin', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'yes' })
+        })
+
+        expect(response.status).toBe(400)
+    })
+
+    it('uses session-scoped Codex model discovery for the fallback endpoint', async () => {
+        const session = createSession({
+            metadata: {
+                path: '/tmp/project',
+                host: 'localhost',
+                flavor: 'codex',
+                machineId: 'machine-1'
+            }
+        })
+        const captured: string[] = []
+        const { app } = createApp(session, {
+            listCodexModelsForSession: async (sessionId) => {
+                captured.push(sessionId)
+                return {
+                    success: true,
+                    models: [{ id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }]
+                }
+            }
+        })
+
+        const response = await app.request('/api/sessions/session-1/codex-models')
+
+        expect(response.status).toBe(200)
+        expect(captured).toEqual(['session-1'])
+        expect(await response.json()).toEqual({
+            success: true,
+            models: [{ id: 'gpt-5.5', displayName: 'GPT-5.5', isDefault: true }]
+        })
+    })
+
     it('returns the machine-scoped Cursor chat store status', async () => {
         const session = createSession({
             active: false,
@@ -246,23 +359,69 @@ describe('sessions routes', () => {
         expect(body.messages.map((message) => message.id)).toEqual(['msg-1', 'msg-2'])
     })
 
-    it('returns 413 when the export exceeds the hard message cap', async () => {
+    it('returns a structured warning instead of rejecting an export above the message threshold', async () => {
+        const session = createSession()
+        const warning = {
+            type: 'warning' as const,
+            count: 20_001,
+            limit: 20_000,
+            estimatedBytes: 12_345_678
+        }
+        const { app } = createApp(session, {
+            getSessionExport: () => warning
+        })
+
+        const response = await app.request('/api/sessions/session-1/export')
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual(warning)
+    })
+
+    it('passes an explicit force confirmation through for the complete export', async () => {
+        const session = createSession()
+        let receivedOptions: { force?: boolean } | undefined
+        const payload = {
+            schemaVersion: 2 as const,
+            exportedAt: 1_762_000_000_000,
+            session,
+            messages: [],
+            scratchlist: []
+        }
+        const { app } = createApp(session, {
+            getSessionExport: (_sessionId, _session, options) => {
+                receivedOptions = options
+                return { type: 'success', payload }
+            }
+        })
+
+        const response = await app.request('/api/sessions/session-1/export?force=true')
+
+        expect(response.status).toBe(200)
+        expect(await response.json()).toEqual(payload)
+        expect(receivedOptions).toEqual({ force: true })
+    })
+
+    it('returns structured 413 details for exports over the resource limit', async () => {
         const session = createSession()
         const { app } = createApp(session, {
             getSessionExport: () => ({
                 type: 'too-large',
                 count: 20_001,
-                limit: 20_000
+                estimatedBytes: 104_857_601,
+                maxBytes: 104_857_600
             })
         })
 
-        const response = await app.request('/api/sessions/session-1/export')
+        const response = await app.request('/api/sessions/session-1/export?force=true')
 
         expect(response.status).toBe(413)
         expect(await response.json()).toEqual({
-            error: 'Session export too large',
+            type: 'too-large',
+            error: 'Session export exceeds the resource limit',
+            code: 'session_export_too_large',
             count: 20_001,
-            limit: 20_000
+            estimatedBytes: 104_857_601,
+            maxBytes: 104_857_600
         })
     })
 

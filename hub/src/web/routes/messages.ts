@@ -60,6 +60,39 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
         return c.json(result)
     })
 
+    app.post('/sessions/:id/messages/:messageId/steer', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine, { requireActive: true })
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+        const sessionId = sessionResult.sessionId
+        const messageId = c.req.param('messageId')
+
+        const result = await engine.steerQueuedMessage(sessionId, messageId)
+        return c.json(result)
+    })
+
+    app.post('/sessions/:id/messages/:messageId/retry', async (c) => {
+        const engine = requireSyncEngine(c, getSyncEngine)
+        if (engine instanceof Response) {
+            return engine
+        }
+
+        const sessionResult = requireSessionFromParam(c, engine)
+        if (sessionResult instanceof Response) {
+            return sessionResult
+        }
+        return c.json(await engine.retryIndeterminateMessage(
+            sessionResult.sessionId,
+            c.req.param('messageId')
+        ))
+    })
+
     app.post('/sessions/:id/messages/queued-state', async (c) => {
         const engine = requireSyncEngine(c, getSyncEngine)
         if (engine instanceof Response) {
@@ -80,7 +113,7 @@ export function createMessagesRoutes(getSyncEngine: () => SyncEngine | null): Ho
 
         const localIds = [...new Set(parsed.data.localIds)]
         if (localIds.length === 0) {
-            return c.json({ queuedLocalIds: [], invokedLocalMessages: [] })
+            return c.json({ queuedLocalIds: [], indeterminateLocalIds: [], invokedLocalMessages: [] })
         }
         return c.json(engine.getQueuedState(sessionId, localIds))
     })

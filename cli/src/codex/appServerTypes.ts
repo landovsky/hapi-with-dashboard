@@ -295,6 +295,18 @@ export interface ThreadRollbackResponse {
     [key: string]: unknown;
 }
 
+export interface TurnSteerParams {
+    threadId: string;
+    input: UserInput[];
+    expectedTurnId: string;
+    clientUserMessageId?: string | null;
+}
+
+export interface TurnSteerResponse {
+    turnId: string;
+    [key: string]: unknown;
+}
+
 export interface ThreadCompactStartParams {
     threadId: string;
 }
@@ -303,7 +315,13 @@ export interface ThreadCompactStartResponse {
     [key: string]: unknown;
 }
 
-export type ThreadGoalStatus = 'active' | 'paused' | 'budgetLimited' | 'complete';
+export type ThreadGoalStatus =
+    | 'active'
+    | 'paused'
+    | 'budgetLimited'
+    | 'usageLimited'
+    | 'blocked'
+    | 'complete';
 
 export interface ThreadGoal {
     threadId: string;

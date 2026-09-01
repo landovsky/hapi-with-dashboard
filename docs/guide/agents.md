@@ -13,7 +13,8 @@ HAPI is a wrapper around AI coding agents. One CLI (`hapi <agent>`) starts any s
 | GitHub Copilot | `hapi copilot` | ACP (`copilot --acp --stdio`) | ✓ | ✓ | `default` `read-only` `safe-yolo` `yolo` | ✓ |
 | Kimi | `hapi kimi` | ACP (`kimi acp`) | ✓ | ✓ | `default` `read-only` `safe-yolo` `yolo` | ✓ |
 | OpenCode | `hapi opencode` | ACP (`opencode acp`) | ✓ | ✓ | `default` `plan` `yolo` | ✓ |
-| Antigravity (agy) | `hapi agy` | Interactive PTY + hooks | ✓ | ✓ | `request-review` `always-proceed` | ✓ |
+| DeepSeek Harness | `hapi dsh` | ACP (`dsh-acp-demo` or configured server) | — | ✓ | Managed by DSH ACP composition | — |
+| Antigravity (agy) | `hapi agy` | Headless print mode (per-turn `agy -p` + NDJSON) | — | ✓ | `request-review` `always-proceed` | ✓ |
 | Pi | `hapi pi` | `pi --mode rpc` (JSON-line RPC over stdio) | — | ✓ | none (always auto-approve) | ✓ |
 | Gemini CLI | — | **Removed** — Google sunset the consumer Gemini CLI (2026-06-18) | — | — | — | — |
 
@@ -23,7 +24,7 @@ Gemini is no longer launchable: `hapi gemini` is kept as a tombstone command tha
 
 ### ACP
 
-Most remote integrations speak the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio through a shared HAPI backend. ACP gives remote sessions bidirectional permission approval, plan/todo updates, question UI, model catalogs, and session resume via `session/load`. Cursor, Grok, Copilot, Kimi, and OpenCode remote sessions all run over ACP.
+Most remote integrations speak the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) over stdio through a shared HAPI backend. ACP gives remote sessions bidirectional permission approval, plan/todo updates, question UI, model catalogs, and session resume via `session/load`. Cursor, Grok, Copilot, Kimi, OpenCode, and DeepSeek Harness remote sessions all run over ACP. DSH's official ACP server is intentionally automation-only and currently supports fresh sessions, committed assistant output, cancellation, and one-shot permissions; it does not provide native resume, model switching, MCP injection, or live tool/reasoning telemetry.
 
 ### Permission modes
 
@@ -31,7 +32,7 @@ Permission modes are per-agent — each flavor exposes its own set (see the matr
 
 ### Local and remote mode
 
-Every session is either **local** (driven from the terminal) or **remote** (driven from web/phone). Switching is seamless and keeps the same session state:
+Every session is either **local** (driven from the terminal) or **remote** (driven from web/phone). DSH is remote-only because its ACP server has no local terminal surface. Switching is seamless and keeps the same session state for flavors that support both:
 
 - **Remote → local:** press double-space in the terminal.
 - **Local → remote:** send a message from the web UI or phone; the session switches automatically.
@@ -45,11 +46,13 @@ hapi resume                # Interactive picker of resumable sessions on this ma
 hapi resume <session-id>   # Resume a specific HAPI session
 ```
 
-`hapi resume` works for every flavor except Gemini. An active remote session is handed off to the local terminal first. Pi is the exception in the other direction: it has no local input path, so Pi sessions always resume in remote mode.
+`hapi resume` works for every resumable flavor except Gemini and fresh-session-only DSH. An active remote session is handed off to the local terminal first. Pi and Antigravity are the exceptions in the other direction: neither has a local input path, so their sessions always resume in remote mode.
 
 ## Cursor Agent
 
 HAPI supports [Cursor Agent CLI](https://cursor.com/docs/cli/using) for running Cursor's AI coding agent with remote control via web and phone.
+
+When Cursor resumes mid-idle (for example after a Shell `notify_on_output` wake) and emits ACP activity, HAPI bumps session thinking over the normal `session-alive` keepalive so the list does not stay stuck idle. See [FAQ](./faq.md#why-did-my-session-look-idle-when-the-agent-woke-itself).
 
 ### Prerequisites
 
@@ -230,6 +233,35 @@ HAPI also exposes Grok's common slash commands, discovers skills from `.grok/ski
 
 If a remote session reports authentication failure, run `grok login --device-auth` on the runner machine and retry.
 
+## DeepSeek Harness
+
+`hapi dsh` uses the shared ACP transport and keeps DSH's runtime outside HAPI. The
+default executable is `dsh-acp-demo`; configure a different ACP server or a
+source checkout with `HAPI_DSH_ACP_COMMAND`, `HAPI_DSH_ACP_CONFIG`, or the JSON
+argument array `HAPI_DSH_ACP_ARGS_JSON`.
+
+The official demo is published as `@deepseek-ai/dsh-acp-demo`; use an exact
+version such as `0.1.0-rc.7` rather than npm's stale `latest` tag:
+
+```bash
+npm install -g @deepseek-ai/dsh-acp-demo@0.1.0-rc.7
+```
+
+A published package still needs a DSH Cordis composition/config. A source
+checkout can be launched directly:
+
+```bash
+export HAPI_DSH_ACP_COMMAND=pnpm
+export HAPI_DSH_ACP_ARGS_JSON='["--dir", "/path/to/deepseek-harness", "run", "demo:acp"]'
+hapi dsh
+```
+
+DSH sessions are remote-only and fresh-session-only. HAPI does not inject MCP
+servers or expose model/effort pickers because the official ACP contract leaves
+those surfaces to the DSH composition. Pending one-shot permission requests
+remain answerable in the standard HAPI UI, but the ACP composition owns the
+overall permission policy.
+
 ## Other agents
 
 - **Claude Code** (`hapi` / `hapi claude`) — the default and recommended flavor; local sessions wrap the native TUI, remote sessions drive the Claude Agent SDK. [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code)
@@ -237,8 +269,17 @@ If a remote session reports authentication failure, run `grok login --device-aut
 - **GitHub Copilot** (`hapi copilot`) — Copilot CLI over ACP (`copilot --acp --stdio`). [GitHub Copilot](https://github.com/features/copilot)
 - **Kimi** (`hapi kimi`) — Moonshot AI's Kimi CLI over ACP (`kimi acp`). [MoonshotAI/kimi-cli](https://github.com/MoonshotAI/kimi-cli)
 - **OpenCode** (`hapi opencode`) — the open-source OpenCode agent over ACP (`opencode acp`). [opencode.ai](https://opencode.ai)
-- **Antigravity** (`hapi agy`) — Google's Antigravity CLI (`agy`), driven as an interactive PTY with hook-based permission bridging. [Google Antigravity](https://antigravity.google)
+- **Antigravity** (`hapi agy`) — Google's Antigravity CLI (`agy`), driven headlessly via print mode: every turn spawns `agy -p <msg> --conversation <uuid> --output-format stream-json`, and NDJSON events (init / step_update / result) are streamed into the chat. There is no PTY/TUI wrapper and no hook-based permission bridge: permission handling uses agy's own `settings.json` allow/deny rules (`request-review`) or `--dangerously-skip-permissions` (`always-proceed`). Tool calls that lack an allow-rule are auto-denied by agy and surfaced as a chat hint. MCP servers are configured the standard agy way — in the user's global `~/.gemini/config/mcp_config.json` or a workspace `.agents/mcp_config.json` — and are loaded natively by agy in headless mode (no HAPI injection). Remote-only — there is no local terminal input path. [Google Antigravity](https://antigravity.google)
 - **Pi** (`hapi pi`) — the Pi coding agent running as `pi --mode rpc` (JSON-line RPC over piped stdio); remote-control only, no local TUI input path. [badlogic/pi-mono](https://github.com/badlogic/pi-mono)
+
+  HAPI translates a subset of Pi's TUI slash commands to native Pi RPC calls, so they work from the web chat as well:
+
+  - `/compact [instructions]` — manually compact context with optional custom summary instructions (runs Pi's `compact` RPC; the summary is rendered as a dedicated block in the chat with the token delta in its header).
+  - `/session` — show session stats (messages, tokens, cost, context usage).
+  - `/model [modelId]` — show the current model and available models, or switch with `/model <modelId>`.
+  - `/help` — list the commands supported from HAPI.
+
+  Pi's extension commands and prompt templates (discovered via `get_commands`) keep working from the `/` menu, and skills are available through `$skill-name` like other ACP flavors. Other Pi TUI builtins (e.g. `/tree`, `/export`, `/reload`) cannot run over RPC; typing them in web shows an explicit "terminal-only" notice instead of silently forwarding the text to the model.
 
 ## Related
 

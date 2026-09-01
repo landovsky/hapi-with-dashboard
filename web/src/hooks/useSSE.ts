@@ -21,7 +21,13 @@ import type {
     SyncEvent
 } from '@/types/api'
 import { queryKeys } from '@/lib/query-keys'
-import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
+import { clearMessageWindow, getMessageWindowState, ingestIncomingMessages, markMessagesConsumed, markMessagesIndeterminate, markMessagesRequeued, removeOptimisticMessage, updateMessageStatus } from '@/lib/message-window-store'
+import { applySessionDetailPatch } from '@/lib/sessionPatch'
+
+// Pure patch-application rules live in @/lib/sessionPatch (React-free, shared
+// with the fixture generator); re-exported here so hook consumers and existing
+// tests keep their import site.
+export { applySessionDetailPatch, isNewerVersionedPatch, isRenderIrrelevantSessionPatch } from '@/lib/sessionPatch'
 
 type SSESubscription = {
     all?: boolean
@@ -34,6 +40,8 @@ export type SSEScope = 'global' | 'full'
 const MESSAGE_STREAM_EVENT_TYPES = new Set<SyncEvent['type']>([
     'message-received',
     'messages-consumed',
+    'messages-indeterminate',
+    'messages-requeued',
     'message-cancelled',
     'scheduled-matured'
 ])
@@ -44,16 +52,6 @@ export function isGlobalScopedMessageStreamEvent(scope: SSEScope, eventType: Syn
 
 export function shouldInvalidateSessionListForEvent(scope: SSEScope, eventType: SyncEvent['type']): boolean {
     return scope === 'global' && eventType === 'messages-invalidated'
-}
-
-// Version-monotonicity gate for structured patches carrying metadata or
-// agentState. SSE reconnects + per-query invalidation can leave the cache
-// holding state that's NEWER than a buffered older patch about to replay;
-// applying that older patch would regress resume / session-id / pending-
-// requests state. Mirrors the CLI room handler contract: strictly newer
-// only. Exported so the rule is unit-testable in isolation from the hook.
-export function isNewerVersionedPatch(patchVersion: number, currentVersion: number): boolean {
-    return patchVersion > currentVersion
 }
 
 /**
@@ -81,6 +79,16 @@ type VisibilityState = 'visible' | 'hidden'
 type ToastEvent = Extract<SyncEvent, { type: 'toast' }>
 
 const HEARTBEAT_STALE_MS = 90_000
+// The hub sends a heartbeat every 30s. When a suspended mobile tab returns to
+// the foreground, the connection may have been silently killed (no FIN/RST
+// ever reaches the browser), so a single missed heartbeat interval is already
+// enough to distrust it on resume. The watchdog keeps the longer 90s
+// threshold for tabs that stayed visible throughout.
+const VISIBILITY_RESUME_STALE_MS = 45_000
+// A new EventSource that hasn't opened within this window is likely hung on a
+// dead pooled socket (common right after a suspended tab resumes) — abandon
+// it and retry on a fresh connection instead of waiting for the watchdog.
+const CONNECT_TIMEOUT_MS = 10_000
 const HEARTBEAT_WATCHDOG_INTERVAL_MS = 10_000
 const RECONNECT_BASE_DELAY_MS = 1_000
 const RECONNECT_MAX_DELAY_MS = 30_000
@@ -93,6 +101,12 @@ const RECONNECT_SLOW_MAX_DELAY_MS = 300_000
 const INVALIDATION_BATCH_MS = 16
 
 function sortSessionSummaries(left: SessionSummary, right: SessionSummary): number {
+    if (Boolean(left.globalPinned) !== Boolean(right.globalPinned)) {
+        return left.globalPinned ? -1 : 1
+    }
+    if (Boolean(left.pinned) !== Boolean(right.pinned)) {
+        return left.pinned ? -1 : 1
+    }
     if (left.active !== right.active) {
         return left.active ? -1 : 1
     }
@@ -100,99 +114,6 @@ function sortSessionSummaries(left: SessionSummary, right: SessionSummary): numb
         return right.pendingRequestsCount - left.pendingRequestsCount
     }
     return right.updatedAt - left.updatedAt
-}
-
-/**
- * True when applying `patch` to `session` would change nothing that renders.
- *
- * Keep-alive patches re-send fields about every ~10s. SessionHeader reads
- * `activeAt` for relative age, but `formatRelativeTime` only changes at
- * minute boundaries (`just now` while delta < 60s). Sub-minute `activeAt`
- * moves are therefore skipped here so the detail cache does not replace the
- * Session object (and re-render SessionChat / HappyThread) six times a
- * minute for an invisible label change. A delta of ≥60s is still
- * render-relevant so the header stays on `just now` for live sessions.
- * The session-list path still uses {@link isRenderIrrelevantPatch}, which
- * ignores `activeAt` entirely.
- */
-export function isRenderIrrelevantSessionPatch(session: Session, patch: SessionPatch): boolean {
-    const current = session as unknown as Record<string, unknown>
-    for (const [key, value] of Object.entries(patch)) {
-        if (
-            key === 'activeAt'
-            && typeof value === 'number'
-            && Math.abs(value - session.activeAt) < 60_000
-        ) {
-            continue
-        }
-        if (current[key] !== value) {
-            return false
-        }
-    }
-    return true
-}
-
-/**
- * Apply a validated SessionPatch onto a detail Session. Returns null when
- * nothing render-relevant changed (keep prior object identity). Field-by-field
- * only — never wholesale-spread versioned `{ version, value }` wrappers.
- * Exported for unit tests (Copilot mode keep-alive must not be dropped).
- */
-export function applySessionDetailPatch(session: Session, patch: SessionPatch): Session | null {
-    if (isRenderIrrelevantSessionPatch(session, patch)) {
-        return null
-    }
-    let changed = false
-    const nextSession: Session = { ...session }
-    const assign = <K extends keyof Session>(key: K, value: Session[K]) => {
-        if (nextSession[key] !== value) {
-            nextSession[key] = value
-            changed = true
-        }
-    }
-    if (patch.active !== undefined) assign('active', patch.active)
-    if (patch.thinking !== undefined) assign('thinking', patch.thinking)
-    if (patch.activeAt !== undefined) assign('activeAt', patch.activeAt)
-    // Monotonic with hub applySessionPatch: a rejected stale
-    // metadata/agentState replay must not rewind updatedAt.
-    if (patch.updatedAt !== undefined) {
-        const nextUpdatedAt = Math.max(nextSession.updatedAt, patch.updatedAt)
-        assign('updatedAt', nextUpdatedAt)
-    }
-    if (patch.model !== undefined) assign('model', patch.model)
-    if (patch.modelReasoningEffort !== undefined) assign('modelReasoningEffort', patch.modelReasoningEffort)
-    if (patch.effort !== undefined) assign('effort', patch.effort)
-    if (Object.prototype.hasOwnProperty.call(patch, 'serviceTier')) {
-        assign('serviceTier', patch.serviceTier ?? null)
-    }
-    if (patch.permissionMode !== undefined) assign('permissionMode', patch.permissionMode)
-    if (patch.collaborationMode !== undefined) assign('collaborationMode', patch.collaborationMode)
-    if (patch.copilotAgentMode !== undefined) assign('copilotAgentMode', patch.copilotAgentMode)
-    if (patch.backgroundTaskCount !== undefined) assign('backgroundTaskCount', patch.backgroundTaskCount)
-    // Version gates: dual SSE can deliver duplicates out of order.
-    // Only mark changed when a strictly newer version lands —
-    // otherwise keep previous object identity (no redundant render).
-    if (patch.todos !== undefined && isNewerVersionedPatch(patch.todos.version, nextSession.todosUpdatedAt ?? 0)) {
-        nextSession.todos = patch.todos.value
-        nextSession.todosUpdatedAt = patch.todos.version
-        changed = true
-    }
-    if (patch.teamState !== undefined && isNewerVersionedPatch(patch.teamState.version, nextSession.teamStateUpdatedAt ?? 0)) {
-        nextSession.teamState = patch.teamState.value ?? undefined
-        nextSession.teamStateUpdatedAt = patch.teamState.version
-        changed = true
-    }
-    if (patch.metadata !== undefined && isNewerVersionedPatch(patch.metadata.version, nextSession.metadataVersion)) {
-        nextSession.metadata = patch.metadata.value
-        nextSession.metadataVersion = patch.metadata.version
-        changed = true
-    }
-    if (patch.agentState !== undefined && isNewerVersionedPatch(patch.agentState.version, nextSession.agentStateVersion)) {
-        nextSession.agentState = patch.agentState.value
-        nextSession.agentStateVersion = patch.agentState.version
-        changed = true
-    }
-    return changed ? nextSession : null
 }
 
 function isSessionRecord(value: unknown): value is Session {
@@ -446,7 +367,11 @@ export function useSSE(options: {
             const maxDelay = attempt >= RECONNECT_SLOW_AFTER_ATTEMPTS
                 ? RECONNECT_SLOW_MAX_DELAY_MS
                 : RECONNECT_MAX_DELAY_MS
-            const exponentialDelay = Math.min(maxDelay, RECONNECT_BASE_DELAY_MS * (2 ** attempt))
+            // First attempt reconnects immediately (jitter only) — backoff is
+            // for repeated failures, not for the initial recovery.
+            const exponentialDelay = attempt === 0
+                ? 0
+                : Math.min(maxDelay, RECONNECT_BASE_DELAY_MS * (2 ** (attempt - 1)))
             const jitter = Math.floor(Math.random() * (RECONNECT_JITTER_MS + 1))
             reconnectAttemptRef.current = attempt + 1
             if (reconnectTimerRef.current) {
@@ -466,8 +391,8 @@ export function useSSE(options: {
             onDisconnectRef.current?.(reason)
         }
 
-        const requestReconnect = (reason: string) => {
-            if (reconnectRequested) {
+        const requestReconnect = (reason: string, force = false) => {
+            if (reconnectRequested && !force) {
                 return
             }
             reconnectRequested = true
@@ -757,6 +682,8 @@ export function useSSE(options: {
                 if (
                     event.type === 'message-cancelled'
                     || event.type === 'messages-consumed'
+                    || event.type === 'messages-indeterminate'
+                    || event.type === 'messages-requeued'
                     || event.type === 'scheduled-matured'
                 ) {
                     queueSessionListInvalidation()
@@ -766,7 +693,13 @@ export function useSSE(options: {
                 // reconnect gaps or while another session is selected, only the global
                 // connection may be alive — still clear the queued bar / optimistic rows.
                 if (event.type === 'messages-consumed') {
-                    markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt)
+                    markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt, event.steered)
+                }
+                if (event.type === 'messages-indeterminate') {
+                    markMessagesIndeterminate(event.sessionId, event.localIds)
+                }
+                if (event.type === 'messages-requeued') {
+                    markMessagesRequeued(event.sessionId, event.localIds)
                 }
                 if (event.type === 'message-cancelled') {
                     removeOptimisticMessage(event.sessionId, event.messageId)
@@ -776,7 +709,15 @@ export function useSSE(options: {
             }
 
             if (event.type === 'messages-consumed') {
-                markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt)
+                markMessagesConsumed(event.sessionId, event.localIds, event.invokedAt, event.steered)
+            }
+
+            if (event.type === 'messages-indeterminate') {
+                markMessagesIndeterminate(event.sessionId, event.localIds)
+            }
+
+            if (event.type === 'messages-requeued') {
+                markMessagesRequeued(event.sessionId, event.localIds)
             }
 
             if (event.type === 'message-cancelled') {
@@ -876,7 +817,24 @@ export function useSSE(options: {
         }
 
         eventSource.onmessage = handleMessage
+        // A connection attempt that never reaches OPEN within CONNECT_TIMEOUT_MS
+        // is likely hung on a dead pooled socket (common right after a
+        // suspended mobile tab resumes). Abandon it and retry on a fresh
+        // connection. force bypasses the one-shot reconnectRequested guard: a
+        // hung attempt is a new attempt cycle, not a duplicate of the previous
+        // reconnect request.
+        const connectDeadlineTimer = setTimeout(() => {
+            if (eventSourceRef.current !== eventSource) {
+                return
+            }
+            if (eventSource.readyState === EventSource.OPEN) {
+                return
+            }
+            requestReconnect('connect-timeout', true)
+        }, CONNECT_TIMEOUT_MS)
+
         eventSource.onopen = () => {
+            clearTimeout(connectDeadlineTimer)
             if (reconnectTimerRef.current) {
                 clearTimeout(reconnectTimerRef.current)
                 reconnectTimerRef.current = null
@@ -917,8 +875,10 @@ export function useSSE(options: {
 
         // When the tab becomes visible again, check immediately whether the
         // SSE connection went stale while hidden (the watchdog skips checks
-        // for hidden tabs).  This avoids the user having to wait up to
-        // HEARTBEAT_WATCHDOG_INTERVAL_MS after switching back.
+        // for hidden tabs). Uses the tighter VISIBILITY_RESUME_STALE_MS
+        // threshold: a device suspend can kill the connection without the
+        // browser ever noticing, so a missed heartbeat interval at resume
+        // already warrants a proactive reconnect.
         const onVisibilityChange = () => {
             if (getVisibilityState() !== 'visible') return
             // A retry fell due while the tab was hidden and was deliberately
@@ -930,7 +890,7 @@ export function useSSE(options: {
                 return
             }
             if (eventSourceRef.current !== eventSource) return
-            if (Date.now() - lastActivityAtRef.current >= HEARTBEAT_STALE_MS) {
+            if (Date.now() - lastActivityAtRef.current >= VISIBILITY_RESUME_STALE_MS) {
                 requestReconnect('visibility-recovery')
             }
         }
@@ -938,6 +898,7 @@ export function useSSE(options: {
 
         return () => {
             clearInterval(watchdogTimer)
+            clearTimeout(connectDeadlineTimer)
             document.removeEventListener('visibilitychange', onVisibilityChange)
             if (invalidationTimerRef.current) {
                 clearTimeout(invalidationTimerRef.current)

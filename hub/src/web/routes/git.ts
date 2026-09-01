@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { isWildcardSearch, matchesSearchQuery, toSearchGlob } from '@hapi/protocol'
 import { z } from 'zod'
 import type { SyncEngine } from '../../sync/syncEngine'
 import type { WebAppEnv } from '../middleware/auth'
@@ -190,12 +191,17 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         }
 
         const bytes = Uint8Array.from(Buffer.from(result.content, 'base64'))
+        const mimeType = result.mimeType ?? 'application/octet-stream'
+        const disposition = !result.mimeType || mimeType.startsWith('image/') || mimeType.startsWith('video/') || mimeType.startsWith('audio/')
+            ? 'inline'
+            : 'attachment'
         // Generated images are content-addressed by an immutable random id, so the bytes for a
         // given id never change. Cache aggressively so remounts/scroll/session reopen don't
         // re-run the full HTTP -> socket.io RPC -> base64 round-trip every time (issue #927).
         return c.body(bytes, 200, {
-            'Content-Type': result.mimeType ?? 'application/octet-stream',
-            'Content-Disposition': `inline; filename="${encodeURIComponent(result.fileName ?? 'generated-image')}"`,
+            'Content-Type': mimeType,
+            'Content-Disposition': `${disposition}; filename="${encodeURIComponent(result.fileName ?? 'generated-media')}"`,
+            'X-Content-Type-Options': 'nosniff',
             'Cache-Control': GENERATED_IMAGE_CACHE_CONTROL,
             ETag: etag
         })
@@ -223,13 +229,23 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
         }
 
         const query = parsed.data.query?.trim() ?? ''
+        // ripgrep's gitignore-style globs use '/' as the path separator even on Windows.
+        // Accept the native separator users see in Windows paths before building the glob.
+        const normalizedQuery = isWindowsSessionPath(sessionPath)
+            ? normalizeFileSearchPath(query)
+            : query
         const limit = parsed.data.limit ?? 200
         const args = ['--files']
-        if (query) {
-            args.push('--iglob', `*${query}*`)
+        if (normalizedQuery && !isWildcardSearch(normalizedQuery)) {
+            args.push('--iglob', toSearchGlob(normalizedQuery))
         }
 
-        const result = await runRpc(() => engine.runRipgrep(sessionResult.sessionId, args, sessionPath))
+        const result = await runRpc(() => engine.runRipgrep(
+            sessionResult.sessionId,
+            args,
+            sessionPath,
+            { query: normalizedQuery, limit }
+        ))
         if (!result.success) {
             return c.json({ success: false, error: result.error ?? 'Failed to list files' })
         }
@@ -243,6 +259,7 @@ export function createGitRoutes(getSyncEngine: () => SyncEngine | null): Hono<We
             .map((line) => line.trim())
             .filter((line) => line.length > 0)
             .map(normalizePath)
+            .filter((path) => !normalizedQuery || matchesSearchQuery(path, normalizedQuery))
             .slice(0, limit)
 
         const metadataResult = await runRpc(() => engine.statFiles(sessionResult.sessionId, paths))

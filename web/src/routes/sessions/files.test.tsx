@@ -8,6 +8,16 @@ import FilesPage from './files'
 const mocks = vi.hoisted(() => ({
     navigate: vi.fn(),
     fileSearch: vi.fn(),
+    transferComposerDraftThenNavigate: vi.fn(async (
+        _source: string,
+        _target: string,
+        navigate: () => void | Promise<void>,
+    ) => {
+        await navigate()
+    }),
+    sessionHeaderProps: null as null | {
+        onSessionReopened?: (newSessionId: string) => void | Promise<void>
+    },
     search: {
         tab: 'directories' as const,
         query: '感',
@@ -18,6 +28,10 @@ vi.mock('@tanstack/react-router', () => ({
     useNavigate: () => mocks.navigate,
     useParams: () => ({ sessionId: 'session-1' }),
     useSearch: () => mocks.search,
+}))
+
+vi.mock('@/lib/composer-draft-transfer', () => ({
+    transferComposerDraftThenNavigate: mocks.transferComposerDraftThenNavigate,
 }))
 
 vi.mock('@/lib/app-context', () => ({
@@ -64,7 +78,10 @@ vi.mock('@/hooks/queries/useSessionFileSearch', () => ({
 }))
 
 vi.mock('@/components/SessionHeader', () => ({
-    SessionHeader: () => null,
+    SessionHeader: (props: { onSessionReopened?: (newSessionId: string) => void | Promise<void> }) => {
+        mocks.sessionHeaderProps = props
+        return null
+    },
 }))
 
 vi.mock('@/components/SessionFiles/DirectoryTree', () => ({
@@ -121,6 +138,7 @@ describe('FilesPage search navigation', () => {
                 tab: 'directories',
                 query: '感',
             },
+            resetScroll: false,
         })
 
         fireEvent.change(input, { target: { value: '言' } })
@@ -132,6 +150,7 @@ describe('FilesPage search navigation', () => {
                 query: '言',
             },
             replace: true,
+            resetScroll: false,
         })
 
         fireEvent.click(screen.getByRole('button', { name: 'Clear search' }))
@@ -140,6 +159,46 @@ describe('FilesPage search navigation', () => {
             params: { sessionId: 'session-1' },
             search: { tab: 'directories' },
             replace: true,
+            resetScroll: false,
         })
+    })
+})
+
+describe('FilesPage reopen draft transfer', () => {
+    beforeEach(() => {
+        vi.clearAllMocks()
+        mocks.sessionHeaderProps = null
+        window.localStorage.clear()
+        window.sessionStorage.clear()
+    })
+
+    it('transfers the composer draft before navigating to a reopened files route', async () => {
+        renderFilesPage()
+        expect(mocks.sessionHeaderProps?.onSessionReopened).toEqual(expect.any(Function))
+
+        await mocks.sessionHeaderProps!.onSessionReopened!('session-reopened')
+
+        expect(mocks.transferComposerDraftThenNavigate).toHaveBeenCalledWith(
+            'session-1',
+            'session-reopened',
+            expect.any(Function),
+        )
+        expect(mocks.navigate).toHaveBeenCalledWith({
+            to: '/sessions/$sessionId/files',
+            params: { sessionId: 'session-reopened' },
+            replace: true,
+            resetScroll: false,
+        })
+    })
+
+    it('preserves the directory scroll position across route remounts', () => {
+        const firstRender = renderFilesPage()
+        const firstScrollRegion = document.querySelector('[data-hapi-session-files-scroll="true"]') as HTMLElement
+        firstScrollRegion.scrollTop = 87
+        firstRender.unmount()
+
+        renderFilesPage()
+        const secondScrollRegion = document.querySelector('[data-hapi-session-files-scroll="true"]') as HTMLElement
+        expect(secondScrollRegion.scrollTop).toBe(87)
     })
 })

@@ -8,9 +8,10 @@ interface RemoteModeDisplayProps {
     logPath?: string
     onExit?: () => void
     onSwitchToLocal?: () => void
+    agentLabel?: string
 }
 
-export const RemoteModeDisplay: React.FC<RemoteModeDisplayProps> = ({ messageBuffer, logPath, onExit, onSwitchToLocal }) => {
+export const RemoteModeDisplay: React.FC<RemoteModeDisplayProps> = ({ messageBuffer, logPath, onExit, onSwitchToLocal, agentLabel = 'Claude' }) => {
     const [messages, setMessages] = useState<BufferedMessage[]>([])
     const { confirmationMode, actionInProgress } = useSwitchControls({
         onExit,
@@ -70,7 +71,7 @@ export const RemoteModeDisplay: React.FC<RemoteModeDisplayProps> = ({ messageBuf
                 overflow="hidden"
             >
                 <Box flexDirection="column" marginBottom={1}>
-                    <Text color="gray" bold>📡 Remote Mode - Claude Messages</Text>
+                    <Text color="gray" bold>📡 Remote Mode - {agentLabel} Messages</Text>
                     <Text color="gray" dimColor>{'─'.repeat(Math.min(terminalWidth - 4, 60))}</Text>
                 </Box>
                 
@@ -123,11 +124,11 @@ export const RemoteModeDisplay: React.FC<RemoteModeDisplayProps> = ({ messageBuf
                             ⏸️  Press space again to switch to local mode
                         </Text>
                     ) : (
-                        <>
-                            <Text color="green" bold>
-                                📱 Press space to switch to local mode • Ctrl-C to exit
-                            </Text>
-                        </>
+                        <Text color="green" bold>
+                            {onSwitchToLocal
+                                ? '📱 Press space to switch to local mode • Ctrl-C to exit'
+                                : '📱 Ctrl-C to exit'}
+                        </Text>
                     )}
                     {process.env.DEBUG && logPath && (
                         <Text color="gray" dimColor>
