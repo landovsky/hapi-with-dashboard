@@ -15,12 +15,20 @@ WORKDIR /app
 
 # Lockfile-first for layer caching on dependency-only changes.
 COPY package.json bun.lock ./
+# bunfig.toml pins `linker = "isolated"` — it must be present BEFORE install, or
+# bun falls back to the hoisted layout (deps land only in root node_modules) and
+# web's vite copy-katex-fonts plugin can't find web/node_modules/katex.
+COPY bunfig.toml ./
 COPY cli/package.json ./cli/
 COPY hub/package.json ./hub/
 COPY web/package.json ./web/
 COPY shared/package.json ./shared/
 COPY docs/package.json ./docs/
 COPY website/package.json ./website/
+# relay/ joined the workspace list upstream (0.30.x); without its manifest the
+# frozen install resolves a different layout and web/node_modules/katex goes
+# missing (vite's copy-katex-fonts plugin then fails the build).
+COPY relay/package.json ./relay/
 RUN bun install --frozen-lockfile
 
 # Full source, then build (web → embedded-web-assets → hub).
