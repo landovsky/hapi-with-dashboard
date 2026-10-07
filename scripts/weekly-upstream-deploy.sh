@@ -7,11 +7,13 @@
 #   2. merge upstream/main onto main; conflicts -> abort, ping negative
 #   3. gate: typecheck + build + web tests (baseline-aware) -> fail -> reset, ping negative
 #   4. push main
-#   5. build fork image -> push to ttl.sh (fresh UUID each run)
+#   5. build fork image -> push to GHCR, tagged with the fork commit sha
 #   6. bump k3s manifest image, rebase-safe push -> Flux rolls it out
 #   7. wait for the new pod to go 1/1 + /health 200 -> ping positive, else negative
 #
-# Deploy path is ttl.sh + Flux GitOps (GHCR CI is blocked on package perms).
+# Deploy path is a LOCAL docker push to GHCR + Flux GitOps (GHCR *CI* is blocked
+# on package perms, but hp-ubuntu's docker login can push). 2026-10-07: moved off
+# ttl.sh — its :24h tags expired, so prod survived only on the node image cache.
 # kubectl is only used read-only to verify the rollout; the rollout itself is
 # driven by the git push to the k3s repo.
 #
@@ -119,11 +121,11 @@ git push -q origin main || fail "git push origin main failed."
 
 # --- 5. build + push image ---------------------------------------------------
 STAGE="build-image"
-IMG="ttl.sh/$(uuidgen):24h"
+IMG="ghcr.io/landovsky/hapi-with-dashboard:$(git rev-parse --short HEAD)"
 docker build -t "$IMG" . >/tmp/hapi-imgbuild.log 2>&1 || fail "docker build failed. See /tmp/hapi-imgbuild.log"
 
 STAGE="push-image"
-docker push "$IMG" >/tmp/hapi-imgpush.log 2>&1 || fail "docker push to ttl.sh failed. See /tmp/hapi-imgpush.log"
+docker push "$IMG" >/tmp/hapi-imgpush.log 2>&1 || fail "docker push to GHCR failed. See /tmp/hapi-imgpush.log"
 
 # --- 6. bump k3s manifest ----------------------------------------------------
 STAGE="update-k3s"
@@ -132,12 +134,14 @@ PRE_MERGE=""
 cd "$K3S_REPO"
 git checkout -q main
 git pull -q --rebase origin main || fail "k3s repo git pull --rebase failed."
-sed -i -E "s#image: ttl\.sh/[^[:space:]]+#image: $IMG#" "$K3S_MANIFEST"
+# Match either the old ttl.sh form or the current GHCR form.
+sed -i -E "s#image: (ttl\.sh/|ghcr\.io/landovsky/hapi-with-dashboard:)[^[:space:]]+#image: $IMG#" "$K3S_MANIFEST"
+grep -q "image: $IMG" "$K3S_MANIFEST" || fail "image bump did not match in $K3S_MANIFEST."
 git add apps/hapi-hub/deployment.yaml
 git commit -q -m "hapi-hub: weekly upstream deploy ($AFTER, $IMG)
 
 Auto: synced $NEW_COMMITS upstream commit(s) into hapi-with-dashboard main
-($BEFORE→$AFTER), gate green, image built + pushed to ttl.sh."
+($BEFORE→$AFTER), gate green, image built + pushed to GHCR."
 # Rebase-safe push in case Flux/others advanced the repo meanwhile.
 git pull -q --rebase origin main || true
 git push -q origin main || {
